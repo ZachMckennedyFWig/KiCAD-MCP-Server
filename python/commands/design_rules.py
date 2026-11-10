@@ -763,6 +763,17 @@ class DesignRuleCommands:
                     # Legacy shape (same as the violations file), for callers that
                     # read the list directly.
                     response["violations"] = violations
+                # Project standards profile (MCP_ISSUES §2.9): its violations ride
+                # along with every DRC, so each edit's delta includes them.
+                if params.get("standards", True):
+                    try:
+                        from commands.standards import standards_for_drc
+
+                        standards = standards_for_drc(self.board, board_file, params)
+                        if standards is not None:
+                            response["standards"] = standards
+                    except Exception as exc:
+                        warnings.append(f"Standards profile check failed: {exc}")
                 return response
 
             finally:

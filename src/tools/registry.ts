@@ -46,6 +46,10 @@ export const toolCategories: ToolCategory[] = [
       "set_board_origin",
       "get_board_origin",
       "launch_kicad_ui",
+      "add_rule_area",
+      "edit_zone",
+      "set_pad_zone_connection",
+      "split_plane",
     ],
   },
   {
@@ -77,6 +81,8 @@ export const toolCategories: ToolCategory[] = [
       "group_components",
       "replace_component",
       "hierarchical_place",
+      "move_components",
+      "place_relative",
     ],
   },
   {
@@ -124,6 +130,10 @@ export const toolCategories: ToolCategory[] = [
       "set_layer_constraints",
       "check_clearance",
       "get_drc_violations",
+      "add_drc_rule",
+      "list_drc_rules",
+      "remove_drc_rule",
+      "check_standards",
     ],
   },
   {
@@ -288,6 +298,9 @@ export const toolCategories: ToolCategory[] = [
       "refill_zones",
       "get_nets_list",
       "set_net_color",
+      "add_copper",
+      "remove_copper",
+      "unroute",
     ],
   },
   {

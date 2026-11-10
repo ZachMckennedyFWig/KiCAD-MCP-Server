@@ -14,6 +14,7 @@ import { computeCommandTimeout, computeTimeoutGrace, defaultTimeout } from "./co
 // Import tool registration functions
 import { registerProjectTools } from "./tools/project.js";
 import { registerBoardTools } from "./tools/board.js";
+import { registerBoardEditTools } from "./tools/board-edit.js";
 import { registerComponentTools } from "./tools/component.js";
 import { registerRoutingTools } from "./tools/routing.js";
 import { registerDesignRuleTools } from "./tools/design-rules.js";
@@ -384,6 +385,7 @@ export class KiCADMcpServer {
     // Register all tools
     registerProjectTools(this.server, this.callKicadScript.bind(this));
     registerBoardTools(this.server, this.callKicadScript.bind(this));
+    registerBoardEditTools(this.server, this.callKicadScript.bind(this));
     registerComponentTools(this.server, this.callKicadScript.bind(this));
     registerRoutingTools(this.server, this.callKicadScript.bind(this));
     registerDesignRuleTools(this.server, this.callKicadScript.bind(this));

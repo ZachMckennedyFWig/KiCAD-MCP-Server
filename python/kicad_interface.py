@@ -407,10 +407,12 @@ try:
     from commands.backannotate_footprints import backannotate_footprints
     from commands.board import BoardCommands
     from commands.board.origin import BoardOriginCommands
+    from commands.board_edit import BoardEditCommands
     from commands.component import ComponentCommands
     from commands.connection_schematic import ConnectionManager
     from commands.datasheet_manager import DatasheetManager
     from commands.design_rules import DesignRuleCommands
+    from commands.drc_rules import DrcRuleCommands
     from commands.digikey import (
         digikey_check_library_availability,
         digikey_search_parts,
@@ -450,6 +452,7 @@ try:
     from commands.schematic_lint import SchematicLintCommands
     from commands.set_symbol_pin_type import set_symbol_pin_type
     from commands.stackup import StackupCommands
+    from commands.standards import StandardsCommands
     from commands.symbol_creator import SymbolCreator
     from commands.symbol_pins import SymbolPinCommands
     from commands.symbol_repair import SymbolRepairCommands
@@ -524,6 +527,15 @@ class KiCADInterface(SchematicHandlersMixin):
         self.library_management_commands = LibraryManagementCommands()
         self.pcb_import_commands = PcbImportCommands()
         self.design_rule_commands = DesignRuleCommands(self.board)
+        # Board editing primitives (MCP_ISSUES E1-E3): they save through the
+        # auto-save path and use run_drc for DRC deltas.
+        self.board_edit_commands = BoardEditCommands(
+            self.board,
+            save_board=self._auto_save_board,
+            run_drc=self.design_rule_commands.run_drc,
+        )
+        self.drc_rule_commands = DrcRuleCommands(self.board)
+        self.standards_commands = StandardsCommands(self.board)
         self.export_commands = ExportCommands(self.board)
         self.hierarchical_place_commands = HierarchicalPlaceCommands()
         # GUI-driver channel (chrome, not design): socket client for the
@@ -655,6 +667,21 @@ class KiCADInterface(SchematicHandlersMixin):
             "assign_net_to_class": self.design_rule_commands.assign_net_to_class,
             "check_clearance": self.design_rule_commands.check_clearance,
             "set_layer_constraints": self.design_rule_commands.set_layer_constraints,
+            # Board editing primitives, zones/rule areas and rules-as-data
+            # (MCP_ISSUES E1-E3, C2, C3, §2.9)
+            "add_copper": self.board_edit_commands.add_copper,
+            "remove_copper": self.board_edit_commands.remove_copper,
+            "unroute": self.board_edit_commands.unroute,
+            "move_components": self.board_edit_commands.move_components,
+            "place_relative": self.board_edit_commands.place_relative,
+            "add_rule_area": self.board_edit_commands.add_rule_area,
+            "edit_zone": self.board_edit_commands.edit_zone,
+            "set_pad_zone_connection": self.board_edit_commands.set_pad_zone_connection,
+            "split_plane": self.board_edit_commands.split_plane,
+            "add_drc_rule": self.drc_rule_commands.add_drc_rule,
+            "list_drc_rules": self.drc_rule_commands.list_drc_rules,
+            "remove_drc_rule": self.drc_rule_commands.remove_drc_rule,
+            "check_standards": self.standards_commands.check_standards,
             # GUI-driver channel (in-process wx helper over a localhost socket;
             # generic scriptable surface, destructive names are advisory-flagged
             # with a "⚠ " prefix — never gated). See commands/gui_driver.py.
@@ -1294,6 +1321,20 @@ class KiCADInterface(SchematicHandlersMixin):
                     elif command == "save_project":
                         self._record_board_signature()
                         self._last_auto_save_status = None
+                    elif (
+                        command in self._BOARD_MUTATING_COMMANDS
+                        and isinstance(result, dict)
+                        and (result.pop("_skipAutoSave", False) or "_autoSaveStatus" in result)
+                    ):
+                        # The handler changed nothing (dry run / no-op), or it
+                        # already saved through _auto_save_board (DRC delta).
+                        save_status = result.pop("_autoSaveStatus", None)
+                        if save_status is not None:
+                            self._last_auto_save_status = save_status
+                            if not save_status.get("saved"):
+                                if save_status.get("warning"):
+                                    result.setdefault("warnings", []).append(save_status["warning"])
+                                result["autoSave"] = save_status
                     elif command in self._BOARD_MUTATING_COMMANDS:
                         # Auto-save after every board mutation via SWIG.
                         # Prevents data loss if Claude hits context limit before
@@ -1387,6 +1428,17 @@ class KiCADInterface(SchematicHandlersMixin):
         "connect_passthrough",
         "connect_to_net",
         "set_footprint_type",
+        # commands.board_edit (E1-E3). They return _skipAutoSave for a dry
+        # run or no-op, and _autoSaveStatus when they saved for a DRC delta.
+        "add_copper",
+        "remove_copper",
+        "unroute",
+        "move_components",
+        "place_relative",
+        "add_rule_area",
+        "edit_zone",
+        "set_pad_zone_connection",
+        "split_plane",
     }
 
     # Commands that write a .kicad_sch file. They are refused while the target
@@ -1926,6 +1978,10 @@ class KiCADInterface(SchematicHandlersMixin):
         self.stackup_commands.board = self.board
         self.via_summary_commands.board = self.board
         self.design_rule_commands.board = self.board
+        for name in ("board_edit_commands", "drc_rule_commands", "standards_commands"):
+            handler = getattr(self, name, None)  # absent on __new__-built test doubles
+            if handler is not None:
+                handler.board = self.board
         self.export_commands.board = self.board
         self.freerouting_commands.board = self.board
 

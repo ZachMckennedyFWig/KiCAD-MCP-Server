@@ -23,6 +23,7 @@ than round-tripping them through a full S-expression reserializer.
 """
 
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -156,3 +157,389 @@ def persist_layer_constraint_rule(
             "persisted": False,
             "warning": f"could not persist layer constraint to {dru_path}: {exc}",
         }
+
+
+# ---------------------------------------------------------------------------
+# Rule parsing, listing and editing (MCP_ISSUES C2)
+# ---------------------------------------------------------------------------
+#
+# KiCad's own DRC engine is the authority on a rules file, and kicad-cli does
+# not say when it rejects one: a .kicad_dru with a syntax error is silently
+# dropped and DRC runs with no custom rules (verified on 10.0.8). These
+# helpers therefore catch what can be caught in text -- balanced parens,
+# strings, rule structure, constraint names and value syntax -- and
+# ``commands.drc_rules`` confirms KiCad accepted the file with a canary rule.
+
+
+class DruSyntaxError(ValueError):
+    """A ``.kicad_dru`` syntax error with a 1-based line and column."""
+
+    def __init__(self, message: str, line: int = 0, column: int = 0):
+        self.line = line
+        self.column = column
+        where = f"line {line}, column {column}: " if line else ""
+        super().__init__(where + message)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"message": str(self), "line": self.line, "column": self.column}
+
+
+class Quoted(str):
+    """A double-quoted string atom (as opposed to a bare symbol)."""
+
+
+# Constraint types of KiCad 10 custom rules. All but bridged_mask and
+# solder_paste_rel_margin were confirmed accepted by kicad-cli 10.0.8 with a
+# (min <len>mm) argument (those two need other argument forms; the kicad-cli
+# canary in commands.drc_rules has the final word either way).
+KNOWN_CONSTRAINTS = {
+    "annular_width",
+    "assertion",
+    "bridged_mask",
+    "clearance",
+    "connection_width",
+    "courtyard_clearance",
+    "creepage",
+    "diff_pair_gap",
+    "diff_pair_uncoupled",
+    "disallow",
+    "edge_clearance",
+    "hole_clearance",
+    "hole_size",
+    "hole_to_hole",
+    "length",
+    "min_resolved_spokes",
+    "physical_clearance",
+    "physical_hole_clearance",
+    "silk_clearance",
+    "skew",
+    "solder_mask_expansion",
+    "solder_paste_abs_margin",
+    "solder_paste_rel_margin",
+    "text_height",
+    "text_thickness",
+    "thermal_relief_gap",
+    "thermal_spoke_width",
+    "track_angle",
+    "track_segment_length",
+    "track_width",
+    "via_count",
+    "via_diameter",
+    "zone_connection",
+}
+# Value syntax KiCad 10.0.8 accepts (each verified with kicad-cli; a wrong form
+# makes it drop the whole file): counts take no unit, track_angle takes plain
+# degrees ("45deg" is rejected), and min_resolved_spokes takes a bare integer
+# ``(constraint min_resolved_spokes 2)``, not ``(min 2)``.
+_UNITLESS_CONSTRAINTS = {"via_count"}
+_ANGLE_CONSTRAINTS = {"track_angle"}
+_BARE_COUNT_CONSTRAINTS = {"min_resolved_spokes"}
+_RULE_CLAUSES = {"condition", "constraint", "layer", "severity"}
+_SEVERITIES = {"error", "warning", "ignore", "exclusion", "info"}
+_VALUE_RE = re.compile(r"^-?(\d+\.?\d*|\.\d+)(mm|mil|mils|in|um|deg)?$", re.IGNORECASE)
+
+
+def _line_col(text: str, pos: int) -> Tuple[int, int]:
+    line = text.count("\n", 0, pos) + 1
+    col = pos - (text.rfind("\n", 0, pos) + 1) + 1
+    return line, col
+
+
+def parse_sexpr(text: str) -> List[Tuple[Any, int, int]]:
+    """Parse ``text`` into top-level forms ``(node, start, end)``.
+
+    A node is a list of atoms (``str``; quoted strings are ``Quoted``) and
+    nested lists. ``#`` starts a comment to the end of the line, as in
+    KiCad's rules files. Raises DruSyntaxError.
+    """
+    forms: List[Tuple[Any, int, int]] = []
+    stack: List[Tuple[List[Any], int]] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in " \t\r\n":
+            i += 1
+        elif c == "#":
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif c == "(":
+            stack.append(([], i))
+            i += 1
+        elif c == ")":
+            if not stack:
+                raise DruSyntaxError("unexpected ')'", *_line_col(text, i))
+            node, start = stack.pop()
+            if stack:
+                stack[-1][0].append(node)
+            else:
+                forms.append((node, start, i + 1))
+            i += 1
+        elif c == '"':
+            j = i + 1
+            buf = []
+            while j < n and text[j] != '"':
+                if text[j] == "\\" and j + 1 < n:
+                    buf.append(text[j + 1])
+                    j += 2
+                    continue
+                buf.append(text[j])
+                j += 1
+            if j >= n:
+                raise DruSyntaxError("unterminated string", *_line_col(text, i))
+            if not stack:
+                raise DruSyntaxError("text outside of a (...) expression", *_line_col(text, i))
+            stack[-1][0].append(Quoted("".join(buf)))
+            i = j + 1
+        else:
+            j = i
+            while j < n and text[j] not in ' \t\r\n()"':
+                j += 1
+            if not stack:
+                raise DruSyntaxError(
+                    f"text outside of a (...) expression: {text[i:j]!r}", *_line_col(text, i)
+                )
+            stack[-1][0].append(text[i:j])
+            i = j
+    if stack:
+        raise DruSyntaxError("unclosed '(' (missing ')')", *_line_col(text, stack[-1][1]))
+    return forms
+
+
+def _check_expression(expr: str) -> Optional[str]:
+    """Cheap checks on a condition/assertion expression string."""
+    if expr.count("'") % 2:
+        return "has unbalanced single quotes"
+    depth = 0
+    in_str = False
+    for c in expr:
+        if c == "'":
+            in_str = not in_str
+        elif not in_str and c == "(":
+            depth += 1
+        elif not in_str and c == ")":
+            depth -= 1
+            if depth < 0:
+                return "has unbalanced parentheses"
+    if depth:
+        return "has unbalanced parentheses"
+    bare = re.sub(r"'[^']*'", "''", expr)
+    if re.search(r"(?<![=!<>])=(?!=)", bare):
+        return "uses '=' (KiCad compares with '==')"
+    return None
+
+
+def describe_rule(node: List[Any]) -> Dict[str, Any]:
+    """Summary of a parsed ``(rule ...)`` node."""
+    info: Dict[str, Any] = {
+        "name": str(node[1]) if len(node) > 1 and isinstance(node[1], str) else None,
+        "condition": None,
+        "layer": None,
+        "severity": None,
+        "constraints": [],
+    }
+    for clause in node[2:]:
+        if not isinstance(clause, list) or not clause:
+            continue
+        head = clause[0]
+        if head == "condition" and len(clause) > 1:
+            info["condition"] = str(clause[1])
+        elif head == "layer" and len(clause) > 1:
+            info["layer"] = str(clause[1])
+        elif head == "severity" and len(clause) > 1:
+            info["severity"] = str(clause[1])
+        elif head == "constraint" and len(clause) > 1:
+            entry: Dict[str, Any] = {"type": str(clause[1])}
+            for arg in clause[2:]:
+                if isinstance(arg, list) and len(arg) >= 2 and arg[0] in ("min", "max", "opt"):
+                    entry[arg[0]] = str(arg[1])
+                elif isinstance(arg, list) and arg:
+                    entry.setdefault("args", []).append(" ".join(str(a) for a in arg))
+                else:
+                    entry.setdefault("args", []).append(str(arg))
+            info["constraints"].append(entry)
+    return info
+
+
+def validate_rule_node(node: Any) -> Tuple[List[str], List[str]]:
+    """(errors, warnings) for one top-level form that should be a rule."""
+    errors: List[str] = []
+    warnings: List[str] = []
+    if not isinstance(node, list) or not node or node[0] != "rule":
+        head = node[0] if isinstance(node, list) and node else node
+        return [f'expected (rule "name" ...), got ({head} ...)'], warnings
+    if len(node) < 2 or isinstance(node[1], list):
+        return ["rule has no name"], warnings
+    name = str(node[1])
+    if not name.strip():
+        errors.append("rule name is empty")
+    constraints = 0
+    for clause in node[2:]:
+        if not isinstance(clause, list) or not clause:
+            errors.append(f"rule '{name}': unexpected {clause!r}; clauses look like (keyword ...)")
+            continue
+        head = clause[0]
+        if head not in _RULE_CLAUSES:
+            errors.append(
+                f"rule '{name}': unknown clause '{head}' (expected one of "
+                f"{', '.join(sorted(_RULE_CLAUSES))})"
+            )
+            continue
+        if head == "condition":
+            if len(clause) != 2 or not isinstance(clause[1], Quoted):
+                errors.append(f"rule '{name}': condition takes one quoted expression")
+            else:
+                problem = _check_expression(str(clause[1]))
+                if problem:
+                    errors.append(f"rule '{name}': condition {problem}")
+        elif head == "layer":
+            if len(clause) != 2 or isinstance(clause[1], list):
+                errors.append(f"rule '{name}': layer takes one layer name, outer or inner")
+        elif head == "severity":
+            if len(clause) != 2 or str(clause[1]) not in _SEVERITIES:
+                errors.append(
+                    f"rule '{name}': severity must be one of {', '.join(sorted(_SEVERITIES))}"
+                )
+        elif head == "constraint":
+            constraints += 1
+            if len(clause) < 2 or isinstance(clause[1], list):
+                errors.append(
+                    f"rule '{name}': constraint needs a type, e.g. (constraint clearance ...)"
+                )
+                continue
+            ctype = str(clause[1])
+            if ctype not in KNOWN_CONSTRAINTS:
+                # Verified on 10.0.8: an unknown type (e.g. 'clearence') makes
+                # KiCad drop the whole file.
+                errors.append(
+                    f"rule '{name}': '{ctype}' is not a KiCad 10 constraint type; KiCad would "
+                    "ignore the whole rules file"
+                )
+            if ctype in _BARE_COUNT_CONSTRAINTS:
+                args = clause[2:]
+                if len(args) != 1 or isinstance(args[0], list) or not str(args[0]).isdigit():
+                    errors.append(
+                        f"rule '{name}': {ctype} takes a bare count, e.g. "
+                        f"(constraint {ctype} 2); the (min 2) form makes KiCad 10 ignore the "
+                        "whole rules file"
+                    )
+                continue
+            for arg in clause[2:]:
+                if isinstance(arg, list) and arg and arg[0] in ("min", "max", "opt"):
+                    m = _VALUE_RE.match(str(arg[1])) if len(arg) == 2 else None
+                    if not m:
+                        errors.append(
+                            f"rule '{name}': ({' '.join(str(a) for a in arg)}) needs one value "
+                            "such as 0.2mm"
+                        )
+                    elif ctype in _ANGLE_CONSTRAINTS:
+                        if m.group(2):
+                            errors.append(
+                                f"rule '{name}': {ctype} takes plain degrees, e.g. "
+                                f"({arg[0]} 45); a unit makes KiCad 10 ignore the whole file"
+                            )
+                    elif not m.group(2) and ctype not in _UNITLESS_CONSTRAINTS:
+                        # Verified on 10.0.8: one unitless length makes KiCad drop
+                        # the whole file, silently, so no custom rule applies.
+                        errors.append(
+                            f"rule '{name}': ({arg[0]} {arg[1]}) has no unit; KiCad 10 then "
+                            f"ignores the WHOLE rules file. Write ({arg[0]} {arg[1]}mm)"
+                        )
+            if ctype == "assertion" and (len(clause) != 3 or not isinstance(clause[2], Quoted)):
+                errors.append(f"rule '{name}': assertion takes one quoted expression")
+    if constraints == 0:
+        errors.append(f"rule '{name}' has no (constraint ...)")
+    return errors, warnings
+
+
+def parse_rules_file(text: str) -> Dict[str, Any]:
+    """Parse a whole ``.kicad_dru``.
+
+    Returns ``{"version", "rules": [{name, condition, layer, severity,
+    constraints, start, end, line, node}], "errors", "warnings"}``. Raises
+    DruSyntaxError when the text is not a sequence of balanced expressions.
+    """
+    forms = parse_sexpr(text)
+    version = None
+    rules: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    warnings: List[str] = []
+    for node, start, end in forms:
+        if isinstance(node, list) and node and node[0] == "version":
+            version = str(node[1]) if len(node) > 1 else None
+            continue
+        errs, warns = validate_rule_node(node)
+        errors += errs
+        warnings += warns
+        if isinstance(node, list) and node and node[0] == "rule" and len(node) > 1:
+            entry = describe_rule(node)
+            entry.update({"start": start, "end": end, "node": node})
+            entry["line"] = _line_col(text, start)[0]
+            rules.append(entry)
+    seen: Dict[str, int] = {}
+    for r in rules:
+        seen[r["name"]] = seen.get(r["name"], 0) + 1
+    for name, count in seen.items():
+        if count > 1:
+            warnings.append(f"rule name '{name}' is used {count} times")
+    return {"version": version, "rules": rules, "errors": errors, "warnings": warnings}
+
+
+def read_dru(dru_path: Optional[str]) -> str:
+    if dru_path and os.path.exists(dru_path):
+        with open(dru_path, "r", encoding="utf-8") as fh:
+            return fh.read()
+    return ""
+
+
+def write_dru_atomic(dru_path: str, text: str) -> None:
+    """Write ``text`` to ``dru_path`` through a temp file and ``os.replace``."""
+    directory = os.path.dirname(dru_path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".dru-", suffix=".kicad_dru")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(tmp_path, dru_path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def append_rule_text(dru_text: str, rule_text: str) -> str:
+    """Append ``rule_text`` (one or more rules) to a rules file's text."""
+    text = dru_text.rstrip("\n")
+    if not text.strip():
+        text = "(version 1)"
+    return text + "\n\n" + rule_text.strip() + "\n"
+
+
+def remove_rule_spans(dru_text: str, spans: List[Tuple[int, int]]) -> str:
+    """Remove ``[start, end)`` spans with the comment lines directly above each.
+
+    The rest of a span's closing line goes too when it is blank, and so does
+    one blank line before the removed block, so the file keeps its spacing.
+    """
+    out = dru_text
+    for start, end in sorted(spans, reverse=True):
+        line_end = out.find("\n", end)
+        end2 = len(out) if line_end < 0 else line_end + 1
+        if out[end:end2].strip():
+            end2 = end
+        line_start = out.rfind("\n", 0, start) + 1
+        start2 = line_start if not out[line_start:start].strip() else start
+        # Comment lines attached to the rule (no blank line in between).
+        while start2 == line_start and start2 > 0:
+            prev_start = out.rfind("\n", 0, start2 - 1) + 1
+            prev_line = out[prev_start : start2 - 1]
+            if prev_line.strip().startswith("#"):
+                start2 = line_start = prev_start
+            else:
+                break
+        if start2 > 0:
+            prev_start = out.rfind("\n", 0, start2 - 1) + 1
+            if not out[prev_start : start2 - 1].strip() and prev_start > 0:
+                start2 = prev_start
+        out = out[:start2] + out[end2:]
+    return out

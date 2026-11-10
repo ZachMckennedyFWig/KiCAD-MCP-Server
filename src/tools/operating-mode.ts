@@ -125,6 +125,8 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set<string>([
   "summarize_net_copper",
   "query_zones",
   "run_drc",
+  "check_standards",
+  "list_drc_rules",
   // Schematic inspection. run_erc, generate_netlist and the view tools work in
   // temporary directories; validate_* run kicad-cli on a copy.
   // assert_connectivity reads a temp netlist; saveAs only writes its own

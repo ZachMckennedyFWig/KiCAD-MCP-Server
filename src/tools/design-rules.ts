@@ -189,6 +189,12 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
         .describe(
           ".kicad_pro (or its directory) whose rules to apply. Default: the board's own project, else the only .kicad_pro next to the board.",
         ),
+      standards: z
+        .boolean()
+        .optional()
+        .describe(
+          "Append the project's standards profile result (standards.yaml/.json, see check_standards) when one exists (default true)",
+        ),
       ...checkOutputParams,
     },
     async (args) => {
