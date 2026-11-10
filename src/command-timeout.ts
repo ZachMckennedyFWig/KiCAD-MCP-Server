@@ -129,6 +129,8 @@ export const LONG_RUNNING_COMMANDS = [
   "project_status",
   // Network sweeps
   "digikey_check_library_availability",
+  // Several A* routes in one call (routing workflows).
+  "route_bus",
 ] as const;
 
 /** Full-design checks: DRC/ERC and zone refill scale with board/sheet size. */
@@ -174,6 +176,12 @@ export const MEDIUM_COMMANDS = [
   "jlc_find_alternative",
   "diff_snapshots",
   "restore_snapshot",
+  // Routing workflows: a refined-grid or whole-board search, a board-wide
+  // fan-out, and job_apply's board reload can each pass 30 s on a big board.
+  "route_connection",
+  "fanout_to_planes",
+  "job_apply",
+  "job_cancel",
 ] as const;
 
 /**

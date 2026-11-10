@@ -20,6 +20,8 @@ export { registerFootprintTools } from "./footprint.js";
 export { registerSymbolCreatorTools } from "./symbol-creator.js";
 export { registerFreeroutingTools } from "./freerouting.js";
 export { registerFinishingTools } from "./finishing.js";
+export { registerRoutingWorkflowTools } from "./routing-workflows.js";
+export { registerJobTools } from "./jobs.js";
 export { registerPartsRegistryTools } from "./parts-registry.js";
 export { registerValidationTools } from "./validation.js";
 export { registerDigiKeyApiTools } from "./digikey-api.js";

@@ -327,6 +327,18 @@ export const toolCategories: ToolCategory[] = [
     tools: ["autoroute", "export_dsn", "import_ses", "check_freerouting"],
   },
   {
+    name: "routing_workflows",
+    description:
+      "Routing workflows: plane fan-out (stub + via per plane pad), grid A* single-connection and bus router, length report",
+    tools: ["fanout_to_planes", "route_connection", "route_bus", "length_match"],
+  },
+  {
+    name: "jobs",
+    description:
+      "Background jobs for long tools (autoroute async, ...): status with progress/log tail/stall flag, list, cancel, apply the result",
+    tools: ["job_status", "job_list", "job_cancel", "job_apply"],
+  },
+  {
     name: "validation",
     description:
       "File integrity checks: locate structural damage in schematics and symbol libraries before KiCad refuses to open them",

@@ -407,6 +407,12 @@ _NOT_SCHEMATIC_WRITERS = {
             "add_pin_labels",
             "cleanup_dangling",
             "transplant_layout",
+            # routing-workflows.ts, jobs.ts
+            "fanout_to_planes",
+            "route_connection",
+            "route_bus",
+            "job_apply",
+            "job_cancel",
         ],
         "writes the board",
     ),
