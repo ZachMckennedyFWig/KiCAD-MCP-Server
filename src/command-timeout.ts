@@ -135,6 +135,9 @@ export const CHECK_COMMANDS = [
   "check_clearance",
   "check_courtyard_overlaps",
   "refill_zones",
+  // Two kicad-cli DRC runs (rules before/after) on temporary copies.
+  "add_drc_rule",
+  "check_standards",
 ] as const;
 
 /** Loading, saving and launching: usually quick, but a big project can exceed 30 s. */
@@ -254,6 +257,12 @@ export function computeCommandTimeout(
     // The Python side kills the script at `timeout` seconds (default 60).
     const scriptSec = Math.min(toPositiveNumber(p.timeout) ?? 60, 1800);
     return Math.max(scriptSec * 1000 + SCRIPT_OVERHEAD_MS, MEDIUM_COMMAND_TIMEOUT_MS);
+  }
+
+  // Board edits with `drcDelta` save and run a full DRC (two when the last
+  // recorded run is stale), so they get the check budget.
+  if (p.drcDelta === true) {
+    return CHECK_COMMAND_TIMEOUT_MS;
   }
   if ((CHECK_COMMANDS as readonly string[]).includes(command)) {
     return CHECK_COMMAND_TIMEOUT_MS;

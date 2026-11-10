@@ -416,6 +416,23 @@ _NOT_SCHEMATIC_WRITERS = {
     ),
     **dict.fromkeys(
         [
+            # board-edit.ts
+            "add_copper",
+            "remove_copper",
+            "unroute",
+            "move_components",
+            "place_relative",
+            "add_rule_area",
+            "edit_zone",
+            "set_pad_zone_connection",
+            "split_plane",
+            "add_drc_rule",
+            "remove_drc_rule",
+        ],
+        "writes the board or its .kicad_dru",
+    ),
+    **dict.fromkeys(
+        [
             "close_project",
             "discard_or_reload",
             "save_as",
