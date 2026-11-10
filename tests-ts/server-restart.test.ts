@@ -8,7 +8,8 @@ import { KiCADMcpServer } from "../src/server.js";
  * A stand-in for python/kicad_interface.py: prints the READY marker, answers
  * every request with its pid, and misbehaves on demand.
  *
- *   command "hang"            never answered (timeout path)
+ *   command "hang"            never answered (wedged-worker path)
+ *   command "slow"            answered after params.delayMs (late response path)
  *   command "die"             process.exit(1) without answering (exit mid-request)
  *   FAKE_WORKER_MODE
  *     exit-before-ready       exits with code 3 before printing READY
@@ -43,6 +44,12 @@ process.stdin.on("data", (chunk) => {
     if (!line.trim()) continue;
     const request = JSON.parse(line);
     if (request.command === "hang") continue;
+    if (request.command === "slow") {
+      setTimeout(() => {
+        process.stdout.write(JSON.stringify({ success: true, command: "slow", pid: process.pid, _requestId: request.requestId }) + "\\n");
+      }, request.params.delayMs);
+      continue;
+    }
     if (request.command === "die") process.exit(1);
     process.stdout.write(JSON.stringify({ success: true, command: request.command, pid: process.pid, _requestId: request.requestId }) + "\\n");
   }
@@ -84,8 +91,41 @@ describe("Python worker recovery", () => {
     rmSync(directory, { recursive: true, force: true });
   });
 
-  it("restarts a timed-out worker and resumes queued requests", async () => {
+  function pushRequest(command: string, params: any, timeout: number): Promise<any> {
+    return new Promise((resolve, reject) => {
+      bridge.requestQueue.push({
+        request: { command, params, timeout, requestId: bridge.allocateInternalRequestId() },
+        resolve,
+        reject,
+      });
+      bridge.processNextRequest();
+    });
+  }
+
+  it("does not kill a timed-out worker; discards its late result and keeps serving (#4)", async () => {
     setUp();
+    bridge.spawnPythonProcess();
+    await bridge.waitForReady(5_000);
+
+    const before = await bridge.callKicadScript("before", {});
+    // Times out at 25 ms but the worker answers at 300 ms.
+    await expect(pushRequest("slow", { delayMs: 300 }, 25)).rejects.toThrow(
+      /Command timeout.*not interrupted/,
+    );
+    // While it is still running, new calls fail fast instead of queueing a retry.
+    await expect(bridge.callKicadScript("retry", {})).rejects.toThrow(/still finishing 'slow'/);
+
+    await waitUntil(() => bridge.orphanedRequest === null, 5_000);
+    const after = await bridge.callKicadScript("after", {});
+    expect(after.success).toBe(true);
+    expect(after.command).toBe("after"); // not the late "slow" response
+    expect(after.pid).toBe(before.pid); // same worker: never killed
+    expect(lives()).toBe(1);
+  });
+
+  it("restarts a timed-out worker that stays wedged past the grace period", async () => {
+    setUp();
+    bridge.timeoutGraceMs = 50;
     bridge.spawnPythonProcess();
     await bridge.waitForReady(5_000);
 
@@ -105,6 +145,7 @@ describe("Python worker recovery", () => {
     });
     await expect(timedOut).rejects.toThrow("Command timeout");
 
+    await waitUntil(() => lives() === 2 && bridge.orphanedRequest === null, 5_000);
     const after = await bridge.callKicadScript("after", {});
     expect(after.success).toBe(true);
     expect(after.pid).not.toBe(before.pid);

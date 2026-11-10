@@ -542,13 +542,25 @@ class DesignRuleCommands:
         return math.hypot(dx, dy)
 
     def run_drc(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Run Design Rule Check using kicad-cli"""
+        """Run Design Rule Check using kicad-cli.
+
+        Output is compact by default (MCP_ISSUES Q5): ``detail`` = "summary"
+        (counts by type/severity + the first ``limit`` items with coordinates),
+        "items" (every matching item, compact) or "full" (adds the legacy
+        ``violations`` list with item UUIDs). ``ignore`` takes violation-type
+        globs (``silk_*``); ``nets``/``refs``/``region`` narrow the view. Every
+        response carries a ``delta`` (new/resolved) against the previous run on
+        the same board, and ``rules`` says which project rules were applied.
+        """
         import json
         import platform
         import shutil
         import subprocess
         import tempfile
 
+        from utils import check_summary
+
+        stage_dir = None
         try:
             if not self.board:
                 return {
@@ -556,6 +568,17 @@ class DesignRuleCommands:
                     "message": "No board is loaded",
                     "errorDetails": "Load or create a board first",
                 }
+
+            # Output shaping (MCP_ISSUES Q5): detail level, limit and view filters.
+            check_opts = {
+                key: params.get(key)
+                for key in ("detail", "limit", "ignore", "nets", "refs", "region", "severity")
+            }
+            try:
+                check_summary.parse_detail_params(check_opts)
+                check_summary.parse_region(check_opts["region"])
+            except ValueError as exc:
+                return {"success": False, "message": f"Invalid parameter: {exc}"}
 
             report_path = params.get("reportPath")
             # Caller-overridable timeout (seconds). Defaults to 600s for big boards
@@ -583,6 +606,12 @@ class DesignRuleCommands:
                     "message": kicad_cli_not_found_message(),
                 }
 
+            # Principle 9: check against the project's own .kicad_pro/.kicad_dru,
+            # even for a board copied away from (or renamed apart from) its project.
+            check_file, stage_dir, rules = self._resolve_drc_project(
+                board_file, params.get("projectPath"), bool(params.get("schematicParity", False))
+            )
+
             # Create temporary JSON output file
             with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
                 json_output = tmp.name
@@ -606,7 +635,7 @@ class DesignRuleCommands:
                 )
                 drc_flags = self._drc_flags(params, refill_supported)
                 cmd += drc_flags
-                cmd.append(board_file)
+                cmd.append(check_file)
 
                 logger.info(f"Running DRC command (timeout={timeout_sec}s): {' '.join(cmd)}")
 
@@ -642,7 +671,7 @@ class DesignRuleCommands:
                         "checked the zone fills saved in the board file."
                     )
                 if params.get("schematicParity", False):
-                    sch = os.path.splitext(board_file)[0] + ".kicad_sch"
+                    sch = os.path.splitext(check_file)[0] + ".kicad_sch"
                     out = (result.stdout or "") + (result.stderr or "")
                     if "Failed to fetch schematic netlist" in out or not os.path.exists(sch):
                         warnings.append(
@@ -694,14 +723,28 @@ class DesignRuleCommands:
                         "--units",
                         "mm",
                         *drc_flags,
-                        board_file,
+                        check_file,
                     ]
                     subprocess.run(cmd_report, capture_output=True, timeout=timeout_sec)
 
-                # Return summary only (not full violations list)
-                return {
+                normalized = [
+                    check_summary.normalize_violation(raw, category)
+                    for category in self.DRC_REPORT_CATEGORIES
+                    for raw in (drc_data.get(category, []) or [])
+                ]
+                compact = check_summary.build_check_response(
+                    "drc", board_file, normalized, check_opts
+                )
+                delta = compact["delta"]
+                message = f"Found {len(violations)} DRC violations"
+                if not delta.get("firstRun"):
+                    message += (
+                        f" ({delta['newCountAll']} new, {delta['resolvedCountAll']} resolved)"
+                    )
+
+                response = {
                     "success": True,
-                    "message": f"Found {len(violations)} DRC violations",
+                    "message": message,
                     "summary": {
                         "total": len(violations),
                         "by_severity": severity_counts,
@@ -711,9 +754,16 @@ class DesignRuleCommands:
                     "zonesRefilled": zones_refilled,
                     "notes": notes,
                     "warnings": warnings,
+                    "rules": rules,
                     "violationsFile": violations_file,
                     "reportPath": report_path if report_path else None,
+                    **compact,
                 }
+                if compact["detail"] == "full":
+                    # Legacy shape (same as the violations file), for callers that
+                    # read the list directly.
+                    response["violations"] = violations
+                return response
 
             finally:
                 # Clean up temp JSON file
@@ -737,6 +787,115 @@ class DesignRuleCommands:
                 "message": "Failed to run DRC",
                 "errorDetails": str(e),
             }
+        finally:
+            if stage_dir:
+                shutil.rmtree(stage_dir, ignore_errors=True)
+
+    @staticmethod
+    def _resolve_drc_project(
+        board_file: str, project_path: Optional[str] = None, with_schematic: bool = False
+    ) -> Tuple[str, Optional[str], Dict[str, Any]]:
+        """Pick the project whose rules DRC must use (MCP_ISSUES principle 9).
+
+        kicad-cli only loads ``<board stem>.kicad_pro`` (and the ``.kicad_dru``
+        of the same stem) from the board's directory. A board that was copied
+        or renamed away from its project was therefore checked against KiCad's
+        default rules without any warning. Resolution:
+
+        1. ``project_path`` (a ``.kicad_pro`` or a directory holding one);
+        2. the board's own ``<stem>.kicad_pro``;
+        3. the only ``.kicad_pro`` in the board's directory.
+
+        When the chosen project's stem differs from the board's, the board is
+        staged into a temp dir under the project's stem together with the
+        project's ``.kicad_pro``/``.kicad_dru`` (and schematics, for parity).
+        Returns (file to check, staging dir or None, rules info for the caller).
+        """
+        import glob
+        import shutil
+        import tempfile
+
+        board = os.path.abspath(board_file)
+        board_dir = os.path.dirname(board)
+        stem = os.path.splitext(os.path.basename(board))[0]
+        own_pro = os.path.join(board_dir, stem + ".kicad_pro")
+
+        chosen = None
+        if project_path:
+            pp = os.path.abspath(os.path.expanduser(str(project_path)))
+            if os.path.isdir(pp):
+                found = sorted(glob.glob(os.path.join(pp, "*.kicad_pro")))
+                chosen = found[0] if len(found) == 1 else None
+                if not chosen:
+                    raise ValueError(
+                        f"projectPath {pp} holds {len(found)} .kicad_pro files; "
+                        "pass the .kicad_pro file itself"
+                    )
+            elif pp.endswith(".kicad_pro") and os.path.isfile(pp):
+                chosen = pp
+            else:
+                raise ValueError(f"projectPath not found or not a .kicad_pro: {pp}")
+        elif os.path.isfile(own_pro):
+            chosen = own_pro
+        else:
+            found = sorted(glob.glob(os.path.join(board_dir, "*.kicad_pro")))
+            if len(found) == 1:
+                chosen = found[0]
+
+        if not chosen:
+            return (
+                board,
+                None,
+                {
+                    "source": "kicad-defaults",
+                    "kicadPro": None,
+                    "kicadDru": None,
+                    "warning": (
+                        "No .kicad_pro found for this board, so kicad-cli used KiCad's "
+                        "default design rules. Pass projectPath to check against a "
+                        "project's rules."
+                    ),
+                },
+            )
+
+        pro_stem = os.path.splitext(os.path.basename(chosen))[0]
+        dru = os.path.splitext(chosen)[0] + ".kicad_dru"
+        rules = {
+            "source": "project",
+            "kicadPro": chosen,
+            "kicadDru": dru if os.path.isfile(dru) else None,
+        }
+        if os.path.normcase(chosen) == os.path.normcase(own_pro):
+            return board, None, rules
+
+        stage = tempfile.mkdtemp(prefix="kicad-mcp-drc-")
+        staged_board = os.path.join(stage, pro_stem + ".kicad_pcb")
+        shutil.copyfile(board, staged_board)
+        shutil.copyfile(chosen, os.path.join(stage, pro_stem + ".kicad_pro"))
+        if rules["kicadDru"]:
+            shutil.copyfile(dru, os.path.join(stage, pro_stem + ".kicad_dru"))
+        pro_dir = os.path.dirname(chosen)
+        # Project library tables, with ${KIPRJMOD} pinned to the real project
+        # dir: without them every footprint from a project-local library is
+        # reported as lib_footprint_issues on the staged copy.
+        prj_mod = pro_dir.replace("\\", "/")
+        for table in ("fp-lib-table", "sym-lib-table"):
+            src_table = os.path.join(pro_dir, table)
+            if os.path.isfile(src_table):
+                with open(src_table, "r", encoding="utf-8") as fh:
+                    text = fh.read()
+                text = text.replace("${KIPRJMOD}", prj_mod).replace("$(KIPRJMOD)", prj_mod)
+                with open(os.path.join(stage, table), "w", encoding="utf-8") as fh:
+                    fh.write(text)
+        if with_schematic:
+            for sch in glob.glob(os.path.join(pro_dir, "*.kicad_sch")):
+                shutil.copyfile(sch, os.path.join(stage, os.path.basename(sch)))
+        rules["source"] = "project (staged copy)"
+        rules["note"] = (
+            f"{os.path.basename(board)} does not sit next to a matching .kicad_pro; DRC ran "
+            f"on a temporary copy paired with {chosen} so that project's rules applied."
+        )
+        return staged_board, stage, rules
 
     # kicad-cli's JSON report keeps three lists. Only "violations" was read before, so a
     # board with missing connections or schematic mismatches reported none of them.

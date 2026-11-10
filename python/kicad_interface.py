@@ -575,6 +575,9 @@ class KiCADInterface(SchematicHandlersMixin):
             "discard_or_reload": self._handle_discard_or_reload,
             "snapshot_project": self._handle_snapshot_project,
             "get_project_info": self.project_commands.get_project_info,
+            # Session state report (MCP_ISSUES I2); also backs the
+            # kicad://project/status resource.
+            "project_status": self._handle_project_status,
             # Board commands
             "set_board_size": self.board_commands.set_board_size,
             "set_board_origin": self.board_origin_commands.set_board_origin,
@@ -6615,10 +6618,15 @@ print("ok")
                     "stats": stats,
                 }
 
-            # The prebuilt paths recreate jlcpcb_parts.db on disk, so the open
-            # manager connection must be released first (Windows file locking),
-            # then reopened on the freshly written database.
+            # The new database is swapped over jlcpcb_parts.db with os.replace,
+            # which Windows refuses while any handle holds the file (WinError
+            # 32, MCP_ISSUES #1). Release this process's connection first and
+            # collect garbage so no stray cursor keeps the handle alive, then
+            # reopen on the freshly installed database.
             self.jlcpcb_parts.close()
+            import gc
+
+            gc.collect()
 
             result = jlcpcb_downloader.download_database(
                 force=force,
@@ -6627,7 +6635,25 @@ print("ok")
             )
 
             # Reopen the manager on the new database regardless of outcome.
+            # If the swap was blocked, this retries installing the parked
+            # <db>.new file (the lock may have cleared meanwhile).
             self.jlcpcb_parts = JLCPCBPartsManager()
+
+            if result.get("locked"):
+                pending = result.get("pending_db_path")
+                if pending and not os.path.exists(pending):
+                    # The reopen above installed it after all.
+                    stats = self.jlcpcb_parts.get_database_stats()
+                    result.update(
+                        success=True,
+                        locked=False,
+                        message="Database installed after the lock cleared.",
+                        total_parts=stats["total_parts"],
+                        basic_parts=stats["basic_parts"],
+                        extended_parts=stats["extended_parts"],
+                    )
+                    result.pop("pending_db_path", None)
+                return result
 
             if not result.get("success"):
                 return result
@@ -6791,6 +6817,43 @@ print("ok")
             return {
                 "success": False,
                 "message": f"Failed to suggest alternatives: {str(e)}",
+            }
+
+    def _handle_project_status(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """~10-line session report: sizes, parity, last DRC/ERC, dirty, snapshot (I2).
+
+        Reads files and cached check history only; it never re-runs DRC/ERC.
+        """
+        from commands.project_status import build_project_status, resolve_project_files
+
+        try:
+            project_path = params.get("projectPath")
+            board_path = self._authoritative_board_path()
+            anchor_board = None if project_path else board_path
+            files = resolve_project_files(project_path, anchor_board)
+            same_board = bool(
+                board_path
+                and files.get("board")
+                and self._normalize_board_path(files["board"])
+                == self._normalize_board_path(board_path)
+            )
+            loaded = None
+            if (
+                same_board
+                and getattr(self, "session_backend", None) != "ipc"
+                and self._current_board_path()
+            ):
+                loaded = self.board
+            dirty = self._dirty_state(board_path) if same_board else None
+            status = build_project_status(project_path, anchor_board, loaded, dirty)
+            return {"success": True, "message": status["text"], **status}
+        except ValueError as e:
+            return {"success": False, "message": str(e)}
+        except Exception as e:
+            logger.error(f"project_status failed: {e}", exc_info=True)
+            return {
+                "success": False,
+                "message": f"project_status failed: {e}",
             }
 
     def _handle_enrich_datasheets(self, params: Dict[str, Any]) -> Dict[str, Any]:

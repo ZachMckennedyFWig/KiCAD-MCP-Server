@@ -32,6 +32,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from commands.jlcpcb_parts import (
+    DatabaseLockedError,
+    pending_db_path,
+    replace_with_retry,
+)
 from utils.platform_helper import PlatformHelper
 from utils.seven_zip import resolve_7z, seven_zip_not_found_message
 
@@ -211,14 +216,23 @@ def convert_source_sqlite(
 ) -> Dict[str, int]:
     """Convert a prebuilt source SQLite (CDFER or yaqwsx) into the MCP schema.
 
-    Writes a fresh ``target_path`` (deleting any existing file) with the
-    ``components`` table + FTS index that ``JLCPCBPartsManager`` expects.
+    Writes the ``components`` table + FTS index that ``JLCPCBPartsManager``
+    expects. The new database is built in a temp file next to ``target_path``
+    and only swapped in (``os.replace``) once it is complete, so a failed
+    conversion never destroys the existing database and the live file is
+    replaced in one atomic step. If the live file is locked (Windows WinError
+    32, #1) the swap is retried with backoff; if it stays locked a
+    ``DatabaseLockedError`` is raised and the finished database is parked at
+    ``<target>.new`` for ``JLCPCBPartsManager`` to install on its next open.
     Returns ``{"total","basic","extended"}`` counts.
     """
     source_path = Path(source_path)
     target_path = Path(target_path)
     if not source_path.exists():
         raise FileNotFoundError(f"source database not found: {source_path}")
+
+    build_path = target_path.with_name(target_path.name + ".tmp")
+    _unlink_quietly(build_path)
 
     src = sqlite3.connect(str(source_path))
     src.row_factory = sqlite3.Row
@@ -227,10 +241,7 @@ def convert_source_sqlite(
         relation = _pick_source_relation(src)
         _progress(progress, f"Converting from source relation '{relation}'...")
 
-        if target_path.exists():
-            target_path.unlink()
-
-        dst = sqlite3.connect(str(target_path))
+        dst = sqlite3.connect(str(build_path))
         try:
             dst.execute("""
                 CREATE TABLE components (
@@ -342,10 +353,116 @@ def convert_source_sqlite(
             ).fetchone()[0]
         finally:
             dst.close()
+    except BaseException:
+        _unlink_quietly(build_path)
+        raise
     finally:
         src.close()
 
+    install_database(build_path, target_path)
     return {"total": total, "basic": basic, "extended": extended}
+
+
+def _unlink_quietly(path: Path) -> None:
+    try:
+        Path(path).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:  # pragma: no cover - best effort
+        logger.debug(f"Could not remove {path}: {exc}")
+
+
+def install_database(built: Path, target: Path) -> None:
+    """Atomically move a fully built database over ``target``.
+
+    Retries with backoff on ``PermissionError`` (the live file is held open).
+    If it never frees up, park the built file at ``<target>.new`` and raise
+    ``DatabaseLockedError`` so the caller can report a recovery path.
+    """
+    built, target = Path(built), Path(target)
+    try:
+        replace_with_retry(built, target)
+        return
+    except PermissionError as exc:
+        pending = Path(pending_db_path(str(target)))
+        parked = built
+        try:
+            os.replace(built, pending)
+            parked = pending
+        except OSError:
+            pass
+        raise DatabaseLockedError(
+            f"Could not replace {target}: {exc}. The new database was built and saved "
+            f"at {parked}.",
+            target=str(target),
+            pending=str(parked),
+        ) from exc
+
+
+def find_processes_holding(path: Path) -> List[Dict[str, Any]]:
+    """Best-effort list of *other* processes that have ``path`` open.
+
+    Uses ``psutil`` when available (it is optional); returns ``[]`` otherwise or
+    on any error. Only python processes are inspected, which keeps this fast and
+    covers the usual culprit: a stale MCP server from an earlier session.
+    """
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return []
+    want = os.path.normcase(os.path.abspath(str(path)))
+    me = os.getpid()
+    holders: List[Dict[str, Any]] = []
+    try:
+        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                if proc.info["pid"] == me or "python" not in (proc.info["name"] or "").lower():
+                    continue
+                for of in proc.open_files():
+                    if os.path.normcase(os.path.abspath(of.path)) == want:
+                        cmd = " ".join(proc.info.get("cmdline") or [])[:160]
+                        holders.append({"pid": proc.info["pid"], "cmdline": cmd})
+                        break
+            except Exception:
+                continue
+    except Exception:  # pragma: no cover - psutil platform quirks
+        return holders
+    return holders
+
+
+def locked_database_result(
+    exc: DatabaseLockedError, cache_dir: Path, source: str
+) -> Dict[str, Any]:
+    """Build the failure response for a download whose final swap was blocked."""
+    target = Path(exc.target)
+    holders = find_processes_holding(target)
+    if holders:
+        who = ", ".join(f"PID {h['pid']} ({h['cmdline'] or 'python'})" for h in holders)
+        culprit = f"It is held open by another process: {who}. "
+    else:
+        culprit = (
+            "This server closed its own connection first, so the file is most likely held "
+            "by another process (e.g. a stale KiCad MCP server python.exe from an earlier "
+            "session, or an open SQLite browser). "
+        )
+    message = (
+        f"JLCPCB download succeeded but replacing {target} failed (file locked). "
+        + culprit
+        + f"The new database is saved at {exc.pending} and will be installed automatically "
+        "the next time the server opens the parts database; to install it now, stop the "
+        "other process(es) and re-run download_jlcpcb_database (the downloaded source is "
+        f"kept in {cache_dir}, so nothing is downloaded again)."
+    )
+    return {
+        "success": False,
+        "locked": True,
+        "source": source,
+        "message": message,
+        "db_path": str(target),
+        "pending_db_path": exc.pending,
+        "cache_path": str(cache_dir),
+        "holders": holders,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -598,15 +715,20 @@ def _download_official(target: Path, force: bool, progress: ProgressFn) -> Dict[
     parts = client.download_full_database(
         callback=lambda page, total, msg: _progress(progress, msg)
     )
-    if force and target.exists():
-        target.unlink()
+    # Import into a temp file and swap it in atomically (#1): never delete or
+    # rewrite the live database in place.
+    build = target.with_name(target.name + ".tmp")
+    _unlink_quietly(build)
+    if not force and target.exists():
+        shutil.copyfile(target, build)
 
-    mgr = JLCPCBPartsManager(db_path=str(target))
+    mgr = JLCPCBPartsManager(db_path=str(build))
     try:
         mgr.import_parts(parts, progress_callback=lambda c, t, m: _progress(progress, m))
         stats = mgr.get_database_stats()
     finally:
         mgr.close()
+    install_database(build, target)
     return _result(
         "official-api",
         target,
@@ -691,7 +813,10 @@ def download_database(
     Returns a result dict (see ``_result``) or ``{"success": False, "message": ...}``.
 
     NOTE: callers that hold an open ``JLCPCBPartsManager`` on the target file must
-    close it before calling (the prebuilt paths recreate the file) and reopen after.
+    close it before calling (the new file is swapped in with ``os.replace``) and
+    reopen after. If the swap is blocked by a lock that never clears, the result
+    has ``locked: True`` plus ``pending_db_path``/``cache_path`` for recovery, and
+    the source cache is kept so a re-run does not download again.
     """
     data_dir = PlatformHelper.get_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -720,6 +845,11 @@ def download_database(
             if src == "official":
                 return _download_official(target, force, progress)
             errors.append(f"{src}: unknown source")
+        except DatabaseLockedError as exc:
+            # The download and conversion worked; only the swap was blocked.
+            # Trying another source would hit the same lock, so stop here.
+            logger.warning(f"JLCPCB database swap blocked: {exc}")
+            return locked_database_result(exc, cache_dir, src)
         except Exception as exc:
             logger.warning(f"JLCPCB source '{src}' failed: {exc}")
             errors.append(f"{src}: {exc}")

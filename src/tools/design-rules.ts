@@ -13,6 +13,99 @@ import { formatKicadResult } from "./tool-response.js";
 type CommandFunction = (command: string, params: Record<string, unknown>) => Promise<any>;
 
 /**
+ * Output-shaping parameters shared by run_drc and run_erc (MCP_ISSUES Q5):
+ * summaries first, detail on request, filters, and a delta against the
+ * previous run.
+ */
+export const checkOutputParams = {
+  detail: z
+    .enum(["summary", "items", "full"])
+    .optional()
+    .describe(
+      "summary (default): counts by type/severity + the first `limit` items with coordinates (mm). items: every matching item. full: also the legacy `violations` list with item UUIDs.",
+    ),
+  limit: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe("Max items listed (default 20 for summary, all for items/full)"),
+  ignore: z
+    .array(z.string())
+    .optional()
+    .describe("Violation-type globs to drop, e.g. ['silk_*', 'lib_symbol_mismatch']"),
+  nets: z
+    .array(z.string())
+    .optional()
+    .describe("Only violations naming one of these nets ('+5V' also matches '/Power/+5V')"),
+  refs: z
+    .array(z.string())
+    .optional()
+    .describe("Only violations naming one of these references, e.g. ['U3', 'C12']"),
+  region: z
+    .object({ x1: z.number(), y1: z.number(), x2: z.number(), y2: z.number() })
+    .optional()
+    .describe("Only violations with an item inside this box (mm)"),
+  timeoutSec: z
+    .number()
+    .int()
+    .optional()
+    .describe("kicad-cli timeout in seconds (default 600 for DRC, 300 for ERC; max 1800)"),
+};
+
+/** Render a compact check result (counts, top items, delta) as a few text lines. */
+export function formatCheckSummary(label: string, result: any): string {
+  const counts = result.counts ?? { total: result.summary?.total ?? 0, by_severity: {} };
+  const sev = counts.by_severity ?? {};
+  const lines: string[] = [];
+  let head = `${label}: ${counts.total} violation(s) — ${sev.error ?? 0} error, ${sev.warning ?? 0} warning`;
+  if (result.filters && result.unfilteredTotal !== undefined) {
+    head += ` (filtered from ${result.unfilteredTotal})`;
+  }
+  lines.push(head);
+  const delta = result.delta;
+  if (delta && !delta.firstRun) {
+    lines.push(
+      `Since last run (${delta.previousRunAt ?? "?"}): +${delta.newCountAll} new, -${delta.resolvedCountAll} resolved`,
+    );
+  } else if (delta?.firstRun) {
+    lines.push("No previous run recorded for this file (delta starts next run).");
+  }
+  const byType = Object.entries(counts.by_type ?? {}) as Array<[string, number]>;
+  if (byType.length > 0) {
+    lines.push("By type: " + byType.map(([t, n]) => `${t} ${n}`).join(", "));
+  }
+  const fmt = (v: any) => {
+    const loc =
+      v.location && v.location.x !== undefined ? ` @ (${v.location.x}, ${v.location.y})` : "";
+    const items = Array.isArray(v.items) && v.items.length ? ` — ${v.items.join("; ")}` : "";
+    return `[${v.severity}] ${v.type}: ${v.message}${loc}${items}`;
+  };
+  const items: any[] = result.items ?? [];
+  if (items.length > 0) {
+    lines.push("");
+    items.forEach((v, i) => lines.push(`${i + 1}. ${fmt(v)}`));
+    if (result.itemsTruncated) {
+      lines.push(`... ${counts.total - items.length} more (raise limit or use detail='items')`);
+    }
+  }
+  if (delta && !delta.firstRun) {
+    for (const [name, list] of [
+      ["New", delta.new],
+      ["Resolved", delta.resolved],
+    ] as Array<[string, any[]]>) {
+      if (list?.length) {
+        lines.push("", `${name}:`);
+        list.forEach((v) => lines.push(`  ${fmt(v)}`));
+      }
+    }
+  }
+  if (result.rules?.warning) lines.push("", `Rules: ${result.rules.warning}`);
+  else if (result.rules?.note) lines.push("", `Rules: ${result.rules.note}`);
+  return lines.join("\n");
+}
+
+/**
  * Register design rule tools with the MCP server
  *
  * @param server MCP server instance
@@ -77,7 +170,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
   // ------------------------------------------------------
   server.tool(
     "run_drc",
-    "Run the KiCAD Design Rule Check (DRC) on the current PCB and return violations, including unconnected items (unrouted connections) and, on request, schematic-parity issues. Each violation in the saved file lists the items it names (description, uuid, position). Zones are refilled first by default, as in KiCad's DRC dialog. Optionally save the report to a file.",
+    "Run the KiCAD Design Rule Check (DRC) on the saved PCB with kicad-cli, against the project's own .kicad_pro/.kicad_dru (`rules` says which were used). Includes unconnected items and, on request, schematic-parity issues. Compact by default: counts by type/severity plus the first `limit` violations with coordinates (mm), and a `delta` (new/resolved) against the previous run on this board. Use `ignore`/`nets`/`refs`/`region` to narrow, detail='full' for everything. The full list is also saved to `violationsFile`. Zones are refilled first by default, as in KiCad's DRC dialog.",
     {
       reportPath: z.string().optional().describe("Optional path to save the DRC report"),
       refillZones: z
@@ -90,10 +183,17 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
         .boolean()
         .optional()
         .describe("Also check the board against the project's schematic (default false)"),
+      projectPath: z
+        .string()
+        .optional()
+        .describe(
+          ".kicad_pro (or its directory) whose rules to apply. Default: the board's own project, else the only .kicad_pro next to the board.",
+        ),
+      ...checkOutputParams,
     },
-    async ({ reportPath, refillZones, schematicParity }) => {
+    async (args) => {
       logger.debug("Running DRC check");
-      const result = await callKicadScript("run_drc", { reportPath, refillZones, schematicParity });
+      const result = await callKicadScript("run_drc", args);
 
       return formatKicadResult(result);
     },

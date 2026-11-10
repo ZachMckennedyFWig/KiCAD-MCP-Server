@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import sqlite3
+import time
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -16,6 +18,80 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from utils.platform_helper import PlatformHelper
 
 logger = logging.getLogger("kicad_interface")
+
+# A freshly built database that could not replace the live one (because the
+# live file was locked) is parked next to it under this suffix and swapped in
+# by the next ``JLCPCBPartsManager`` that opens the path (#1).
+PENDING_DB_SUFFIX = ".new"
+
+
+class DatabaseLockedError(RuntimeError):
+    """The live database file could not be replaced because it is held open."""
+
+    def __init__(self, message: str, target: str, pending: Optional[str] = None):
+        super().__init__(message)
+        self.target = target
+        self.pending = pending
+
+
+def replace_with_retry(
+    src: os.PathLike,
+    dst: os.PathLike,
+    attempts: int = 6,
+    initial_delay: float = 0.25,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """``os.replace(src, dst)`` with exponential backoff on ``PermissionError``.
+
+    On Windows a file that another handle holds open without
+    ``FILE_SHARE_DELETE`` (SQLite does exactly that) cannot be replaced:
+    ``os.replace`` raises ``PermissionError`` (WinError 32 / 5). Short-lived
+    holders -- an antivirus scan, the search indexer, a cursor that is being
+    finalized -- usually let go within a second, so retry with backoff before
+    giving up. The final ``PermissionError`` is re-raised unchanged.
+    """
+    delay = initial_delay
+    for attempt in range(1, attempts + 1):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt >= attempts:
+                raise
+            logger.info(
+                f"Replacing {dst} failed (file in use), retry {attempt}/{attempts - 1} "
+                f"in {delay:.2f}s"
+            )
+            sleep(delay)
+            delay = min(delay * 2, 4.0)
+
+
+def pending_db_path(db_path: str) -> str:
+    return str(db_path) + PENDING_DB_SUFFIX
+
+
+def apply_pending_database_swap(db_path: str) -> bool:
+    """Swap in a database parked by a download whose replace was blocked.
+
+    Returns True when a pending database was installed. Never raises: if the
+    live file is still locked the pending file is left for the next attempt.
+    """
+    if not db_path:
+        return False
+    pending = pending_db_path(db_path)
+    if not os.path.isfile(pending):
+        return False
+    try:
+        replace_with_retry(pending, db_path, attempts=2, initial_delay=0.1)
+    except OSError as exc:
+        logger.warning(
+            f"A newer JLCPCB database is waiting at {pending} but {db_path} is still in "
+            f"use ({exc}). Stop other KiCad MCP server processes, then re-run "
+            "download_jlcpcb_database or restart the server to install it."
+        )
+        return False
+    logger.info(f"Installed pending JLCPCB database {pending} -> {db_path}")
+    return True
 
 
 def _build_fts_match_query(query: str) -> str:
@@ -84,6 +160,11 @@ class JLCPCBPartsManager:
             db_path = str(data_dir / "jlcpcb_parts.db")
             self.db_path = db_path
 
+        # A previous download may have built a new database but been unable to
+        # swap it in because the old file was locked (Windows WinError 32, #1).
+        # Finish that swap now, before we open (and lock) the old file ourselves.
+        apply_pending_database_swap(self.db_path)
+
         try:
             self._init_database()
         except sqlite3.OperationalError as exc:
@@ -93,6 +174,7 @@ class JLCPCBPartsManager:
                 self.db_path,
                 exc,
             )
+            self.close()
 
     def _init_database(self) -> None:
         """Initialize SQLite database with schema"""
@@ -141,6 +223,7 @@ class JLCPCBPartsManager:
         """)
 
         self.conn.commit()
+        cursor.close()
         logger.info(f"Initialized JLCPCB parts database at {self.db_path}")
 
     def import_parts(
@@ -209,6 +292,7 @@ class JLCPCBPartsManager:
         """)
 
         self.conn.commit()
+        cursor.close()
         logger.info(f"Import complete: {imported} parts imported, {skipped} skipped")
 
     def _determine_library_type(self, part: Dict) -> str:
@@ -316,6 +400,7 @@ class JLCPCBPartsManager:
         """)
 
         self.conn.commit()
+        cursor.close()
         logger.info(f"Import complete: {imported} parts imported, {skipped} skipped")
 
     def search_parts(
@@ -398,6 +483,10 @@ class JLCPCBPartsManager:
         except Exception as e:
             logger.error(f"Search error: {e}")
             return []
+        finally:
+            # Finalize the statement now: a lingering cursor keeps the file
+            # handle alive after close() on Windows (#1 WinError 32).
+            cursor.close()
 
     def get_part_info(self, lcsc_number: str) -> Optional[Dict]:
         """
@@ -411,9 +500,9 @@ class JLCPCBPartsManager:
         """
         if self.conn is None:
             return None
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM components WHERE lcsc = ?", (lcsc_number,))
-        row = cursor.fetchone()
+        with closing(self.conn.cursor()) as cursor:
+            cursor.execute("SELECT * FROM components WHERE lcsc = ?", (lcsc_number,))
+            row = cursor.fetchone()
 
         if row:
             part = dict(row)
@@ -436,21 +525,20 @@ class JLCPCBPartsManager:
                 "in_stock": 0,
                 "db_path": self.db_path,
             }
-        cursor = self.conn.cursor()
+        with closing(self.conn.cursor()) as cursor:
+            cursor.execute("SELECT COUNT(*) as total FROM components")
+            total = cursor.fetchone()["total"]
 
-        cursor.execute("SELECT COUNT(*) as total FROM components")
-        total = cursor.fetchone()["total"]
+            cursor.execute("SELECT COUNT(*) as basic FROM components WHERE library_type = 'Basic'")
+            basic = cursor.fetchone()["basic"]
 
-        cursor.execute("SELECT COUNT(*) as basic FROM components WHERE library_type = 'Basic'")
-        basic = cursor.fetchone()["basic"]
+            cursor.execute(
+                "SELECT COUNT(*) as extended FROM components WHERE library_type = 'Extended'"
+            )
+            extended = cursor.fetchone()["extended"]
 
-        cursor.execute(
-            "SELECT COUNT(*) as extended FROM components WHERE library_type = 'Extended'"
-        )
-        extended = cursor.fetchone()["extended"]
-
-        cursor.execute("SELECT COUNT(*) as in_stock FROM components WHERE stock > 0")
-        in_stock = cursor.fetchone()["in_stock"]
+            cursor.execute("SELECT COUNT(*) as in_stock FROM components WHERE stock > 0")
+            in_stock = cursor.fetchone()["in_stock"]
 
         return {
             "total_parts": total,
@@ -544,10 +632,18 @@ class JLCPCBPartsManager:
         return alternatives[:limit]
 
     def close(self) -> None:
-        """Close database connection"""
-        if self.conn:
-            self.conn.close()
-            self.conn = None
+        """Close the database connection and release the file handle.
+
+        Safe to call repeatedly. Any error from sqlite during close is logged,
+        not raised, so callers that close before swapping the file (#1) can
+        always proceed to the swap.
+        """
+        conn, self.conn = self.conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(f"Closing JLCPCB database failed: {exc}")
 
 
 if __name__ == "__main__":

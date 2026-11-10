@@ -133,7 +133,7 @@ export function registerProjectResources(
   // ------------------------------------------------------
   server.resource("project_status", "kicad://project/status", async (uri) => {
     logger.debug("Retrieving project status");
-    const result = await callKicadScript("get_project_status", {});
+    const result = await callKicadScript("project_status", {});
 
     if (!result.success) {
       logger.error(`Failed to retrieve project status: ${result.errorDetails}`);

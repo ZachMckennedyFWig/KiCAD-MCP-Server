@@ -9,7 +9,7 @@ import { spawn, exec, execSync, ChildProcess } from "child_process";
 import { existsSync, readdirSync } from "fs";
 import { join, dirname, isAbsolute } from "path";
 import { logger } from "./logger.js";
-import { computeCommandTimeout, DEFAULT_COMMAND_TIMEOUT_MS } from "./command-timeout.js";
+import { computeCommandTimeout, computeTimeoutGrace, defaultTimeout } from "./command-timeout.js";
 
 // Import tool registration functions
 import { registerProjectTools } from "./tools/project.js";
@@ -290,6 +290,14 @@ export class KiCADMcpServer {
     reject: Function;
     timeoutHandle: NodeJS.Timeout;
   } | null = null;
+  /**
+   * A command whose caller already got a timeout error but which the worker is
+   * still executing (MCP_ISSUES #4). The worker is deliberately not killed so it
+   * cannot be interrupted mid-write; new calls fail fast until it finishes.
+   */
+  private orphanedRequest: { requestId: number; command: string; timedOutAt: number } | null = null;
+  /** How long an orphaned command may run before the worker is deemed wedged. */
+  private timeoutGraceMs = computeTimeoutGrace();
 
   /** Resolved when Python prints {"type":"ready"} — stdin loop is live. */
   private readyPromise!: Promise<void>;
@@ -677,10 +685,19 @@ export class KiCADMcpServer {
     logger.info("Stopping KiCAD MCP server...");
     this.stopping = true;
 
-    // Kill the Python process if it's running
-    if (this.pythonProcess) {
-      this.pythonProcess.kill();
-      this.pythonProcess = null;
+    // Stop the Python process if it's running. If it is in the middle of a
+    // command, close its stdin first so it can finish (the stdin loop exits on
+    // EOF after the current command) instead of being killed mid-write; force
+    // it only if it does not exit promptly.
+    const worker = this.pythonProcess;
+    this.pythonProcess = null;
+    if (worker) {
+      if (this.processingRequest && worker.exitCode === null) {
+        const exited = new Promise<void>((resolve) => worker.once("exit", () => resolve()));
+        worker.stdin?.end();
+        await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 5_000))]);
+      }
+      if (worker.exitCode === null) worker.kill();
     }
 
     logger.info("KiCAD MCP server stopped");
@@ -925,9 +942,24 @@ export class KiCADMcpServer {
         return;
       }
 
+      // A previous command timed out but is still running in the worker. Fail
+      // fast rather than queue: the caller is most likely retrying it, and a
+      // queued retry would run again once the original finishes (duplicates).
+      if (this.orphanedRequest) {
+        const busyFor = Math.round((Date.now() - this.orphanedRequest.timedOutAt) / 1000);
+        reject(
+          new Error(
+            `KiCAD worker is still finishing '${this.orphanedRequest.command}', which timed ` +
+              `out ${busyFor}s ago and was not interrupted (to avoid truncating files). ` +
+              "Wait and retry; check the result (e.g. project_status) before repeating that command.",
+          ),
+        );
+        return;
+      }
+
       // Determine timeout based on command type (see src/command-timeout.ts).
       const commandTimeout = computeCommandTimeout(command, params);
-      if (commandTimeout !== DEFAULT_COMMAND_TIMEOUT_MS) {
+      if (commandTimeout !== defaultTimeout()) {
         logger.info(`Using extended timeout (${commandTimeout / 1000}s) for command: ${command}`);
       }
 
@@ -1032,6 +1064,50 @@ export class KiCADMcpServer {
     }
   }
 
+  /**
+   * Abandon the caller of a timed-out command without killing the worker.
+   *
+   * Before MCP_ISSUES #4 a timeout restarted (killed) the worker at once. On
+   * Windows that is TerminateProcess: a command that was writing a schematic
+   * was cut off mid-write and left the file at 0 bytes. Python executes
+   * commands serially, so instead the request stays "current" with no-op
+   * callbacks: its late response is matched by id and dropped, then the queue
+   * resumes. Only if it is still running `timeoutGraceMs` later is the worker
+   * treated as wedged in native code and restarted.
+   */
+  private orphanRequest(command: string, requestId: number): void {
+    this.orphanedRequest = { requestId, command, timedOutAt: Date.now() };
+    const clear = () => {
+      if (this.orphanedRequest?.requestId === requestId) this.orphanedRequest = null;
+    };
+    const wedgeHandle = setTimeout(() => {
+      if (this.currentRequestHandler?.requestId !== requestId) return;
+      logger.error(
+        `Timed-out command ${command} still running after a further ` +
+          `${this.timeoutGraceMs / 1000}s; restarting the worker`,
+      );
+      this.currentRequestHandler = null;
+      this.processingRequest = false;
+      clear();
+      // The buffer is left alone: a partial frame from the wedged command
+      // completes on the next data chunk and is discarded by ID.
+      void this.restartPythonProcess(`command wedged: ${command}`);
+    }, this.timeoutGraceMs);
+    this.currentRequestHandler = {
+      requestId,
+      resolve: (result: any) => {
+        clear();
+        logger.warn(
+          `Timed-out command ${command} finished late ` +
+            `(${result?.success ? "success" : "failure"}); result discarded`,
+        );
+      },
+      reject: () => clear(),
+      timeoutHandle: wedgeHandle,
+    };
+    // processingRequest stays true: nothing else is sent until it finishes.
+  }
+
   private allocateInternalRequestId(): number {
     return this.nextInternalRequestId++;
   }
@@ -1065,27 +1141,24 @@ export class KiCADMcpServer {
       const requestStr = JSON.stringify(request);
 
       // Set a timeout (use command-specific timeout or default)
-      const timeoutDuration = request.timeout || 30000;
+      const timeoutDuration = request.timeout || defaultTimeout();
       const timeoutHandle = setTimeout(() => {
         // The response may have arrived between the timer firing and this
         // callback running; only abandon our own request (#373).
         if (this.currentRequestHandler?.requestId !== request.requestId) return;
         logger.error(`Command timeout after ${timeoutDuration / 1000}s: ${request.command}`);
         logger.error(`Buffer contents: ${this.responseBuffer.substring(0, 200)}...`);
+        this.orphanRequest(request.command, request.requestId);
 
-        // Clear state. The buffer is left alone: a partial frame from the
-        // timed-out command completes on the next data chunk and is then
-        // discarded by ID, not delivered to the next request.
-        this.currentRequestHandler = null;
-        this.processingRequest = false;
-
-        // Reject the promise
-        reject(new Error(`Command timeout after ${timeoutDuration / 1000}s: ${request.command}`));
-
-        // Python executes commands serially. A timed-out command may still be
-        // wedged in native KiCAD code, so continuing to feed the same worker
-        // only causes every queued request to time out behind it.
-        void this.restartPythonProcess(`command timeout: ${request.command}`);
+        reject(
+          new Error(
+            `Command timeout after ${timeoutDuration / 1000}s: ${request.command}. ` +
+              "The command was not interrupted and is still running in the KiCAD worker " +
+              "(killing it could leave a half-written file); its result will be discarded. " +
+              "Check the outcome before retrying. Raise the limit with " +
+              "KICAD_MCP_TOOL_TIMEOUTS or KICAD_MCP_COMMAND_TIMEOUT_MS if this is expected.",
+          ),
+        );
       }, timeoutDuration);
 
       // Store the current request handler
