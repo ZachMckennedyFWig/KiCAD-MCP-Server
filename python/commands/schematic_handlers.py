@@ -348,6 +348,10 @@ class SchematicHandlersMixin:
             schematic_path = params.get("schematicPath")
             reference = params.get("reference")
             delete_attached_labels = bool(params.get("deleteAttachedLabels", False))
+            # Wires that only served the deleted symbol's pins are trimmed along
+            # with its labels (#5g). Defaults to the label flag so a single
+            # "clean up after this part" switch covers both.
+            delete_attached_wires = bool(params.get("deleteAttachedWires", delete_attached_labels))
             unit = params.get("unit")
 
             if not schematic_path:
@@ -438,14 +442,14 @@ class SchematicHandlersMixin:
             # the optional label cleanup knows where its labels sat.
             target_pin_positions: List[Tuple[float, float]] = []
             label_cleanup_warning: Optional[str] = None
-            if delete_attached_labels:
+            if delete_attached_labels or delete_attached_wires:
                 try:
                     target_pin_positions = self._pin_positions_for_reference(
                         content, reference, unit
                     )
                     if not target_pin_positions:
                         logger.warning(
-                            "deleteAttachedLabels: no pin positions resolvable "
+                            "deleteAttachedLabels/Wires: no pin positions resolvable "
                             "for %s (missing lib_symbols entry?); skipping "
                             "label cleanup",
                             reference,
@@ -476,13 +480,22 @@ class SchematicHandlersMixin:
                 "schematic": str(sch_file),
             }
 
+            label_targets = list(target_pin_positions)
+            if delete_attached_wires and label_cleanup_warning is None:
+                wire_result = self._delete_dangling_wires_at(sch_file, target_pin_positions)
+                exposed = wire_result.pop("_exposed", [])
+                result.update(wire_result)
+                # A label at the far end of a removed stub is now floating
+                # too; let the label pass consider those points as well.
+                label_targets.extend(exposed)
+
             if delete_attached_labels:
                 if label_cleanup_warning is not None:
                     result["deleted_labels"] = []
                     result["deleted_label_count"] = 0
                     result["labelCleanupWarning"] = label_cleanup_warning
                 else:
-                    result.update(self._delete_dangling_labels_at(sch_file, target_pin_positions))
+                    result.update(self._delete_dangling_labels_at(sch_file, label_targets))
 
             return result
 
@@ -545,6 +558,47 @@ class SchematicHandlersMixin:
                         mini_doc.append(item)
                     break
         return WireManager._collect_pin_positions(mini_doc)
+
+    @staticmethod
+    def _delete_dangling_wires_at(
+        sch_file: Path, target_positions: List[Tuple[float, float]]
+    ) -> Dict[str, Any]:
+        """Trim wires left dangling at a removed symbol's pin positions (#5g).
+
+        Delegates to WireManager.prune_dangling_wires, which only removes a
+        wire whose end sits on a deleted pin with nothing else there, and walks
+        on through bare corners until it reaches a junction, pin, label or
+        sheet pin. Never raises; failures are reported via
+        ``wireCleanupWarning``. ``_exposed`` (internal, popped by the caller)
+        lists the end points of removed wires so the label pass can drop
+        labels left floating there.
+        """
+        try:
+            if not target_positions:
+                return {"deleted_wires": [], "deleted_wire_count": 0, "_exposed": []}
+            with open(sch_file, "r", encoding="utf-8") as f:
+                sch_data = sexpdata.loads(f.read())
+            removed = WireManager.prune_dangling_wires(sch_data, target_positions)
+            if removed:
+                with open(sch_file, "w", encoding="utf-8") as f:
+                    f.write(kicad_dumps(sch_data))
+                logger.info("Deleted %d dangling wire segment(s)", len(removed))
+            return {
+                "deleted_wires": [
+                    {"start": {"x": a[0], "y": a[1]}, "end": {"x": b[0], "y": b[1]}}
+                    for a, b in removed
+                ],
+                "deleted_wire_count": len(removed),
+                "_exposed": [pt for seg in removed for pt in seg],
+            }
+        except Exception as e:
+            logger.warning(f"Wire cleanup after component delete failed: {e}")
+            return {
+                "deleted_wires": [],
+                "deleted_wire_count": 0,
+                "wireCleanupWarning": str(e),
+                "_exposed": [],
+            }
 
     @staticmethod
     def _delete_dangling_labels_at(

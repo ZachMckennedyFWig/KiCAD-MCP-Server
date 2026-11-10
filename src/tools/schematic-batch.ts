@@ -213,7 +213,7 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
   // Net labels on many pins
   server.tool(
     "batch_connect",
-    "Place net labels on multiple pins in one call to wire nets quickly. 'connections' is a map {reference: {pin: netName}} where pin is a number or name. labelType selects 'label' (sheet-local, the default) or 'global_label' (connects across all sheets by name — use this for power rails and any net that spans sheets). For local labels, if a facing label for the same net is nearby a wire is drawn instead of a duplicate label; global labels are placed one-per-pin since they join their net by name. Set replace=true to clear any existing label at a pin first. Warns about power nets missing a PWR_FLAG.",
+    "Place net labels on multiple pins in one call to wire nets quickly. 'connections' is a map {reference: {pin: netName}} where pin is a number or name. labelType selects 'label' (sheet-local, the default) or 'global_label' (connects across all sheets by name — use this for power rails and any net that spans sheets). For local labels, if a facing label for the same net is nearby an orthogonal wire (straight, or a Z with a grid-snapped jog — never diagonal) is drawn instead of a duplicate label; when that wire would land on or cross another object a plain label is placed instead. Global labels are placed one-per-pin since they join their net by name. On two-pin parts a label whose text would overlap a visible Reference/Value field is moved 2.54 or 5.08 mm out along the pin with a stub wire (avoidFieldOverlap, default true). Set replace=true to remove every existing label (local, global, hierarchical) on each pin first. Coordinates are schematic mm, origin top-left, Y down. Returns {success, message, placed:[{ref, pin, net, position:{x,y}, label_position?, wire?, note?, replaced?}], failed:[{ref, pin, reason}], warnings?}. Warns only about nets touched by this call that hold a power_in pin and no power_out pin (PWR_FLAG or regulator output) anywhere in the sheet hierarchy.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       connections: z
@@ -230,7 +230,16 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
         .boolean()
         .optional()
         .default(false)
-        .describe("Delete existing labels at each pin before placing (default false)"),
+        .describe(
+          "Delete every existing label (local, global, hierarchical) at each pin, and a label at the end of a bare stub from it, before placing (default false)",
+        ),
+      avoidFieldOverlap: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe(
+          "On two-pin parts, move a label out along the pin (with a stub wire) when its text would overlap a visible Reference/Value field (default true)",
+        ),
     },
     async (args: any) => {
       const r = await callKicadScript("batch_connect", args);

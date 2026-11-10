@@ -443,6 +443,7 @@ try:
     from commands.routing import RoutingCommands
     from commands.schematic import SchematicLoadError, SchematicManager
     from commands.schematic_batch import SchematicBatchCommands
+    from commands.schematic_connectivity import assert_connectivity, relabel_net
     from commands.schematic_declutter import SchematicDeclutterCommands
     from commands.schematic_field_layout import SchematicFieldLayoutCommands
     from commands.schematic_hierarchy import SchematicHierarchyCommands
@@ -706,6 +707,9 @@ class KiCADInterface(SchematicHandlersMixin):
             "batch_add_no_connects": self.batch_commands.batch_add_no_connects,
             "batch_connect": self.batch_commands.batch_connect,
             "batch_add_and_connect": self.batch_commands.batch_add_and_connect,
+            # Connectivity verification and net renaming (hierarchy-wide)
+            "assert_connectivity": assert_connectivity,
+            "relabel_net": relabel_net,
             "update_symbol_from_library": update_symbol_from_library,
             "add_library_symbol_property": add_library_symbol_property,
             # JLCPCB API commands (complete parts catalog via API)
@@ -1407,6 +1411,7 @@ class KiCADInterface(SchematicHandlersMixin):
         "repair_flat_symbols",
         "replace_instance_lib_ids",
         "replace_schematic_component",
+        "relabel_net",
         "rotate_schematic_component",
         "set_schematic_component_property",
         "set_schematic_property_position",
@@ -1423,6 +1428,7 @@ class KiCADInterface(SchematicHandlersMixin):
         "enrich_datasheets": lambda p: not bool(p.get("dry_run", False)),
         "lint_offgrid": lambda p: bool(p.get("fix", False)),
         "lint_schematic_cosmetic": lambda p: not bool(p.get("dryRun", False)),
+        "relabel_net": lambda p: not bool(p.get("dryRun", False)),
         "repair_flat_symbols": lambda p: not bool(p.get("dryRun", True))
         and str(p.get("path", "")).endswith(".kicad_sch"),
         "suggest_schematic_declutter": lambda p: bool(p.get("apply", False)),
