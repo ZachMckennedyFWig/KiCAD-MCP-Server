@@ -1652,8 +1652,15 @@ edit_schematic_component and set its value to an empty string.`,
     {
       schematicPath: z.string().describe("Absolute path to the .kicad_sch schematic file"),
       boardPath: z.string().describe("Absolute path to the .kicad_pcb board file"),
+      updateFootprints: z
+        .boolean()
+        .optional()
+        .describe(
+          "Replace board footprints whose schematic Footprint field changed, keeping position, " +
+            "rotation, side and nets (default true). false only reports them in footprints_mismatched.",
+        ),
     },
-    async (args: { schematicPath: string; boardPath: string }) => {
+    async (args: { schematicPath: string; boardPath: string; updateFootprints?: boolean }) => {
       const result = await callKicadScript("sync_schematic_to_board", args);
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],

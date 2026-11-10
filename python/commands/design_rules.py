@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pcbnew
-from commands.routing import persist_net_assignment_to_project
+from commands.routing import assign_net_class_in_memory, persist_net_assignment_to_project
 from utils.kicad_cli import kicad_cli_not_found_message, resolve_kicad_cli
 from utils.kicad_dru import (
     build_layer_constraint_rule,
@@ -19,6 +19,20 @@ from utils.kicad_dru import (
 )
 
 logger = logging.getLogger("kicad_interface")
+
+
+def _project_defines_class(pro_path: Optional[str], class_name: str) -> bool:
+    """True when ``net_settings.classes`` in ``pro_path`` has ``class_name``."""
+    import json
+
+    if not pro_path or not os.path.isfile(pro_path):
+        return False
+    try:
+        with open(pro_path, "r", encoding="utf-8") as handle:
+            classes = (json.load(handle).get("net_settings") or {}).get("classes") or []
+    except (OSError, ValueError, AttributeError):
+        return False
+    return any(isinstance(c, dict) and c.get("name") == class_name for c in classes)
 
 
 class DesignRuleCommands:
@@ -336,7 +350,17 @@ class DesignRuleCommands:
                 except Exception:
                     resolved = None
 
-            if resolved is None:
+            pro_path = None
+            try:
+                board_path = self.board.GetFileName()
+                if board_path and board_path.endswith(".kicad_pcb"):
+                    pro_path = str(Path(board_path).with_suffix(".kicad_pro"))
+            except Exception:
+                pro_path = None
+
+            # A headless LoadBoard does not always carry the project's classes,
+            # so a class defined only in .kicad_pro counts as existing too.
+            if resolved is None and not _project_defines_class(pro_path, class_name):
                 return {
                     "success": False,
                     "message": f"Net class not found: {class_name}",
@@ -345,18 +369,12 @@ class DesignRuleCommands:
 
             in_memory_warning = None
             try:
-                net.SetClass(resolved)
+                # KiCad 10 has no NETINFO_ITEM.SetClass (#5k); the helper uses
+                # NET_SETTINGS pattern assignment there.
+                assign_net_class_in_memory(self.board, net, net_name, class_name, resolved)
             except Exception as exc:
                 in_memory_warning = f"in-memory net class assignment failed: {exc}"
                 logger.warning("assign_net_to_class: %s", in_memory_warning)
-
-            pro_path = None
-            try:
-                board_path = self.board.GetFileName()
-                if board_path and board_path.endswith(".kicad_pcb"):
-                    pro_path = str(Path(board_path).with_suffix(".kicad_pro"))
-            except Exception:
-                pro_path = None
 
             persist = persist_net_assignment_to_project(pro_path, net_name, class_name)
 

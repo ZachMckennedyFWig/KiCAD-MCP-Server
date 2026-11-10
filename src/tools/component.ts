@@ -414,11 +414,24 @@ export function registerComponentTools(server: McpServer, callKicadScript: Comma
   // ------------------------------------------------------
   server.tool(
     "replace_component",
-    "Replace an existing PCB component with a different component type, optionally changing footprint and value.",
+    "Swap a placed PCB footprint for another library footprint, keeping its reference, value, " +
+      "position, rotation, board side, schematic link, custom fields and pad nets (matched by " +
+      "pad number). Returns {success, component: {reference, value, footprint, " +
+      "previousFootprint, position: {x, y, unit: 'mm'}, rotation (deg), side}, padNetsKept, " +
+      "droppedPadNets?} - droppedPadNets lists old pad numbers with nets that the new " +
+      "footprint does not have.",
     {
       reference: z.string().describe("Reference designator of the component to replace"),
-      newComponentId: z.string().describe("ID of the new component to use"),
-      newFootprint: z.string().optional().describe("Optional new footprint"),
+      newFootprint: z
+        .string()
+        .optional()
+        .describe("New footprint as 'Library:Footprint', e.g. 'Resistor_SMD:R_0805_2012Metric'"),
+      newComponentId: z
+        .string()
+        .optional()
+        .describe(
+          "Alternative to newFootprint: 'Library:Footprint' or a bare footprint name searched in every library",
+        ),
       newValue: z.string().optional().describe("Optional new component value"),
     },
     async ({ reference, newComponentId, newFootprint, newValue }) => {

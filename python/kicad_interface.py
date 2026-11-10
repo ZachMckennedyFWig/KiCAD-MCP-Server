@@ -614,6 +614,7 @@ class KiCADInterface(SchematicHandlersMixin):
             "suggest_placement": self.component_commands.suggest_placement,
             "duplicate_component": self.component_commands.duplicate_component,
             "set_footprint_type": self.component_commands.set_footprint_type,
+            "replace_component": self.component_commands.replace_component,
             # Routing commands
             "add_net": self.routing_commands.add_net,
             "route_trace": self.routing_commands.route_trace,
@@ -633,6 +634,7 @@ class KiCADInterface(SchematicHandlersMixin):
             "create_netclass": self.routing_commands.create_netclass,
             "set_net_color": self.routing_commands.set_net_color,
             "add_copper_pour": self.routing_commands.add_copper_pour,
+            "add_zone": self.routing_commands.add_zone,
             "route_differential_pair": self.routing_commands.route_differential_pair,
             "refill_zones": self._handle_refill_zones,
             # Design rule commands
@@ -1171,6 +1173,19 @@ class KiCADInterface(SchematicHandlersMixin):
                 result = handler(params)
                 logger.debug(f"Command result: {result}")
 
+                # A command that wrote the .kicad_pcb itself (not through
+                # auto-save) reports it with this private key. Adopt the write
+                # as the new on-disk baseline -- reloading memory when the file
+                # was written from a separate board -- so the auto-save guard
+                # does not mistake it for an external edit (#5h / #5n).
+                if isinstance(result, dict) and "_boardFileWritten" in result:
+                    written = result.pop("_boardFileWritten")
+                    if not self._adopt_board_file_write(written):
+                        result.setdefault("warnings", []).append(
+                            "The board file was written, but the in-memory board could not "
+                            "be reloaded from it. Run open_board before further edits."
+                        )
+
                 # Add backend indicator
                 if isinstance(result, dict):
                     backend = self._result_backend_for_command(command, result)
@@ -1350,6 +1365,8 @@ class KiCADInterface(SchematicHandlersMixin):
         "add_board_text",
         "move_footprint_text",
         "add_copper_pour",
+        "add_zone",
+        "replace_component",
         "refill_zones",
         "import_svg_logo",
         "sync_schematic_to_board",
@@ -1943,6 +1960,55 @@ class KiCADInterface(SchematicHandlersMixin):
         if first is None:
             return True
         return all(hasattr(first, m) for m in self._ITEM_HEALTH_METHODS)
+
+    def _adopt_board_file_write(self, written: Any) -> bool:
+        """Make a command's own write of the ``.kicad_pcb`` the new disk baseline.
+
+        Several tools write the board file through a path other than
+        ``_auto_save_board`` (sync_schematic_to_board, autoroute, import_ses,
+        set_board_origin, hierarchical_place, refill_zones, ...). Without
+        this, the recorded disk signature still describes the old file, so
+        the next auto-save refuses with "changed externally" and leaves
+        ``memChangesUnsaved`` set although nothing external happened
+        (#5h / #5n).
+
+        ``written`` is ``"memory"``/``"disk"`` or ``{"mode": ..., "path": ...}``:
+
+        * ``memory`` -- the file was saved from ``self.board``; memory and
+          disk agree, so only the signature is refreshed.
+        * ``disk`` -- the file was written from a separately loaded board or
+          edited as text; ``self.board`` is stale and is reloaded from disk.
+
+        A write to a different file than the loaded board needs nothing.
+        Returns False only when a needed reload failed.
+        """
+        if isinstance(written, dict):
+            mode = written.get("mode", "memory")
+            path = written.get("path")
+        else:
+            mode, path = (written if isinstance(written, str) else "memory"), None
+
+        current = self._current_board_path()
+        if not current:
+            return True
+        if path and self._normalize_board_path(path) != self._normalize_board_path(current):
+            return True
+
+        if mode != "disk":
+            self._record_board_signature()
+            self._last_auto_save_status = None
+            return True
+
+        board = self._safe_load_board(current)
+        if board is None:
+            logger.warning(f"Could not reload {current} after a tool rewrote it")
+            return False
+        self.board = board
+        self.project_commands.board = board
+        self._update_command_handlers()
+        self._record_board_signature()
+        self._last_auto_save_status = None
+        return True
 
     def _reload_stackup_file(self) -> bool:
         """Reload the board after set_stackup_layer writes its file.
@@ -5100,6 +5166,9 @@ class KiCADInterface(SchematicHandlersMixin):
                 if reloaded is not None:
                     self.board = reloaded
                     self._update_command_handlers()
+                    # Our own text write is the new baseline, not an external edit.
+                    self._record_board_signature()
+                    self._last_auto_save_status = None
                     logger.info("Reloaded board into pcbnew after SVG logo import")
                 else:
                     logger.warning(
@@ -5319,6 +5388,10 @@ print("ok")
                         }
                     self.board = reloaded
                     self._update_command_handlers()
+                    # The subprocess rewrote the file; make it the disk baseline so
+                    # the auto-save after this command does not refuse it (#5n).
+                    self._record_board_signature()
+                    self._last_auto_save_status = None
                     logger.info("Zone fill subprocess succeeded")
                     return {
                         "success": True,

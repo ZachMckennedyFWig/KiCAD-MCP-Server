@@ -13,6 +13,12 @@ import pcbnew
 from commands.library import LibraryManager
 from commands.placement_optimizer import PlacementOptimizerCommands
 from utils.board_items import delete_board_item
+from utils.footprint_swap import (
+    FootprintLoadError,
+    footprint_lib_id,
+    load_library_footprint,
+    swap_footprint,
+)
 
 logger = logging.getLogger("kicad_interface")
 
@@ -631,38 +637,21 @@ class ComponentCommands(PlacementOptimizerCommands):
                         "errorDetails": f"Could not find footprint library: {lib_name}",
                     }
 
-                new_module = pcbnew.FootprintLoad(library_path, fp_name)
-                if not new_module:
+                try:
+                    new_module = load_library_footprint(library_path, fp_name)
+                except FootprintLoadError as e:
                     return {
                         "success": False,
                         "message": "Failed to load footprint",
-                        "errorDetails": f"Could not load footprint from {lib_name}:{fp_name}",
+                        "errorDetails": f"Could not load footprint from {lib_name}:{fp_name}: {e}",
                     }
 
                 # Replace the physical footprint (pads, courtyard, silkscreen, ...), not just
                 # the FPID string: mirrors KiCAD's own PCB_EDIT_FRAME::ExchangeFootprint(),
                 # preserving identity, placement and pad-to-net connectivity by pad number.
-                new_module.SetReference(module.GetReference())
-                new_module.SetValue(module.GetValue())
-                new_module.SetPosition(module.GetPosition())
-                new_module.SetOrientation(module.GetOrientation())
-                new_module.SetFPID(pcbnew.LIB_ID(lib_name, fp_name))
-                new_module.SetPath(module.GetPath())
-                new_module.SetAttributes(module.GetAttributes())
-                new_module.SetLocked(module.IsLocked())
-
-                old_nets = {pad.GetNumber(): pad.GetNet() for pad in module.Pads()}
-                for pad in new_module.Pads():
-                    net = old_nets.get(pad.GetNumber())
-                    if net is not None:
-                        pad.SetNet(net)
-
-                was_flipped = module.IsFlipped()
-                self.board.Add(new_module)
-                if was_flipped and not new_module.IsFlipped():
-                    new_module.Flip(new_module.GetPosition(), False)
-                delete_board_item(self.board, module)
-                module = new_module
+                module, _swap_report = swap_footprint(
+                    self.board, module, new_module, lib_name, fp_name
+                )
 
             return {
                 "success": True,
@@ -677,6 +666,115 @@ class ComponentCommands(PlacementOptimizerCommands):
         except Exception as e:
             logger.error(f"Error editing component: {str(e)}")
             return {"success": False, "message": "Failed to edit component", "errorDetails": str(e)}
+
+    def replace_component(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Swap a placed footprint for another library footprint (MCP_ISSUES #5i / B2).
+
+        Keeps reference, value (unless ``newValue``), position, rotation, board
+        side, schematic link, attributes, lock state, custom fields and every
+        pad's net, matched by pad number. The new footprint is named by
+        ``newFootprint`` ("Library:Footprint"), or by ``newComponentId`` when
+        ``newFootprint`` is omitted ("Library:Footprint" or a bare footprint
+        name searched in every library).
+        """
+        try:
+            if not self.board:
+                return {
+                    "success": False,
+                    "message": "No board is loaded",
+                    "errorDetails": "Load or create a board first",
+                }
+
+            reference = params.get("reference")
+            spec = params.get("newFootprint") or params.get("newComponentId")
+            new_value = params.get("newValue")
+            if not reference or not spec:
+                return {
+                    "success": False,
+                    "message": "Missing parameters",
+                    "errorDetails": "reference and newFootprint (or newComponentId) are required",
+                }
+
+            module = self.board.FindFootprintByReference(reference)
+            if not module:
+                return {
+                    "success": False,
+                    "message": "Component not found",
+                    "errorDetails": f"Could not find component: {reference}",
+                }
+
+            library_path = None
+            lib_name = ""
+            fp_name = spec
+            if ":" in spec:
+                lib_name, fp_name = spec.split(":", 1)
+                library_path = self.library_manager.get_library_path(lib_name)
+                if not library_path:
+                    return {
+                        "success": False,
+                        "message": "Library not found",
+                        "errorDetails": f"Footprint library '{lib_name}' is not in fp-lib-table",
+                    }
+            else:
+                found = self.library_manager.find_footprint(spec)
+                if found:
+                    library_path, fp_name = found
+                    for nick, path in self.library_manager.libraries.items():
+                        if path == library_path:
+                            lib_name = nick
+                            break
+                if not library_path or not lib_name:
+                    return {
+                        "success": False,
+                        "message": "Footprint not found",
+                        "errorDetails": (
+                            f"Could not find footprint '{spec}' in any library; "
+                            "pass newFootprint as 'Library:Footprint'"
+                        ),
+                    }
+
+            try:
+                new_module = load_library_footprint(library_path, fp_name)
+            except FootprintLoadError as e:
+                return {
+                    "success": False,
+                    "message": "Failed to load footprint",
+                    "errorDetails": str(e),
+                }
+
+            module, report = swap_footprint(
+                self.board, module, new_module, lib_name, fp_name, value=new_value
+            )
+            pos = module.GetPosition()
+            result: Dict[str, Any] = {
+                "success": True,
+                "message": (
+                    f"Replaced {reference}: {report['oldFootprint'] or '?'} -> "
+                    f"{report['newFootprint']}"
+                ),
+                "component": {
+                    "reference": reference,
+                    "value": module.GetValue(),
+                    "footprint": report["newFootprint"],
+                    "previousFootprint": report["oldFootprint"],
+                    "position": {"x": pos.x / 1e6, "y": pos.y / 1e6, "unit": "mm"},
+                    "rotation": module.GetOrientation().AsDegrees(),
+                    "side": report["side"],
+                },
+                "padNetsKept": report["padNetsKept"],
+            }
+            if report.get("droppedPadNets"):
+                result["droppedPadNets"] = report["droppedPadNets"]
+                result["warnings"] = [report["warning"]]
+            return result
+
+        except Exception as e:
+            logger.error(f"Error replacing component: {str(e)}")
+            return {
+                "success": False,
+                "message": "Failed to replace component",
+                "errorDetails": str(e),
+            }
 
     def set_footprint_type(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Set the placement type and exclusion flags of an existing PCB footprint.

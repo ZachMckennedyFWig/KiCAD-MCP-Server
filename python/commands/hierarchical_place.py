@@ -58,6 +58,9 @@ class HierarchicalPlaceCommands:
                 "success": True,
                 "placed_count": placed,
                 "footprint_count": footprint_count,
+                # Written from a separately loaded board: the dispatcher reloads
+                # the in-memory board if it is this file (#5n).
+                "_boardFileWritten": {"mode": "disk", "path": str(path)},
                 "message": (
                     f"Hierarchically placed {placed} footprint(s) in {path.name}; "
                     "clustered by schematic sheet"

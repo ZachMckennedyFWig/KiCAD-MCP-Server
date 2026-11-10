@@ -510,13 +510,54 @@ def _reconcile_ses_net_names(
     return _SES_NET_TOKEN_RE.sub(_repl, ses_text), remapped
 
 
+def _dsn_failure_diagnostics(board: Any, output_path: str) -> List[str]:
+    """Likely reasons for a silent ``ExportSpecctraDSN`` failure.
+
+    KiCad catches the exporter's exception and returns ``False``, so the
+    reason is lost; these are the causes that can be checked from Python.
+    Verified on KiCad 10.0.8: a missing directory or a file name with a
+    character Windows forbids (``<>:"|?*``) makes the export return False.
+    """
+    hints: List[str] = []
+    out_dir = os.path.dirname(os.path.abspath(output_path))
+    name = os.path.basename(output_path)
+    bad_chars = sorted(set(c for c in name if c in '<>:"|?*' or ord(c) < 32))
+    if os.name == "nt" and bad_chars:
+        hints.append(f"output file name contains characters Windows does not allow: {bad_chars}")
+    elif not os.path.isdir(out_dir):
+        hints.append(f"output directory does not exist: {out_dir}")
+    elif not os.access(out_dir, os.W_OK):
+        hints.append(f"output directory is not writable: {out_dir}")
+    elif os.path.exists(output_path):
+        try:
+            with open(output_path, "a", encoding="utf-8"):
+                pass
+        except OSError as exc:
+            hints.append(f"output file is locked or read-only ({exc})")
+    try:
+        refs: Dict[str, int] = {}
+        for fp in board.GetFootprints():
+            ref = fp.GetReference()
+            refs[ref] = refs.get(ref, 0) + 1
+        if refs.get("", 0):
+            hints.append(f"{refs['']} footprint(s) have an empty reference")
+        dups = sorted(r for r, n in refs.items() if r and n > 1)
+        if dups:
+            hints.append("duplicate references: " + ", ".join(dups[:20]))
+    except Exception:
+        pass
+    return hints
+
+
 class FreeroutingCommands:
     """Handles Freerouting autoroute operations."""
 
     def __init__(self, board: Any = None) -> None:
         self.board = board
 
-    def _apply_project_net_classes(self, board_path: Optional[str]) -> Dict[str, Any]:
+    def _apply_project_net_classes(
+        self, board_path: Optional[str], board: Any = None
+    ) -> Dict[str, Any]:
         """Push the project's net classes into the loaded board before DSN
         export (#302).
 
@@ -548,7 +589,9 @@ class FreeroutingCommands:
             }
         custom = [c["name"] for c in settings["classes"] if c.get("name") != "Default"]
         try:
-            report = apply_net_classes_to_board(self.board, settings)
+            report = apply_net_classes_to_board(
+                board if board is not None else self.board, settings
+            )
         except Exception as exc:
             detail = (
                 f"project defines net classes {custom} but they could not be "
@@ -561,6 +604,79 @@ class FreeroutingCommands:
         if report["applied"]:
             logger.info(f"Applied project net classes to board: {report['applied']}")
         return report
+
+    def _export_dsn_robust(self, output_path: str, board_path: Optional[str]) -> Dict[str, Any]:
+        """Export a DSN, falling back to a fresh disk load of the saved board (#5l).
+
+        ``ExportSpecctraDSN`` swallows the exporter's exception and returns
+        ``False``. The in-memory board is tried first (project net classes
+        already applied by the caller). On failure, a path problem is reported
+        straight away; otherwise the saved ``.kicad_pcb`` is loaded fresh,
+        given the project classes, and exported.
+
+        Returns ``{"ok": True, "source": "memory"|"disk", "warnings": [...]}``
+        or ``{"ok": False, "errorDetails": str}``.
+        """
+        import pcbnew
+
+        attempts: List[str] = []
+
+        def _try(board: Any, label: str) -> bool:
+            try:
+                result = pcbnew.ExportSpecctraDSN(board, output_path)
+            except Exception as exc:
+                attempts.append(f"{label}: {exc}")
+                return False
+            if _api_ok(result) and os.path.isfile(output_path):
+                return True
+            if _api_ok(result):
+                attempts.append(f"{label}: exporter reported success but wrote no file")
+            else:
+                attempts.append(f"{label}: ExportSpecctraDSN returned: {result}")
+            return False
+
+        if _try(self.board, "in-memory board"):
+            return {"ok": True, "source": "memory", "warnings": []}
+
+        hints = _dsn_failure_diagnostics(self.board, output_path)
+        output_problem = any(h.startswith("output") for h in hints)
+        if output_problem:
+            # A path problem fails the same way for any board: report it now.
+            return {
+                "ok": False,
+                "errorDetails": "; ".join(attempts) + ". Likely cause: " + "; ".join(hints),
+            }
+        can_reload = bool(board_path) and os.path.isfile(str(board_path))
+        if can_reload:
+            try:
+                disk_board = pcbnew.LoadBoard(board_path)
+            except Exception as exc:
+                disk_board = None
+                attempts.append(f"reload of {board_path} failed: {exc}")
+            if disk_board is not None:
+                self._apply_project_net_classes(board_path, board=disk_board)
+                if _try(disk_board, "saved board reloaded from disk"):
+                    return {
+                        "ok": True,
+                        "source": "disk",
+                        "warnings": [
+                            "The in-memory board could not be exported "
+                            f"({attempts[0]}); the DSN was exported from the saved file "
+                            f"{board_path} instead. Changes not yet saved are not in it."
+                        ],
+                    }
+        else:
+            attempts.append("no saved board file to fall back to")
+
+        detail = "; ".join(attempts)
+        if hints:
+            detail += ". Likely cause: " + "; ".join(hints)
+        else:
+            detail += (
+                ". KiCad does not report the exporter's reason; check the output path, "
+                "run DRC, and check the board outline and footprint references."
+            )
+        return {"ok": False, "errorDetails": detail}
 
     def _apply_edge_clearance(self, dsn_path: str) -> None:
         """Grow hole keepouts in the exported DSN to the board's copper-to-edge clearance."""
@@ -794,20 +910,15 @@ class FreeroutingCommands:
 
         # Step 1: Export DSN (once, regardless of attempt count)
         logger.info(f"Exporting DSN to {dsn_path}")
-        try:
-            result = pcbnew.ExportSpecctraDSN(self.board, dsn_path)
-            if not _api_ok(result):
-                return {
-                    "success": False,
-                    "message": "DSN export failed",
-                    "errorDetails": (f"ExportSpecctraDSN returned: {result}"),
-                }
-        except Exception as e:
+        export = self._export_dsn_robust(dsn_path, board_path)
+        if not export["ok"]:
             return {
                 "success": False,
                 "message": "DSN export failed",
-                "errorDetails": str(e),
+                "errorDetails": export["errorDetails"],
+                "netClasses": netclass_report,
             }
+        export_warnings: List[str] = list(export["warnings"])
 
         if not os.path.isfile(dsn_path):
             return {
@@ -1022,11 +1133,17 @@ class FreeroutingCommands:
                 pass
 
         # Step 4: Save board
+        saved = False
         try:
             with preserve_project_settings(board_path):
                 self.board.Save(board_path)
+            saved = True
         except Exception as e:
             logger.warning(f"Board save after autoroute failed: {e}")
+            export_warnings.append(
+                f"Routes were imported into the in-memory board but saving {board_path} "
+                f"failed ({e}); call save_project."
+            )
 
         # Collect stats
         tracks = self.board.GetTracks()
@@ -1060,6 +1177,14 @@ class FreeroutingCommands:
             "netClasses": netclass_report,
             "freerouting_stdout": best_proc_stdout[:1000],
         }
+        if netclass_report.get("warning"):
+            export_warnings.append(netclass_report["warning"])
+        if export_warnings:
+            response["warnings"] = export_warnings
+        if saved:
+            # Saved from the in-memory board: tell the dispatcher so the
+            # auto-save guard treats it as ours, not an external edit (#5n).
+            response["_boardFileWritten"] = {"mode": "memory", "path": board_path}
         if attempts > 1:
             response["attempts"] = attempt_results
             response["best_attempt"] = best_attempt_idx + 1
@@ -1106,31 +1231,32 @@ class FreeroutingCommands:
         if netclass_report.get("warning"):
             logger.warning(f"Net-class application: {netclass_report['warning']}")
 
-        try:
-            result = pcbnew.ExportSpecctraDSN(self.board, output_path)
-            if not _api_ok(result):
-                return {
-                    "success": False,
-                    "message": "DSN export failed",
-                    "errorDetails": (f"ExportSpecctraDSN returned: {result}"),
-                }
-        except Exception as e:
+        export = self._export_dsn_robust(output_path, board_path)
+        if not export["ok"]:
             return {
                 "success": False,
                 "message": "DSN export failed",
-                "errorDetails": str(e),
+                "errorDetails": export["errorDetails"],
+                "netClasses": netclass_report,
             }
 
         if os.path.isfile(output_path):
             self._apply_edge_clearance(output_path)
         file_size = os.path.getsize(output_path) if os.path.isfile(output_path) else 0
-        return {
+        response: Dict[str, Any] = {
             "success": True,
             "message": f"Exported DSN to {output_path}",
             "path": output_path,
             "size_bytes": file_size,
+            "source": export["source"],
             "netClasses": netclass_report,
         }
+        warnings = list(export["warnings"])
+        if netclass_report.get("warning"):
+            warnings.append(netclass_report["warning"])
+        if warnings:
+            response["warnings"] = warnings
+        return response
 
     def _board_net_names(self) -> List[str]:
         """All net names currently on the loaded board (same enumeration as
@@ -1245,12 +1371,19 @@ class FreeroutingCommands:
                     pass
 
         board_path = params.get("boardPath") or self.board.GetFileName()
+        saved = False
+        save_warning = None
         if board_path:
             try:
                 with preserve_project_settings(board_path):
                     self.board.Save(board_path)
+                saved = True
             except Exception as e:
                 logger.warning(f"Board save after SES import failed: {e}")
+                save_warning = (
+                    f"Routes were imported into the in-memory board but saving {board_path} "
+                    f"failed ({e}); call save_project."
+                )
 
         tracks = self.board.GetTracks()
         track_count = sum(1 for t in tracks if t.GetClass() != "PCB_VIA")
@@ -1270,6 +1403,12 @@ class FreeroutingCommands:
         if placement_skipped:
             # Those parts kept their board position; the routes imported anyway.
             response["placementSkipped"] = sorted(set(placement_skipped))
+        if save_warning:
+            response["warnings"] = [save_warning]
+        if saved:
+            # Saved from the in-memory board: tell the dispatcher so the
+            # auto-save guard treats it as ours, not an external edit (#5n).
+            response["_boardFileWritten"] = {"mode": "memory", "path": board_path}
         return response
 
     def check_freerouting(self, params: Dict[str, Any]) -> Dict[str, Any]:
