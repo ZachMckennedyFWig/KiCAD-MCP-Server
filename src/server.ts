@@ -16,6 +16,7 @@ import { registerProjectTools } from "./tools/project.js";
 import { registerBoardTools } from "./tools/board.js";
 import { registerComponentTools } from "./tools/component.js";
 import { registerRoutingTools } from "./tools/routing.js";
+import { registerBoardQueryTools } from "./tools/board-query.js";
 import { registerDesignRuleTools } from "./tools/design-rules.js";
 import { registerExportTools } from "./tools/export.js";
 import { registerSchematicTools } from "./tools/schematic.js";
@@ -386,6 +387,7 @@ export class KiCADMcpServer {
     registerBoardTools(this.server, this.callKicadScript.bind(this));
     registerComponentTools(this.server, this.callKicadScript.bind(this));
     registerRoutingTools(this.server, this.callKicadScript.bind(this));
+    registerBoardQueryTools(this.server, this.callKicadScript.bind(this));
     registerDesignRuleTools(this.server, this.callKicadScript.bind(this));
     registerExportTools(this.server, this.callKicadScript.bind(this));
     registerSchematicTools(this.server, this.callKicadScript.bind(this));

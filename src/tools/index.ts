@@ -8,6 +8,7 @@ export { registerProjectTools } from "./project.js";
 export { registerBoardTools } from "./board.js";
 export { registerComponentTools } from "./component.js";
 export { registerRoutingTools } from "./routing.js";
+export { registerBoardQueryTools } from "./board-query.js";
 export { registerDesignRuleTools } from "./design-rules.js";
 export { registerExportTools } from "./export.js";
 export { registerSchematicTools } from "./schematic.js";

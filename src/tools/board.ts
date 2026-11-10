@@ -628,6 +628,11 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
       '  "inline" (default) — PNG/JPG rendered as an image visible to Claude; SVG returned as text.',
       '  "file" — image written next to the .kicad_pcb as <board>_2d_view.<ext>; filePath is returned.',
       "Use file mode for large boards to avoid MCP message-size limits.",
+      "Zoom and highlight: region, scale, highlightNets, showRatsnest or showDrcMarkers switch to a native renderer",
+      "(png/jpg) that draws the board from pcbnew geometry, in memory (unsaved edits included) or from pcbPath.",
+      "It crops to region {x0,y0,x1,y1} (mm, KiCad board coordinates), draws highlightNets in colour with everything",
+      "else grey, labels a mm grid, and returns a view legend: pixel (0,0) = (x0,y0), px = (x-x0)*pxPerMm,",
+      "plus highlight colours, ratsnest gap lines and DRC markers in view.",
     ].join(" "),
     {
       pcbPath: z
@@ -649,8 +654,45 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
         .describe(
           '"inline" (default): image returned directly; "file": written to disk, filePath returned',
         ),
+      region: z
+        .object({ x0: z.number(), y0: z.number(), x1: z.number(), y1: z.number() })
+        .optional()
+        .describe("Crop window in mm (KiCad board coordinates). Default: board outline + 1 mm"),
+      scale: z
+        .number()
+        .positive()
+        .optional()
+        .describe("Pixels per mm (e.g. 40 for a 0.4 mm-pitch QFN). Default: fit width x height"),
+      highlightNets: z
+        .array(z.string())
+        .optional()
+        .describe("Nets drawn in bright colours on top; everything else is greyed"),
+      showRatsnest: z
+        .union([z.boolean(), z.array(z.string())])
+        .optional()
+        .describe(
+          "Draw the gaps between islands (unrouted connections) for highlightNets (true) or the listed nets",
+        ),
+      showDrcMarkers: z
+        .boolean()
+        .optional()
+        .describe("Mark violations from the last run_drc report (<board>_drc_violations.json)"),
+      grid: z.boolean().optional().describe("Label a mm grid on region renders (default true)"),
     },
-    async ({ pcbPath, layers, width, height, format, responseMode }) => {
+    async ({
+      pcbPath,
+      layers,
+      width,
+      height,
+      format,
+      responseMode,
+      region,
+      scale,
+      highlightNets,
+      showRatsnest,
+      showDrcMarkers,
+      grid,
+    }) => {
       logger.debug("Getting 2D board view");
       const result = await callKicadScript("get_board_2d_view", {
         pcbPath,
@@ -659,13 +701,33 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
         height,
         format,
         responseMode,
+        region,
+        scale,
+        highlightNets,
+        showRatsnest,
+        showDrcMarkers,
+        grid,
       });
+      // Native (region/highlight) renders carry a legend: pixel mapping,
+      // highlight colours, ratsnest gaps, DRC markers.
+      const legend =
+        result.success && result.view
+          ? [
+              {
+                type: "text" as const,
+                text: JSON.stringify({ view: result.view, warnings: result.warnings }),
+              },
+            ]
+          : [];
 
       if (result.success) {
         // file mode — just return the path as text
         if (responseMode === "file" || result.filePath) {
           return {
-            content: [{ type: "text" as const, text: result.message || result.filePath }],
+            content: [
+              { type: "text" as const, text: result.message || result.filePath },
+              ...legend,
+            ],
           };
         }
         // inline svg (or fallback svg) — return as text, prepend any notice
@@ -686,6 +748,7 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
               data: result.imageData,
               mimeType: result.format === "jpg" ? "image/jpeg" : "image/png",
             },
+            ...legend,
           ],
         };
       }

@@ -288,6 +288,12 @@ export const toolCategories: ToolCategory[] = [
     ],
   },
   {
+    name: "inspection",
+    description:
+      "Board inspection: what is inside a window, per-net routing reports (length per layer, vias, plane-split crossings), connectivity islands of an item or net and the gaps between them",
+    tools: ["query_region", "net_report", "connected_items", "why_unconnected"],
+  },
+  {
     name: "autoroute",
     description: "Freerouting autorouter: automatic PCB routing via Specctra DSN/SES",
     tools: ["autoroute", "export_dsn", "import_ses", "check_freerouting"],
