@@ -418,6 +418,7 @@ try:
     )
     from commands.eagle import EagleCommands
     from commands.export import ExportCommands
+    from commands.finishing import FinishingCommands
     from commands.find_duplicate_symbols import find_duplicate_symbols
     from commands.footprint import FootprintCreator
     from commands.freerouting import FreeroutingCommands
@@ -454,6 +455,7 @@ try:
     from commands.symbol_pins import SymbolPinCommands
     from commands.symbol_repair import SymbolRepairCommands
     from commands.symbol_schematic import SymbolSchematicCommands
+    from commands.transplant import TransplantCommands
     from commands.update_symbol_from_library import update_symbol_from_library
     from commands.validate_kicad_files import validate_schematic, validate_symbol_library
     from commands.via_summary import ViaSummaryCommands
@@ -526,6 +528,10 @@ class KiCADInterface(SchematicHandlersMixin):
         self.design_rule_commands = DesignRuleCommands(self.board)
         self.export_commands = ExportCommands(self.board)
         self.hierarchical_place_commands = HierarchicalPlaceCommands()
+        # Finishing tools and layout transplant hold the interface rather than
+        # a board, so they always act on the current self.board.
+        self.finishing_commands = FinishingCommands(self)
+        self.transplant_commands = TransplantCommands(self)
         # GUI-driver channel (chrome, not design): socket client for the
         # in-KiCad helper plugin (gui_driver_plugin/) + the Linux AT-SPI shim.
         # Independent of kipy/SWIG — never touches board objects.
@@ -844,6 +850,14 @@ class KiCADInterface(SchematicHandlersMixin):
             "check_freerouting": self.freerouting_commands.check_freerouting,
             # Eagle import commands
             "import_eagle_project": self.eagle_commands.import_eagle_project,
+            # Finishing tools and reference-layout transplant (MCP_ISSUES F1, F2,
+            # F4, R4). Each supports dryRun and auto-saves itself only after a
+            # committed change, so they are not in _BOARD_MUTATING_COMMANDS.
+            "stitch_ground": self.finishing_commands.stitch_ground,
+            "tidy_silkscreen": self.finishing_commands.tidy_silkscreen,
+            "add_pin_labels": self.finishing_commands.add_pin_labels,
+            "cleanup_dangling": self.finishing_commands.cleanup_dangling,
+            "transplant_layout": self.transplant_commands.transplant_layout,
             # Schematic migration
             "replace_instance_lib_ids": self.symbol_schematic_commands.replace_instance_lib_ids,
             # Library management (deletion stays with the existing delete_symbol tool)

@@ -401,6 +401,12 @@ _NOT_SCHEMATIC_WRITERS = {
             "export_dsn",
             "import_ses",
             "import_pcb",
+            # finishing.ts
+            "stitch_ground",
+            "tidy_silkscreen",
+            "add_pin_labels",
+            "cleanup_dangling",
+            "transplant_layout",
         ],
         "writes the board",
     ),

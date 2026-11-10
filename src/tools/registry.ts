@@ -291,6 +291,18 @@ export const toolCategories: ToolCategory[] = [
     ],
   },
   {
+    name: "finishing",
+    description:
+      "Board finishing and layout reuse: stitching-via grids/edge rings/fences, silkscreen reference tidy-up and connector pin labels, dangling-stub cleanup, reference-layout transplant",
+    tools: [
+      "stitch_ground",
+      "tidy_silkscreen",
+      "add_pin_labels",
+      "cleanup_dangling",
+      "transplant_layout",
+    ],
+  },
+  {
     name: "autoroute",
     description: "Freerouting autorouter: automatic PCB routing via Specctra DSN/SES",
     tools: ["autoroute", "export_dsn", "import_ses", "check_freerouting"],
