@@ -32,8 +32,81 @@ All notable changes to the KiCAD MCP Server project are documented here.
   - A value the server doesn't recognise counts as `readonly`.
   - The mode combines with `KICAD_MCP_TOOLBOXES`, and read-only tools carry
     MCP's `readOnlyHint` annotation in every mode.
+- **`assert_connectivity`** checks design intent against the netlist that
+  `kicad-cli` exports: `{ref: {pin: net}}` in, only mismatches, single-pin nets
+  and unexpected no-connects out. Net names match with or without the
+  hierarchical prefix. Expectation sets can be stored in the project
+  (`.kicad-mcp/connectivity.json`) and re-run.
+- **`relabel_net`** renames a net's local, global and hierarchical labels
+  across the hierarchy, with `dryRun` and `sheetOnly`.
+- **`project_status`** reports sheet, part and footprint counts, unrouted
+  count, schematic/board parity, the last DRC/ERC counts, dirty flags and the
+  last snapshot in about ten lines, without re-running any check.
+- **Compact DRC/ERC output.** `run_drc` and `run_erc` take `detail`
+  (`summary` by default, `items`, `full`), `limit`, `ignore` (type globs),
+  `nets`, `refs` and `region`. Every run also returns a `delta` (new and
+  resolved violations) against the previous run of the same file. The full
+  violation list is now returned only with `detail="full"`.
+- **`run_drc` uses the project's own rules** (`.kicad_pro` / `.kicad_dru` and
+  library tables), also for a copied or renamed board.
+- **`replace_component`** and **`add_zone`** are now implemented for the SWIG
+  backend. `add_zone` and `add_copper_pour` take priority, clearance, minimum
+  width, pad connection, thermal gap/spoke and island mode.
+- **`sync_schematic_to_board` swaps changed footprints** (`updateFootprints`,
+  default true), keeping position, rotation, side and pad nets, and reports
+  mismatches.
+- **Per-tool command timeouts.** Batch schematic tools, exports and syncs get
+  600 s, checks 900 s. `KICAD_MCP_COMMAND_TIMEOUT_MS`,
+  `KICAD_MCP_TOOL_TIMEOUTS` and `KICAD_MCP_TIMEOUT_GRACE_MS` override them.
 
 ### Bug Fixes
+
+- **Symbols were taken from an older KiCad install.** KiCad 10's global
+  `sym-lib-table` is a single `Table` row; the loader did not follow it and
+  fell back to a KiCad 8 table. Sheets got KiCad 8 symbols, with different pin
+  positions (TPS22917 QOD on the CT row, a shorter solder jumper), renamed
+  pins (USB-C `SH` became `S1`), `lib_symbol_mismatch` on every symbol, and
+  "not found" for symbols new in KiCad 10 (RP2350B, TPS22810DBV). The loader
+  now reads the newest global table and follows nested tables.
+- **Embedded symbols are copied verbatim** from the library, and pin
+  positions are computed from that text.
+- **`extends` chains of any depth are flattened** the way KiCad does on save.
+  Two-level chains (APS6404L-3SQRx-SN, THVD1450D) used to embed flat, without
+  unit sub-symbols, and broke every later call on the sheet.
+- **A failed placement leaves the sheet byte-identical.** Failed placements
+  used to write orphan instances.
+- **`batch_add_and_connect` reports why each component failed.**
+- **KiCad files are read as UTF-8 on Windows**, including inside kicad-skip.
+  Non-ASCII library text no longer raises `UnicodeDecodeError`.
+- **Schematic writes are atomic** (temp file and `os.replace`) and keep the
+  file's line endings.
+- **A command timeout no longer kills the Python worker mid-write.** The
+  worker finishes, its late reply is discarded, and only a worker still busy
+  after the grace period is restarted. A timeout used to leave a
+  `.kicad_sch` at 0 bytes.
+- **`batch_connect(replace=true)` removes global and hierarchical labels**,
+  not just local ones.
+- **Deleting a component removes the wires left dangling** on its pins
+  (`deleteAttachedWires`), trimming back to the nearest junction.
+- **The PWR_FLAG warning only names nets that need one**: a `power_in` pin and
+  no `power_out` pin anywhere in the hierarchy.
+- **Auto-wiring never draws diagonal wires.** It uses a straight or Z-shaped
+  route, or places a label, and moves labels off reference/value text on
+  two-pin parts.
+- **Tools no longer refuse to save their own board writes.**
+  `sync_schematic_to_board`, `refill_zones`, `import_svg_logo`, `autoroute`,
+  `import_ses`, `set_board_origin` and `hierarchical_place` refresh the
+  in-memory board and its file hash after writing the `.kicad_pcb`.
+- **`create_netclass` persists net assignments** to `netclass_patterns`, uses
+  `NET_SETTINGS` on KiCad 9/10 (where `NETINFO_ITEM.SetClass` is gone), and
+  warns when a net or pattern matches nothing, suggesting the hierarchical
+  name.
+- **`export_dsn` falls back to the saved board** when the in-memory export
+  fails, and reports a reason.
+- **`download_jlcpcb_database` no longer fails with `WinError 32`.** The new
+  database is built in a temp file and swapped in with retries. If another
+  process holds the file, the new database is parked and installed on the
+  next open, and the error names the holder.
 
 - **`import_eagle_project` no longer replaces a schematic that is open in
   KiCad.** It writes `<output_dir>/<project_name>.kicad_sch` without checking

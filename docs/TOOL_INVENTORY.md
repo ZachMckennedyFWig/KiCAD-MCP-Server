@@ -5,9 +5,9 @@
      in this file are preserved, so improving the wording here is safe. -->
 
 **Version:** 2.8.3
-**Tools registered on the server:** 251
-**Tools indexed for keyword discovery:** 251 in 20 categories
-**Last updated:** 2026-11-06
+**Tools registered on the server:** 254
+**Tools indexed for keyword discovery:** 254 in 20 categories
+**Last updated:** 2026-11-10
 
 ## How to read this document
 
@@ -31,24 +31,25 @@ not already know the name:
 
 ---
 
-## Project and Board Files (12 tools)
+## Project and Board Files (13 tools)
 
 _Source: `src/tools/project.ts`_
 
-| Tool                | Description                                                                                                       | Discovery |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------- | --------- |
-| `create_project`    | Create a new KiCAD project (.kicad_pro, .kicad_pcb, .kicad_sch)                                                   | Essential |
-| `open_project`      | Open an existing KiCAD project                                                                                    | Essential |
-| `open_board`        | Open a specific .kicad_pcb board file and refresh the MCP in-memory board state.                                  | Essential |
-| `reload_board`      | Reload the current or specified .kicad_pcb from disk, discarding stale in-memory board state.                     | Essential |
-| `close_project`     | Close the currently loaded KiCAD project: optionally save, then drop the in-memory board and clear session state. | Essential |
-| `save_project`      | Save the current project                                                                                          | Essential |
-| `save_board`        | Save the current PCB board.                                                                                       | Essential |
-| `save_as`           | Save the current PCB board to a new .kicad_pcb path.                                                              | Essential |
-| `is_dirty`          | Return whether the MCP knows the loaded board has unsaved memory changes or external disk changes.                | Essential |
-| `discard_or_reload` | Discard the current in-memory PCB state and reload the board from disk.                                           | Essential |
-| `get_project_info`  | Get project metadata and information                                                                              | Essential |
-| `snapshot_project`  | Save a named checkpoint snapshot (renders PDF, saves step label)                                                  | Essential |
+| Tool                | Description                                                                                                                                      | Discovery |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | --------- |
+| `create_project`    | Create a new KiCAD project (.kicad_pro, .kicad_pcb, .kicad_sch)                                                                                  | Essential |
+| `open_project`      | Open an existing KiCAD project                                                                                                                   | Essential |
+| `open_board`        | Open a specific .kicad_pcb board file and refresh the MCP in-memory board state.                                                                 | Essential |
+| `reload_board`      | Reload the current or specified .kicad_pcb from disk, discarding stale in-memory board state.                                                    | Essential |
+| `close_project`     | Close the currently loaded KiCAD project: optionally save, then drop the in-memory board and clear session state.                                | Essential |
+| `save_project`      | Save the current project                                                                                                                         | Essential |
+| `save_board`        | Save the current PCB board.                                                                                                                      | Essential |
+| `save_as`           | Save the current PCB board to a new .kicad_pcb path.                                                                                             | Essential |
+| `is_dirty`          | Return whether the MCP knows the loaded board has unsaved memory changes or external disk changes.                                               | Essential |
+| `discard_or_reload` | Discard the current in-memory PCB state and reload the board from disk.                                                                          | Essential |
+| `get_project_info`  | Get project metadata and information                                                                                                             | Essential |
+| `project_status`    | About 10 lines to re-orient after a context reset: sheet and part counts, board footprint and unrouted counts, schematic<->board parity (refs... | Essential |
+| `snapshot_project`  | Save a named checkpoint snapshot (renders PDF, saves step label)                                                                                 | Essential |
 
 ---
 
@@ -199,7 +200,7 @@ _Source: `src/tools/export.ts`_
 
 ---
 
-## Schematic (46 tools)
+## Schematic (48 tools)
 
 _Source: `src/tools/schematic.ts`_
 
@@ -251,6 +252,8 @@ _Source: `src/tools/schematic.ts`_
 | `list_schematic_texts`                | List all text annotations (with optional filter)                                                                                                     | `schematic`             |
 | `add_schematic_text`                  | Add free-form text annotation to schematic                                                                                                           | `schematic`             |
 | `add_sheet_pin`                       | Add a sheet pin to a hierarchical sheet symbol                                                                                                       | `schematic_hierarchy`   |
+| `assert_connectivity`                 | (no description in source)                                                                                                                           | `schematic`             |
+| `relabel_net`                         | (no description in source)                                                                                                                           | `schematic`             |
 
 ---
 
@@ -520,13 +523,13 @@ _Source: `src/tools/toolboxes.ts`_
 
 | Source file              | Section                                | Tools   |
 | ------------------------ | -------------------------------------- | ------- |
-| `project.ts`             | Project and Board Files                | 12      |
+| `project.ts`             | Project and Board Files                | 13      |
 | `board.ts`               | Board Management                       | 21      |
 | `component.ts`           | Component Management                   | 28      |
 | `routing.ts`             | Routing                                | 19      |
 | `design-rules.ts`        | Design Rules and DRC                   | 7       |
 | `export.ts`              | Export and Fabrication Output          | 27      |
-| `schematic.ts`           | Schematic                              | 46      |
+| `schematic.ts`           | Schematic                              | 48      |
 | `schematic-batch.ts`     | Schematic Batch Operations             | 9       |
 | `schematic-hierarchy.ts` | Hierarchical Sheets                    | 5       |
 | `schematic-layout.ts`    | Schematic Layout and Cosmetics         | 5       |
@@ -546,11 +549,11 @@ _Source: `src/tools/toolboxes.ts`_
 | `digikey-api.ts`         | digikey-api.ts                         | 3       |
 | `gui-driver.ts`          | gui-driver.ts                          | 11      |
 | `toolboxes.ts`           | toolboxes.ts                           | 3       |
-| **Total**                |                                        | **251** |
+| **Total**                |                                        | **254** |
 
 ## Summary by discovery category
 
-These are the categories `search_tools` searches. They cover 251 of the 251 registered tools.
+These are the categories `search_tools` searches. They cover 254 of the 254 registered tools.
 
 | Category                   | Tools indexed |
 | -------------------------- | ------------- |
@@ -558,7 +561,7 @@ These are the categories `search_tools` searches. They cover 251 of the 251 regi
 | `component`                | 24            |
 | `export`                   | 27            |
 | `drc`                      | 8             |
-| `schematic`                | 36            |
+| `schematic`                | 38            |
 | `library`                  | 9             |
 | `symbol_library`           | 17            |
 | `symbol_pins`              | 3             |
@@ -574,6 +577,6 @@ These are the categories `search_tools` searches. They cover 251 of the 251 regi
 | `parts-registry`           | 3             |
 | `digikey`                  | 3             |
 | `gui-driver`               | 11            |
-| **Indexed total**          | **251**       |
+| **Indexed total**          | **254**       |
 | Registered but not indexed | 0             |
-| **Registered total**       | **251**       |
+| **Registered total**       | **254**       |
