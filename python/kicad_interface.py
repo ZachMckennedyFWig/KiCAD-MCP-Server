@@ -197,6 +197,12 @@ _SKIP_LOG_LEVEL = logging.DEBUG if _env_flag_enabled("KICAD_MCP_DEBUG_SKIP") els
 for _skip_logger_name in ("skip", "skip.sexp", "skip.sexp.parser", "skip.sexp.sourcefile"):
     logging.getLogger(_skip_logger_name).setLevel(_SKIP_LOG_LEVEL)
 
+# kicad-skip opens schematics with the locale codec (cp1252 on Windows); KiCad
+# files are UTF-8, so non-ASCII field text broke every skip-based call (#2).
+from utils.file_io import patch_kicad_skip_utf8  # noqa: E402
+
+patch_kicad_skip_utf8()
+
 # Log Python environment details
 logger.info(f"Python version: {sys.version}")
 logger.info(f"Python executable: {sys.executable}")

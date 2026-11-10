@@ -28,29 +28,34 @@ from commands import dynamic_symbol_loader as dsl_mod  # noqa: E402
 from commands.dynamic_symbol_loader import DynamicSymbolLoader  # noqa: E402
 from commands.library_symbol import SymbolLibraryManager  # noqa: E402
 
+# Every symbol carries a unit sub-symbol: one without any cannot be embedded
+# (kicad-skip cannot parse it), so the loader refuses it.
 MINIMAL_LIB = """(kicad_symbol_lib (version 20241209) (generator "test")
   (symbol "Foo" (in_bom yes) (on_board yes)
     (property "Reference" "U" (at 0 0 0))
     (property "Value" "Foo" (at 0 0 0))
     (property "Description" "First revision" (at 0 0 0))
+    (symbol "Foo_1_1"
+      (pin passive line (at 0 0 0) (length 2.54) (name "~") (number "1"))
+    )
   )
 )
 """
 
 MINIMAL_LIB_EDITED = MINIMAL_LIB.replace('"Value" "Foo"', '"Value" "FooV2"')
 
-MINIMAL_LIB_TWO_SYMBOLS = MINIMAL_LIB.replace(
-    ")\n",
-    """)
-  (symbol "Bar" (in_bom yes) (on_board yes)
+_BAR_SYMBOL = """  (symbol "Bar" (in_bom yes) (on_board yes)
     (property "Reference" "U" (at 0 0 0))
     (property "Value" "Bar" (at 0 0 0))
     (property "Description" "Second symbol" (at 0 0 0))
+    (symbol "Bar_1_1"
+      (pin passive line (at 0 0 0) (length 2.54) (name "~") (number "1"))
+    )
   )
-)
-""",
-    1,
-)
+"""
+
+# Bar appended as a second top-level symbol, before the library's closing paren.
+MINIMAL_LIB_TWO_SYMBOLS = MINIMAL_LIB[: MINIMAL_LIB.rstrip().rfind(")")] + _BAR_SYMBOL + ")\n"
 
 
 def _bump_mtime(path: Path) -> None:

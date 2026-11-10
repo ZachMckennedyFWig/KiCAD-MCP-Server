@@ -28,11 +28,31 @@ from commands.schematic_text_utils import (
     _move_property_in_block,
 )
 from commands.wire_manager import WireManager
+from utils.file_io import FileTransaction, read_text_preserve_newline, write_text_atomic
 from utils.symbol_instances import add_missing_instances, instance_report
 
 logger = logging.getLogger("kicad_interface")
 
 _GRID = 1.27  # 50-mil KiCad schematic grid (mm)
+
+
+def _symbol_has_pins(locator, schematic_file, lib_id) -> bool:
+    """Whether the embedded definition of *lib_id* has any pins (False if unknown)."""
+    try:
+        return bool(locator.get_symbol_pins(schematic_file, lib_id))
+    except Exception:
+        return False
+
+
+def _summarize_errors(errors: List[Dict[str, Any]], limit: int = 5) -> str:
+    """One-line digest of per-component failures, for callers that only show the message."""
+    parts = [
+        f"{e.get('reference', '?')} ({e.get('symbol', '?')}): {e.get('error', 'unknown error')}"
+        for e in errors[:limit]
+    ]
+    if len(errors) > limit:
+        parts.append(f"... and {len(errors) - limit} more")
+    return "; ".join(parts)
 
 
 def _snap(val: float) -> float:
@@ -140,6 +160,10 @@ class SchematicBatchCommands:
                 # — exactly the round-trips the batch exists to avoid.
                 unit = int(comp.get("unit", 1) or 1)
 
+                # Everything written for this component — lib_symbols entry,
+                # instance, field moves — is undone if any step fails, so a
+                # reported failure never leaves an orphan instance behind (#5c).
+                txn = FileTransaction(schematic_file)
                 try:
                     loader.add_component(
                         schematic_file,
@@ -172,9 +196,14 @@ class SchematicBatchCommands:
 
                     locator._schematic_cache.pop(str(schematic_file), None)
                     all_pins = locator.get_all_symbol_pins(schematic_file, reference) or {}
+                    if not all_pins and _symbol_has_pins(locator, schematic_file, symbol):
+                        raise ValueError(
+                            f"{reference} was written but its pins could not be located "
+                            "(the sheet may not parse); placement rolled back"
+                        )
 
                     block_text = None
-                    raw_content = schematic_file.read_text(encoding="utf-8")
+                    raw_content, newline = read_text_preserve_newline(schematic_file)
                     block_text, block_start, block_end = _find_placed_symbol_block(
                         raw_content, reference, unit
                     )
@@ -189,7 +218,7 @@ class SchematicBatchCommands:
                             raw_content = (
                                 raw_content[:block_start] + new_block + raw_content[block_end + 1 :]
                             )
-                            schematic_file.write_text(raw_content, encoding="utf-8")
+                            write_text_atomic(schematic_file, raw_content, newline)
                             block_text = new_block
 
                     if block_text:
@@ -222,7 +251,13 @@ class SchematicBatchCommands:
 
                 except Exception as e:
                     logger.error(f"Error adding {reference} ({symbol}): {e}")
-                    errors.append({"symbol": symbol, "reference": reference, "error": str(e)})
+                    try:
+                        txn.rollback()
+                    except OSError as rb_err:  # pragma: no cover - disk-level failure
+                        logger.error(f"Rollback of {schematic_file} failed: {rb_err}")
+                    errors.append(
+                        {"symbol": symbol, "reference": reference, "error": str(e) or repr(e)}
+                    )
 
             # Placement already writes an instance entry for every use of this
             # sheet (#428). This fills in any symbol already on the sheet that
@@ -336,21 +371,13 @@ class SchematicBatchCommands:
             old_fields = comp_info.get("fields", {})
             use_rotation = new_rotation if new_rotation is not None else old_rotation
 
-            content = sch_file.read_text(encoding="utf-8")
+            content, newline = read_text_preserve_newline(sch_file)
             block_text, block_start, block_end = _find_placed_symbol_block(content, reference)
             if block_text is None:
                 return {
                     "success": False,
                     "message": f"Component '{reference}' not found in schematic file",
                 }
-
-            trim_start = block_start
-            while trim_start > 0 and content[trim_start - 1] in (" ", "\t"):
-                trim_start -= 1
-            if trim_start > 0 and content[trim_start - 1] == "\n":
-                trim_start -= 1
-            content = content[:trim_start] + content[block_end + 1 :]
-            sch_file.write_text(content, encoding="utf-8")
 
             derived_project_path = _find_project_root(sch_file.parent)
             loader = DynamicSymbolLoader(project_path=derived_project_path)
@@ -366,18 +393,29 @@ class SchematicBatchCommands:
             old_value = _field_value("Value", new_type)
             old_footprint = _field_value("Footprint", "")
 
-            loader.add_component(
-                sch_file,
-                new_library,
-                new_type,
-                reference=reference,
-                value=old_value,
-                footprint=old_footprint,
-                x=old_x,
-                y=old_y,
-                angle=use_rotation,
-                project_path=derived_project_path,
-            )
+            # Removing the old instance and placing the new one is one change:
+            # if the new symbol cannot be placed, the old one comes back.
+            with FileTransaction(sch_file):
+                trim_start = block_start
+                while trim_start > 0 and content[trim_start - 1] in (" ", "\t"):
+                    trim_start -= 1
+                if trim_start > 0 and content[trim_start - 1] == "\n":
+                    trim_start -= 1
+                content = content[:trim_start] + content[block_end + 1 :]
+                write_text_atomic(sch_file, content, newline)
+
+                loader.add_component(
+                    sch_file,
+                    new_library,
+                    new_type,
+                    reference=reference,
+                    value=old_value,
+                    footprint=old_footprint,
+                    x=old_x,
+                    y=old_y,
+                    angle=use_rotation,
+                    project_path=derived_project_path,
+                )
 
             fields_to_restore = {}
             for fname, fdata in old_fields.items():
@@ -829,18 +867,33 @@ class SchematicBatchCommands:
                     }
                 )
 
-            add_errors = add_result.get("errors", [])
+            add_errors = list(add_result.get("errors", []))
+            if not add_errors and add_result.get("success") is False and add_result.get("message"):
+                # batch_add_components failed as a whole (bad params, unreadable
+                # sheet): surface its reason instead of a bare "0 placed".
+                add_errors.append({"symbol": "*", "reference": "*", "error": add_result["message"]})
             conn_placed = connect_result.get("placed", [])
             conn_failed = connect_result.get("failed", [])
 
+            # The MCP front-end shows only `message` when success is false, so
+            # the per-component reasons must be in it, not just in `errors` (#3).
+            message = (
+                f"Placed {add_result.get('added_count', 0)} component(s)"
+                f"{' (' + str(len(add_errors)) + ' failed)' if add_errors else ''}, "
+                f"connected {len(conn_placed)} pin(s)"
+                f"{' (' + str(len(conn_failed)) + ' failed)' if conn_failed else ''}"
+            )
+            if add_errors:
+                message += f". Add failures: {_summarize_errors(add_errors)}"
+            if conn_failed and add_result.get("added_count", 0) == 0:
+                message += ". Connect failures: " + "; ".join(
+                    f"{f.get('ref', '?')}/{f.get('pin', '?')}: {f.get('reason', '?')}"
+                    for f in conn_failed[:5]
+                )
+
             return {
                 "success": add_result.get("added_count", 0) > 0,
-                "message": (
-                    f"Placed {add_result.get('added_count', 0)} component(s)"
-                    f"{' (' + str(len(add_errors)) + ' failed)' if add_errors else ''}, "
-                    f"connected {len(conn_placed)} pin(s)"
-                    f"{' (' + str(len(conn_failed)) + ' failed)' if conn_failed else ''}"
-                ),
+                "message": message,
                 "added_count": add_result.get("added_count", 0),
                 "added": add_result.get("added", []),
                 "connected_count": len(conn_placed),
