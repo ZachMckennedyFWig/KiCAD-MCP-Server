@@ -36,6 +36,7 @@ import { registerFreeroutingTools } from "./tools/freerouting.js";
 import { registerEagleTools } from "./tools/eagle.js";
 import { registerPcbImportTools } from "./tools/pcb-import.js";
 import { registerValidationTools } from "./tools/validation.js";
+import { registerFabBomTools } from "./tools/fab-bom.js";
 import { registerRouterTools } from "./tools/router.js";
 import {
   parseToolboxSetting,
@@ -408,6 +409,7 @@ export class KiCADMcpServer {
     registerEagleTools(this.server, this.callKicadScript.bind(this));
     registerPcbImportTools(this.server, this.callKicadScript.bind(this));
     registerValidationTools(this.server, this.callKicadScript.bind(this));
+    registerFabBomTools(this.server, this.callKicadScript.bind(this));
     // Register all resources
     registerProjectResources(this.server, this.callKicadScript.bind(this));
     registerBoardResources(this.server, this.callKicadScript.bind(this));

@@ -80,8 +80,10 @@ export const toolCategories: ToolCategory[] = [
   },
   {
     name: "export",
-    description: "File export for fabrication and documentation: Gerber, PDF, BOM, 3D models",
+    description:
+      "File export for fabrication and documentation: one-call JLCPCB fab package, Gerber, PDF, BOM, 3D models",
     tools: [
+      "fab_package",
       "export_gerber",
       "export_gerbers",
       "export_drill",
@@ -254,7 +256,7 @@ export const toolCategories: ToolCategory[] = [
   {
     name: "schematic_batch",
     description:
-      "Batch schematic authoring: add/edit/replace components, batch no-connects, batch connect, add-and-connect",
+      "Batch schematic authoring: add/edit/replace components, batch no-connects, batch connect, add-and-connect, rule-based property/LCSC/DNP mapping across the hierarchy",
     tools: [
       "batch_add_components",
       "batch_edit_schematic_components",
@@ -262,6 +264,7 @@ export const toolCategories: ToolCategory[] = [
       "batch_add_no_connects",
       "batch_connect",
       "batch_add_and_connect",
+      "apply_property_map",
     ],
   },
   {
@@ -325,13 +328,15 @@ export const toolCategories: ToolCategory[] = [
   {
     name: "jlcpcb",
     description:
-      "JLCPCB/LCSC parts: download and search the local JLCPCB catalog, part details and stats, cheaper or in-stock alternatives, and LCSC datasheet lookup and enrichment",
+      "JLCPCB/LCSC parts: download and search the local JLCPCB catalog, part details and stats, cheaper or in-stock alternatives, parametric search, BOM loading-fee/stock report, and LCSC datasheet lookup and enrichment",
     tools: [
       "download_jlcpcb_database",
       "get_jlcpcb_database_stats",
       "search_jlcpcb_parts",
       "get_jlcpcb_part",
       "suggest_jlcpcb_alternatives",
+      "jlc_bom_report",
+      "jlc_find_alternative",
       "get_datasheet_url",
       "enrich_datasheets",
     ],
@@ -369,6 +374,12 @@ export const toolCategories: ToolCategory[] = [
       "kicad_gui_tree_atspi",
       "kicad_gui_click_atspi",
     ],
+  },
+  {
+    name: "snapshots",
+    description:
+      "Undo and scripting: list, diff and restore project snapshots (automatic pre-mutation snapshots with KICAD_MCP_AUTO_SNAPSHOT=1), and run a pcbnew Python script in a separate process (arbitrary code)",
+    tools: ["list_snapshots", "diff_snapshots", "restore_snapshot", "run_pcbnew_script"],
   },
 ];
 
