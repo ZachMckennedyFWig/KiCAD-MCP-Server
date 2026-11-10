@@ -104,3 +104,16 @@ def delete_board_item(board: Any, item: Any) -> None:
         # Already a raw SwigPyObject, or a mock without the attribute. The
         # Remove() above has still detached it; there is nothing more to do.
         pass
+
+
+def detach_board_item(board: Any, item: Any) -> Any:
+    """Temporarily take ``item`` off ``board`` for a transaction; returns it.
+
+    This is ``Remove()`` and therefore hands ownership to Python (see the
+    module docstring). It is only safe because the caller keeps the returned
+    reference and later either re-adds it with ``board.Add(item)`` (rollback)
+    or re-adds it and calls :func:`delete_board_item` (commit). Never drop the
+    reference while the item is detached.
+    """
+    board.Remove(item)
+    return item

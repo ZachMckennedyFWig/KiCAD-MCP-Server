@@ -121,6 +121,10 @@ export const LONG_RUNNING_COMMANDS = [
   "find_orphaned_wires",
   "find_wires_crossing_symbols",
   "add_gnd_stitching_vias",
+  // Finishing passes: zone refills and whole-board collision/connectivity checks
+  "stitch_ground",
+  "cleanup_dangling",
+  "transplant_layout",
   "enrich_datasheets",
   "project_status",
   // Network sweeps
