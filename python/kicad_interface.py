@@ -407,6 +407,7 @@ try:
     from commands.backannotate_footprints import backannotate_footprints
     from commands.board import BoardCommands
     from commands.board.origin import BoardOriginCommands
+    from commands.board_query import BoardQueryCommands
     from commands.component import ComponentCommands
     from commands.connection_schematic import ConnectionManager
     from commands.datasheet_manager import DatasheetManager
@@ -518,6 +519,8 @@ class KiCADInterface(SchematicHandlersMixin):
         self.routing_commands = RoutingCommands(self.board)
         self.stackup_commands = StackupCommands(self.board, self)
         self.via_summary_commands = ViaSummaryCommands(self.board)
+        # Reads self.board on every call, so open/reload need not update it.
+        self.board_query_commands = BoardQueryCommands(lambda: self.board)
         self.freerouting_commands = FreeroutingCommands(self.board)
         self.eagle_commands = EagleCommands()
         self.symbol_schematic_commands = SymbolSchematicCommands()
@@ -647,6 +650,11 @@ class KiCADInterface(SchematicHandlersMixin):
             "add_zone": self.routing_commands.add_zone,
             "route_differential_pair": self.routing_commands.route_differential_pair,
             "refill_zones": self._handle_refill_zones,
+            # Board query/inspection (MCP_ISSUES 2.4 Q1, Q3, Q4; read-only)
+            "query_region": self.board_query_commands.query_region,
+            "net_report": self.board_query_commands.net_report,
+            "connected_items": self.board_query_commands.connected_items,
+            "why_unconnected": self.board_query_commands.why_unconnected,
             # Design rule commands
             "set_design_rules": self.design_rule_commands.set_design_rules,
             "get_design_rules": self.design_rule_commands.get_design_rules,

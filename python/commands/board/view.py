@@ -9,6 +9,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import pcbnew
+from commands.board_render import render_board_view, wants_native_render
 from PIL import Image
 from utils.kicad_cli import kicad_cli_not_found_message, resolve_kicad_cli
 
@@ -141,10 +142,17 @@ class BoardViewCommands:
         responseMode controls how the image is returned:
         - "inline" (default): image bytes are base64-encoded and returned as ``imageData``.
         - "file": image is written next to the .kicad_pcb file and ``filePath`` is returned.
+
+        ``region``, ``highlightNets``, ``scale``, ``showRatsnest`` or
+        ``showDrcMarkers`` switch to the native renderer in
+        ``commands.board_render`` (cropped, net-highlighted, in-memory board).
         """
         import glob
         import subprocess
         import tempfile
+
+        if wants_native_render(params):
+            return render_board_view(self.board, params)
 
         try:
             pcb_path = params.get("pcbPath")
