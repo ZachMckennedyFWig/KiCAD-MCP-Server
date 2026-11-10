@@ -84,13 +84,9 @@ KNOWN_JSONRPC_UNREAD: Dict[str, Set[str]] = {
 }
 
 # TypeScript tools that call a Python command with no entry in command_routes:
-# every call answers "unknown command".
-KNOWN_UNROUTED: Set[str] = {
-    "add_component_annotation",
-    "export_position_file",
-    "export_vrml",
-    "group_components",
-}
+# every call answers "unknown command". Emptied when the last four were either
+# implemented (group_components) or removed as duplicates; keep it empty.
+KNOWN_UNROUTED: Set[str] = set()
 
 # --- TypeScript side ---------------------------------------------------------
 
@@ -364,6 +360,41 @@ def test_every_ts_tool_that_calls_python_has_a_route(tools, routes) -> None:
     assert not (
         KNOWN_UNROUTED - unrouted
     ), f"now routed; remove from KNOWN_UNROUTED: {sorted(KNOWN_UNROUTED - unrouted)}"
+
+
+# Any callKicadScript("name", ...) with a literal command name, anywhere in src/
+# (tools, MCP resources, prompts, the router). Resources and prompts are not
+# server.tool() registrations, so the check above cannot see them -- eleven
+# resources once called commands that never existed.
+_CALL_LITERAL = re.compile(r"callKicadScript\(\s*[\"'`]([A-Za-z0-9_]+)[\"'`]")
+
+
+def ts_command_calls() -> Dict[str, List[str]]:
+    """{command: ["src/relative/file.ts:line", ...]} for every literal call in src/."""
+    calls: Dict[str, List[str]] = {}
+    for path in sorted((ROOT / "src").rglob("*.ts")):
+        src = path.read_text(encoding="utf-8")
+        for m in _CALL_LITERAL.finditer(src):
+            line = src[: m.start()].count("\n") + 1
+            where = f"{path.relative_to(ROOT).as_posix()}:{line}"
+            calls.setdefault(m.group(1), []).append(where)
+    return calls
+
+
+def test_every_command_called_from_typescript_has_a_route(routes) -> None:
+    calls = ts_command_calls()
+    # Guard the guard: tools alone make well over 200 distinct calls, and the
+    # resources must be part of the scan.
+    assert len(calls) >= 200, f"only {len(calls)} callKicadScript literals found"
+    assert any(
+        w.startswith("src/resources/") for ws in calls.values() for w in ws
+    ), "scan no longer reaches src/resources/"
+    missing = {name: where for name, where in sorted(calls.items()) if name not in routes}
+    assert not missing, (
+        "TypeScript calls Python commands that kicad_interface.command_routes does not "
+        f"know, so every call answers 'unknown command': {missing}. Route the command, "
+        "point the caller at an existing command, or remove the caller."
+    )
 
 
 def test_zod_parameters_are_read_by_their_handlers(tools, routes, vocabulary) -> None:

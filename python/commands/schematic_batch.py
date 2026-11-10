@@ -28,6 +28,7 @@ from commands.schematic_autowire import (
     _route_conflict,
     _sheet_geometry,
 )
+from commands.schematic_connectivity import LABEL_SCOPES, resolve_label_scope
 from commands.schematic_text_utils import (
     _extract_property_position,
     _find_facing_label,
@@ -566,6 +567,10 @@ class SchematicBatchCommands:
         labelType (default "label") selects the label kind:
           - "label":        sheet-local net label (connects only within this sheet)
           - "global_label": connects across all sheets in the design by name
+        scope ("local" / "global" / "auto") overrides labelType when given;
+        "auto" picks a global label for a net whose name already appears on
+        another sheet of the hierarchy (or as a global label on this one) and a
+        local label otherwise, per net.
         Facing-label auto-wiring only applies to local labels; global labels join
         their net by name, so one is placed per pin with no inter-label wiring.
         """
@@ -583,6 +588,14 @@ class SchematicBatchCommands:
                         f"invalid labelType '{label_type}'; expected 'label' or 'global_label'"
                     ),
                 }
+            scope = params.get("scope")
+            if scope is not None and scope not in ("local", "global", "auto"):
+                return {
+                    "success": False,
+                    "message": f"invalid scope '{scope}'; expected 'local', 'global' or 'auto'",
+                }
+            if scope in LABEL_SCOPES:
+                label_type = LABEL_SCOPES[scope]
 
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
@@ -608,12 +621,31 @@ class SchematicBatchCommands:
             failed: List[Dict[str, Any]] = []
             placed_positions: Dict[tuple, str] = {}
 
+            # scope=auto: one label kind per net, decided from the other sheets
+            # before this call adds anything.
+            auto_scope: Dict[str, Dict[str, Any]] = {}
+            if scope == "auto":
+                auto_scope = resolve_label_scope(
+                    sch_path,
+                    [
+                        str(net)
+                        for pin_map in connections.values()
+                        if isinstance(pin_map, dict)
+                        for net in pin_map.values()
+                    ],
+                )
+
             for ref, pin_map in connections.items():
                 if not isinstance(pin_map, dict):
                     failed.append({"ref": ref, "reason": "pin_map must be a dict {pin: netName}"})
                     continue
                 for pin_id, net_name in pin_map.items():
                     try:
+                        pin_label_type = (
+                            auto_scope[str(net_name)]["labelType"]
+                            if str(net_name) in auto_scope
+                            else label_type
+                        )
                         resolved_pin = str(pin_id)
                         position = locator.get_pin_location(sch_path, ref, resolved_pin)
                         if not position:
@@ -665,13 +697,15 @@ class SchematicBatchCommands:
                         # behind, merging two nets.
                         removed_labels: List[Dict[str, Any]] = []
                         if replace:
-                            removed_labels = self._delete_labels_at(sch_path, position)
+                            removed_labels = self._delete_labels_at(
+                                sch_path, position, new_net=str(net_name)
+                            )
 
                         # Facing-label auto-wiring is only meaningful for local labels;
                         # global labels join their net by name (one placed per pin).
                         existing_pos = (
                             _find_facing_label(sch_path, net_name, position, orientation)
-                            if label_type == "label"
+                            if pin_label_type == "label"
                             else None
                         )
                         route = None
@@ -701,6 +735,8 @@ class SchematicBatchCommands:
                                 }
                                 if removed_labels:
                                     row["replaced"] = removed_labels
+                                if scope == "auto":
+                                    row["labelType"] = pin_label_type
                                 placed.append(row)
                                 placed_positions[pos_key] = net_name
                             else:
@@ -730,7 +766,7 @@ class SchematicBatchCommands:
                             sch_path,
                             net_name,
                             label_pos,
-                            label_type=label_type,
+                            label_type=pin_label_type,
                             orientation=orientation,
                         ):
                             row = {
@@ -746,6 +782,8 @@ class SchematicBatchCommands:
                                 row["note"] = "; ".join(notes)
                             if removed_labels:
                                 row["replaced"] = removed_labels
+                            if scope == "auto":
+                                row["labelType"] = pin_label_type
                             placed.append(row)
                             placed_positions[pos_key] = net_name
                         else:
@@ -767,6 +805,17 @@ class SchematicBatchCommands:
                 "failed": failed,
             }
             warnings = self._pwr_flag_warnings(sch_path, locator, placed)
+            used_nets = {str(row.get("net")) for row in placed}
+            for net in sorted(used_nets & set(auto_scope)):
+                local_only = auto_scope[net]["localOnly"]
+                if local_only:
+                    warnings.append(
+                        f"scope=auto placed a global label for '{net}', but "
+                        + ", ".join(Path(f).name for f in local_only)
+                        + " use(s) only local/hierarchical labels of that name, which a "
+                        "global label does not join. Convert those to global labels "
+                        "(batch_connect replace=true with scope='global') to merge the nets."
+                    )
             if warnings:
                 result["warnings"] = warnings
             return result
@@ -779,17 +828,27 @@ class SchematicBatchCommands:
             return {"success": False, "message": str(e)}
 
     @staticmethod
-    def _delete_labels_at(sch_path, position, tolerance=0.5):
-        """Remove every label on the pin at *position* (batch_connect replace=True).
+    def _delete_labels_at(sch_path, position, tolerance=0.5, new_net=None):
+        """Remove the pin's old connection at *position* (batch_connect replace=True).
 
-        Covers all three label kinds — ``label``, ``global_label`` and
-        ``hierarchical_label`` (#5f: only local labels used to go, so an old
-        global label stayed on the pin and merged two nets). A label at the far
-        end of a bare stub wire from the pin (one wire, nothing else attached
-        at its far end) is removed together with that stub. Returns the
-        removed labels as [{type, text, position}].
+        * Every label on the pin, of all three kinds -- ``label``,
+          ``global_label`` and ``hierarchical_label`` (#5f: only local labels
+          used to go, so an old global label stayed on the pin and merged two
+          nets).
+        * Wire chains leaving the pin that end at a label: a chain is a run of
+          wire segments with nothing else attached anywhere along it (no
+          branch, junction, pin or label before its far end). When the far end
+          is the pin's own label (not on a pin, no other wire there) the chain
+          and that label go. When it reaches another pin's label -- the wire
+          batch_connect draws to a facing label -- only the chain goes (the
+          other pin keeps its label), unless that label already names
+          *new_net*, in which case the wire is still right and stays.
+
+        Returns the removed labels as [{type, text, position}] followed by the
+        removed wire chains as [{type: "wire", to: label text, points: [...]}].
         """
         removed: List[Dict[str, Any]] = []
+        removed_wires: List[Dict[str, Any]] = []
         try:
             import sexpdata
             from sexpdata import Symbol
@@ -813,65 +872,144 @@ class SchematicBatchCommands:
                 )
                 return (float(at[1]), float(at[2])) if at is not None else None
 
-            # Far ends of bare stubs leaving the pin.
             wires = [
                 (i, WireManager._parse_wire(item))
                 for i, item in enumerate(data)
                 if WireManager._parse_wire(item) is not None
             ]
-            stub_ends: Dict[tuple, int] = {}
-            for i, (a, b, _w, _t) in wires:
-                if near(a[0], a[1], px, py):
-                    far = b
-                elif near(b[0], b[1], px, py):
-                    far = a
-                else:
-                    continue
-                others = sum(
-                    1
-                    for j, (c, d, _w2, _t2) in wires
-                    if j != i and (near(c[0], c[1], *far) or near(d[0], d[1], *far))
-                )
-                if others == 0:
-                    stub_ends[(round(far[0], 4), round(far[1], 4))] = i
-
-            pin_positions = WireManager._collect_pin_positions(data)
-            drop = set()
+            labels = []  # (index, kind, text, (x, y))
+            junctions = []
             for idx, item in enumerate(data):
-                if not (isinstance(item, list) and item and item[0] in label_tags):
+                if not (isinstance(item, list) and item):
                     continue
-                pos = label_at(item)
-                if pos is None:
-                    continue
-                hit = near(pos[0], pos[1], px, py)
-                if not hit:
-                    stub = next(
-                        (
-                            wi
-                            for (sx, sy), wi in stub_ends.items()
-                            if near(pos[0], pos[1], sx, sy)
-                            and not any(near(pos[0], pos[1], qx, qy) for qx, qy in pin_positions)
-                        ),
-                        None,
-                    )
-                    if stub is None:
-                        continue
-                    drop.add(stub)
-                drop.add(idx)
-                removed.append(
-                    {
-                        "type": str(item[0]),
-                        "text": str(item[1]) if len(item) > 1 else "",
-                        "position": {"x": pos[0], "y": pos[1]},
-                    }
+                if item[0] in label_tags:
+                    pos = label_at(item)
+                    if pos is not None:
+                        labels.append(
+                            (idx, str(item[0]), str(item[1]) if len(item) > 1 else "", pos)
+                        )
+                elif item[0] == Symbol("junction"):
+                    pos = label_at(item)
+                    if pos is not None:
+                        junctions.append(pos)
+            pin_positions = WireManager._collect_pin_positions(data)
+
+            def on_interior(pt, a, b, eps=1e-3):
+                """pt strictly inside segment a-b (not at either end)."""
+                if near(pt[0], pt[1], *a) or near(pt[0], pt[1], *b):
+                    return False
+                cross = (b[0] - a[0]) * (pt[1] - a[1]) - (b[1] - a[1]) * (pt[0] - a[0])
+                if abs(cross) > eps * max(1.0, abs(b[0] - a[0]) + abs(b[1] - a[1])):
+                    return False
+                return (
+                    min(a[0], b[0]) - eps <= pt[0] <= max(a[0], b[0]) + eps
+                    and min(a[1], b[1]) - eps <= pt[1] <= max(a[1], b[1]) + eps
                 )
+
+            def labels_near(pt):
+                return [lab for lab in labels if near(lab[3][0], lab[3][1], *pt)]
+
+            def chain_from(first):
+                """Follow a branch-free wire run from the pin through *first*.
+
+                Returns (wire indices, far end, labels at the far end, is_own)
+                or None when the run branches, touches anything on the way,
+                or ends somewhere that is not a label.
+                """
+                i, (a, b, _w, _t) = first
+                cur = b if near(a[0], a[1], px, py) else a
+                chain = [i]
+                points = [(px, py), cur]
+                while True:
+                    if any(near(cur[0], cur[1], jx, jy) for jx, jy in junctions):
+                        return None
+                    if any(near(cur[0], cur[1], qx, qy) for qx, qy in pin_positions):
+                        at_pin = True
+                    else:
+                        at_pin = False
+                    here = labels_near(cur)
+                    attached = [
+                        (j, seg)
+                        for j, seg in wires
+                        if j not in chain
+                        and (near(seg[0][0], seg[0][1], *cur) or near(seg[1][0], seg[1][1], *cur))
+                    ]
+                    if here or at_pin:
+                        if not here:
+                            return None  # a bare pin-to-pin wire is not ours to judge
+                        own = not at_pin and not attached
+                        return chain, cur, here, own, points
+                    if len(attached) != 1:
+                        return None  # dead end or branch
+                    j, (c, d, _w2, _t2) = attached[0]
+                    chain.append(j)
+                    cur = d if near(c[0], c[1], *cur) else c
+                    points.append(cur)
+
+            drop = set()
+            # 1. Labels on the pin itself.
+            for idx, kind, text, pos in labels:
+                if near(pos[0], pos[1], px, py):
+                    drop.add(idx)
+                    removed.append(
+                        {"type": kind, "text": text, "position": {"x": pos[0], "y": pos[1]}}
+                    )
+
+            # 2. Wire chains from the pin to a label.
+            for first in wires:
+                _i, (a, b, _w, _t) = first
+                if not (near(a[0], a[1], px, py) or near(b[0], b[1], px, py)):
+                    continue
+                if first[0] in drop:
+                    continue
+                found = chain_from(first)
+                if found is None:
+                    continue
+                chain, end, end_labels, own, points = found
+                # Nothing else may touch the run between its two ends.
+                segs = [next(seg for j, seg in wires if j == k) for k in chain]
+                others = [seg for j, seg in wires if j not in chain]
+                touch_pts = (
+                    [lab[3] for lab in labels]
+                    + list(pin_positions)
+                    + junctions
+                    + [p for s in others for p in (s[0], s[1])]
+                )
+                if any(on_interior(pt, s[0], s[1]) for s in segs for pt in touch_pts):
+                    continue
+                if any(on_interior(pt, s[0], s[1]) for pt in points for s in others):
+                    continue
+                if own:
+                    for idx, kind, text, pos in end_labels:
+                        if idx not in drop:
+                            drop.add(idx)
+                            removed.append(
+                                {
+                                    "type": kind,
+                                    "text": text,
+                                    "position": {"x": pos[0], "y": pos[1]},
+                                }
+                            )
+                elif new_net is not None and any(
+                    text == new_net for _i2, _k, text, _p in end_labels
+                ):
+                    continue  # already wired to the requested net: keep it
+                drop.update(chain)
+                if not own:
+                    removed_wires.append(
+                        {
+                            "type": "wire",
+                            "to": end_labels[0][2],
+                            "points": [{"x": x, "y": y} for x, y in points],
+                        }
+                    )
             if drop:
                 new_data = [item for i, item in enumerate(data) if i not in drop]
                 WireManager.sync_junctions(new_data)
                 Path(sch_path).write_text(kicad_dumps(new_data), encoding="utf-8")
         except Exception as e:
             logger.warning(f"replace cleanup failed: {e}")
-        return removed
+        return removed + removed_wires
 
     @staticmethod
     def _offset_label_from_fields(sch_path, locator, ref, position, orientation, net_name):
@@ -960,13 +1098,14 @@ class SchematicBatchCommands:
                 "message": "no nets specified",
             }
             if nets_per_ref:
-                connect_result = self.batch_connect(
-                    {
-                        "schematicPath": schematic_path,
-                        "connections": nets_per_ref,
-                        "labelType": params.get("labelType") or params.get("label_type") or "label",
-                    }
-                )
+                connect_params = {
+                    "schematicPath": schematic_path,
+                    "connections": nets_per_ref,
+                    "labelType": params.get("labelType") or params.get("label_type") or "label",
+                }
+                if params.get("scope") is not None:
+                    connect_params["scope"] = params.get("scope")
+                connect_result = self.batch_connect(connect_params)
 
             add_errors = list(add_result.get("errors", []))
             if not add_errors and add_result.get("success") is False and add_result.get("message"):

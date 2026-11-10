@@ -62,7 +62,11 @@ class ConnectionManager:
 
     @staticmethod
     def connect_to_net(
-        schematic_path: Path, component_ref: str, pin_name: str, net_name: str
+        schematic_path: Path,
+        component_ref: str,
+        pin_name: str,
+        net_name: str,
+        label_type: str = "label",
     ) -> Dict[str, Any]:
         """
         Connect a component pin to a named net using a wire stub and label.
@@ -72,6 +76,7 @@ class ConnectionManager:
             component_ref: Reference designator (e.g., "U1", "U1_")
             pin_name: Pin name/number
             net_name: Name of the net to connect to (e.g., "VCC", "GND", "SIGNAL_1")
+            label_type: "label" (sheet-local, default) or "global_label"
 
         Returns:
             Dict with keys:
@@ -124,7 +129,7 @@ class ConnectionManager:
 
             # Add label at the end of the stub using WireManager
             label_success = WireManager.add_label(
-                schematic_path, net_name, stub_end, label_type="label"
+                schematic_path, net_name, stub_end, label_type=label_type
             )
             if not label_success:
                 msg = f"Failed to add net label '{net_name}'"
@@ -138,6 +143,7 @@ class ConnectionManager:
                 "pin_location": pin_loc,
                 "label_location": stub_end,
                 "wire_stub": [pin_loc, stub_end],
+                "label_type": label_type,
             }
 
         except Exception as e:

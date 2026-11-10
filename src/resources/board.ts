@@ -212,61 +212,6 @@ export function registerBoardResources(server: McpServer, callKicadScript: Comma
   );
 
   // ------------------------------------------------------
-  // Board 3D View Resource
-  // ------------------------------------------------------
-  server.resource(
-    "board_3d_view",
-    new ResourceTemplate("kicad://board/3d-view/{angle?}", {
-      list: async () => ({
-        resources: [
-          { uri: "kicad://board/3d-view/isometric", name: "Isometric View" },
-          { uri: "kicad://board/3d-view/top", name: "Top View" },
-          { uri: "kicad://board/3d-view/bottom", name: "Bottom View" },
-        ],
-      }),
-    }),
-    async (uri, params) => {
-      const angle = params.angle || "isometric";
-      const width = params.width ? parseInt(params.width as string) : undefined;
-      const height = params.height ? parseInt(params.height as string) : undefined;
-
-      logger.debug(`Retrieving 3D board view from ${angle} angle`);
-      const result = await callKicadScript("get_board_3d_view", {
-        width,
-        height,
-        angle,
-      });
-
-      if (!result.success) {
-        logger.error(`Failed to retrieve 3D board view: ${result.errorDetails}`);
-        return {
-          contents: [
-            {
-              uri: uri.href,
-              text: JSON.stringify({
-                error: "Failed to retrieve 3D board view",
-                details: result.errorDetails,
-              }),
-              mimeType: "application/json",
-            },
-          ],
-        };
-      }
-
-      logger.debug("Successfully retrieved 3D board view");
-      return {
-        contents: [
-          {
-            uri: uri.href,
-            blob: result.imageData,
-            mimeType: "image/png",
-          },
-        ],
-      };
-    },
-  );
-
-  // ------------------------------------------------------
   // Board Statistics Resource
   // ------------------------------------------------------
   server.resource("board_statistics", "kicad://board/statistics", async (uri) => {

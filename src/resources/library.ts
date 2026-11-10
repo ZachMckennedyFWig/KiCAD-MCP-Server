@@ -25,14 +25,13 @@ export function registerLibraryResources(
   logger.info("Registering library resources");
 
   // ------------------------------------------------------
-  // Component Library Resource
+  // Component Library Resource -- footprint search across the fp-lib-table
+  // (backed by search_footprints; filter is a case-insensitive pattern, * = any)
   // ------------------------------------------------------
   server.resource(
     "component_library",
     new ResourceTemplate("kicad://components/{filter?}/{library?}", {
-      list: async () => ({
-        resources: [{ uri: "kicad://components", name: "All Components" }],
-      }),
+      list: undefined,
     }),
     async (uri, params) => {
       const filter = params.filter || "";
@@ -43,9 +42,9 @@ export function registerLibraryResources(
         `Retrieving component library${filter ? ` with filter: ${filter}` : ""}${library ? ` from library: ${library}` : ""}`,
       );
 
-      const result = await callKicadScript("get_component_library", {
-        filter,
-        library,
+      const result = await callKicadScript("search_footprints", {
+        pattern: filter || "*",
+        library: library || undefined,
         limit,
       });
 
@@ -66,7 +65,7 @@ export function registerLibraryResources(
       }
 
       logger.debug(
-        `Successfully retrieved ${result.components?.length || 0} components from library`,
+        `Successfully retrieved ${result.footprints?.length || 0} footprints from library`,
       );
       return {
         contents: [
@@ -85,7 +84,7 @@ export function registerLibraryResources(
   // ------------------------------------------------------
   server.resource("library_list", "kicad://libraries", async (uri) => {
     logger.debug("Retrieving library list");
-    const result = await callKicadScript("get_library_list", {});
+    const result = await callKicadScript("list_libraries", {});
 
     if (!result.success) {
       logger.error(`Failed to retrieve library list: ${result.errorDetails}`);
@@ -116,55 +115,9 @@ export function registerLibraryResources(
   });
 
   // ------------------------------------------------------
-  // Library Component Details Resource
-  // ------------------------------------------------------
-  server.resource(
-    "library_component_details",
-    new ResourceTemplate("kicad://library/component/{componentId}/{library?}", {
-      list: undefined,
-    }),
-    async (uri, params) => {
-      const { componentId, library } = params;
-      logger.debug(
-        `Retrieving details for component: ${componentId}${library ? ` from library: ${library}` : ""}`,
-      );
-
-      const result = await callKicadScript("get_component_details", {
-        componentId,
-        library,
-      });
-
-      if (!result.success) {
-        logger.error(`Failed to retrieve component details: ${result.errorDetails}`);
-        return {
-          contents: [
-            {
-              uri: uri.href,
-              text: JSON.stringify({
-                error: `Failed to retrieve details for component ${componentId}`,
-                details: result.errorDetails,
-              }),
-              mimeType: "application/json",
-            },
-          ],
-        };
-      }
-
-      logger.debug(`Successfully retrieved details for component: ${componentId}`);
-      return {
-        contents: [
-          {
-            uri: uri.href,
-            text: JSON.stringify(result),
-            mimeType: "application/json",
-          },
-        ],
-      };
-    },
-  );
-
-  // ------------------------------------------------------
-  // Component Footprint Resource
+  // Footprint Resource (backed by get_footprint_info)
+  // kicad://footprint/Resistor_SMD:R_0805_2012Metric or
+  // kicad://footprint/Resistor_SMD/R_0805_2012Metric
   // ------------------------------------------------------
   server.resource(
     "component_footprint",
@@ -177,9 +130,8 @@ export function registerLibraryResources(
         `Retrieving footprint for component: ${componentId}${footprint ? ` (${footprint})` : ""}`,
       );
 
-      const result = await callKicadScript("get_component_footprint", {
-        componentId,
-        footprint,
+      const result = await callKicadScript("get_footprint_info", {
+        footprint_name: footprint ? `${componentId}:${footprint}` : componentId,
       });
 
       if (!result.success) {
@@ -212,7 +164,7 @@ export function registerLibraryResources(
   );
 
   // ------------------------------------------------------
-  // Component Symbol Resource
+  // Symbol Resource (backed by get_symbol_info), e.g. kicad://symbol/Device:R
   // ------------------------------------------------------
   server.resource(
     "component_symbol",
@@ -223,8 +175,8 @@ export function registerLibraryResources(
       const { componentId } = params;
       logger.debug(`Retrieving symbol for component: ${componentId}`);
 
-      const result = await callKicadScript("get_component_symbol", {
-        componentId,
+      const result = await callKicadScript("get_symbol_info", {
+        symbol: componentId,
       });
 
       if (!result.success) {
@@ -259,54 +211,6 @@ export function registerLibraryResources(
       }
 
       // Otherwise return the JSON result
-      return {
-        contents: [
-          {
-            uri: uri.href,
-            text: JSON.stringify(result),
-            mimeType: "application/json",
-          },
-        ],
-      };
-    },
-  );
-
-  // ------------------------------------------------------
-  // Component 3D Model Resource
-  // ------------------------------------------------------
-  server.resource(
-    "component_3d_model",
-    new ResourceTemplate("kicad://3d-model/{componentId}/{footprint?}", {
-      list: undefined,
-    }),
-    async (uri, params) => {
-      const { componentId, footprint } = params;
-      logger.debug(
-        `Retrieving 3D model for component: ${componentId}${footprint ? ` (${footprint})` : ""}`,
-      );
-
-      const result = await callKicadScript("get_component_3d_model", {
-        componentId,
-        footprint,
-      });
-
-      if (!result.success) {
-        logger.error(`Failed to retrieve component 3D model: ${result.errorDetails}`);
-        return {
-          contents: [
-            {
-              uri: uri.href,
-              text: JSON.stringify({
-                error: `Failed to retrieve 3D model for component ${componentId}`,
-                details: result.errorDetails,
-              }),
-              mimeType: "application/json",
-            },
-          ],
-        };
-      }
-
-      logger.debug(`Successfully retrieved 3D model for component: ${componentId}`);
       return {
         contents: [
           {

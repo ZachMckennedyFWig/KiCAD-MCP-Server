@@ -221,7 +221,7 @@ Export BOM as CSV.
 Export the component position file.
 ```
 
-**Tool:** `export_position_file`
+**Tool:** `export_pos` (kicad-cli; CSV/ASCII/Gerber, per side, units)
 
 ### 3D Preview
 

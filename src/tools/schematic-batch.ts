@@ -213,7 +213,7 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
   // Net labels on many pins
   server.tool(
     "batch_connect",
-    "Place net labels on multiple pins in one call to wire nets quickly. 'connections' is a map {reference: {pin: netName}} where pin is a number or name. labelType selects 'label' (sheet-local, the default) or 'global_label' (connects across all sheets by name — use this for power rails and any net that spans sheets). For local labels, if a facing label for the same net is nearby an orthogonal wire (straight, or a Z with a grid-snapped jog — never diagonal) is drawn instead of a duplicate label; when that wire would land on or cross another object a plain label is placed instead. Global labels are placed one-per-pin since they join their net by name. On two-pin parts a label whose text would overlap a visible Reference/Value field is moved 2.54 or 5.08 mm out along the pin with a stub wire (avoidFieldOverlap, default true). Set replace=true to remove every existing label (local, global, hierarchical) on each pin first. Coordinates are schematic mm, origin top-left, Y down. Returns {success, message, placed:[{ref, pin, net, position:{x,y}, label_position?, wire?, note?, replaced?}], failed:[{ref, pin, reason}], warnings?}. Warns only about nets touched by this call that hold a power_in pin and no power_out pin (PWR_FLAG or regulator output) anywhere in the sheet hierarchy.",
+    "Place net labels on multiple pins in one call to wire nets quickly. 'connections' is a map {reference: {pin: netName}} where pin is a number or name. labelType selects 'label' (sheet-local, the default) or 'global_label' (connects across all sheets by name — use this for power rails and any net that spans sheets). For local labels, if a facing label for the same net is nearby an orthogonal wire (straight, or a Z with a grid-snapped jog — never diagonal) is drawn instead of a duplicate label; when that wire would land on or cross another object a plain label is placed instead. Global labels are placed one-per-pin since they join their net by name. On two-pin parts a label whose text would overlap a visible Reference/Value field is moved 2.54 or 5.08 mm out along the pin with a stub wire (avoidFieldOverlap, default true). scope='auto' picks global_label per net when the name is already used on another sheet of the hierarchy, else a local label (each placed row then reports labelType). Set replace=true to remove every existing label (local, global, hierarchical) on each pin first, plus a wire run from the pin that ends at a label of another net (e.g. an earlier auto-wire to another pin's label) when nothing else hangs off it. Coordinates are schematic mm, origin top-left, Y down. Returns {success, message, placed:[{ref, pin, net, position:{x,y}, label_position?, wire?, note?, replaced?}], failed:[{ref, pin, reason}], warnings?}. Warns only about nets touched by this call that hold a power_in pin and no power_out pin (PWR_FLAG or regulator output) anywhere in the sheet hierarchy.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       connections: z
@@ -226,12 +226,18 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
         .describe(
           "Label kind: 'label' = sheet-local (default); 'global_label' = connects across all sheets by name",
         ),
+      scope: z
+        .enum(["local", "global", "auto"])
+        .optional()
+        .describe(
+          "Label scope, overrides labelType: 'local' = label, 'global' = global_label, 'auto' = per net, a global label when the net name is already used on another sheet of the hierarchy (or as a global label on this sheet), else a local label. Omit to use labelType.",
+        ),
       replace: z
         .boolean()
         .optional()
         .default(false)
         .describe(
-          "Delete every existing label (local, global, hierarchical) at each pin, and a label at the end of a bare stub from it, before placing (default false)",
+          "Delete every existing label (local, global, hierarchical) at each pin, a label at the end of a bare stub from it, and a branch-free wire run from the pin to another net's label, before placing (default false)",
         ),
       avoidFieldOverlap: z
         .boolean()
@@ -280,6 +286,12 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
         .default("label")
         .describe(
           "Label kind used to wire the nets: 'label' = sheet-local (default); 'global_label' = cross-sheet by name",
+        ),
+      scope: z
+        .enum(["local", "global", "auto"])
+        .optional()
+        .describe(
+          "Label scope, overrides labelType: 'local' = label, 'global' = global_label, 'auto' = per net, a global label when the net name is already used on another sheet of the hierarchy (or as a global label on this sheet), else a local label. Omit to use labelType.",
         ),
       origin_x: z.number().optional(),
       origin_y: z.number().optional(),

@@ -63,10 +63,8 @@ export const LONG_RUNNING_COMMANDS = [
   "export_svg",
   "export_3d",
   "export_3d_cli",
-  "export_vrml",
   "export_bom",
   "export_pos",
-  "export_position_file",
   "export_netlist",
   "export_dsn",
   "export_gencad",
@@ -87,7 +85,6 @@ export const LONG_RUNNING_COMMANDS = [
   "export_schematic_svg",
   "generate_netlist",
   "get_board_2d_view",
-  "get_board_3d_view",
   "get_schematic_view",
   "get_schematic_view_region",
   // Schematic <-> board sync and imports

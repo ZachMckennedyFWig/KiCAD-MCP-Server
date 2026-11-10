@@ -113,7 +113,7 @@ export function registerComponentResources(
     async (uri, params) => {
       const { reference } = params;
       logger.debug(`Retrieving connections for component: ${reference}`);
-      const result = await callKicadScript("get_component_connections", {
+      const result = await callKicadScript("get_component_pads", {
         reference,
       });
 
@@ -151,7 +151,7 @@ export function registerComponentResources(
   // ------------------------------------------------------
   server.resource("component_placement", "kicad://components/placement", async (uri) => {
     logger.debug("Retrieving component placement information");
-    const result = await callKicadScript("get_component_placement", {});
+    const result = await callKicadScript("get_component_list", {});
 
     if (!result.success) {
       logger.error(`Failed to retrieve component placement: ${result.errorDetails}`);
@@ -180,85 +180,6 @@ export function registerComponentResources(
       ],
     };
   });
-
-  // ------------------------------------------------------
-  // Component Groups Resource
-  // ------------------------------------------------------
-  server.resource("component_groups", "kicad://components/groups", async (uri) => {
-    logger.debug("Retrieving component groups");
-    const result = await callKicadScript("get_component_groups", {});
-
-    if (!result.success) {
-      logger.error(`Failed to retrieve component groups: ${result.errorDetails}`);
-      return {
-        contents: [
-          {
-            uri: uri.href,
-            text: JSON.stringify({
-              error: "Failed to retrieve component groups",
-              details: result.errorDetails,
-            }),
-            mimeType: "application/json",
-          },
-        ],
-      };
-    }
-
-    logger.debug(`Successfully retrieved ${result.groups?.length || 0} component groups`);
-    return {
-      contents: [
-        {
-          uri: uri.href,
-          text: JSON.stringify(result),
-          mimeType: "application/json",
-        },
-      ],
-    };
-  });
-
-  // ------------------------------------------------------
-  // Component Visualization Resource
-  // ------------------------------------------------------
-  server.resource(
-    "component_visualization",
-    new ResourceTemplate("kicad://component/{reference}/visualization", {
-      list: undefined,
-    }),
-    async (uri, params) => {
-      const { reference } = params;
-      logger.debug(`Generating visualization for component: ${reference}`);
-      const result = await callKicadScript("get_component_visualization", {
-        reference,
-      });
-
-      if (!result.success) {
-        logger.error(`Failed to generate component visualization: ${result.errorDetails}`);
-        return {
-          contents: [
-            {
-              uri: uri.href,
-              text: JSON.stringify({
-                error: `Failed to generate visualization for component ${reference}`,
-                details: result.errorDetails,
-              }),
-              mimeType: "application/json",
-            },
-          ],
-        };
-      }
-
-      logger.debug(`Successfully generated visualization for component: ${reference}`);
-      return {
-        contents: [
-          {
-            uri: uri.href,
-            blob: result.imageData, // Base64 encoded image data
-            mimeType: "image/png",
-          },
-        ],
-      };
-    },
-  );
 
   logger.info("Component resources registered");
 }

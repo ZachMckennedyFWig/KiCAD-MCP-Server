@@ -89,7 +89,12 @@ def test_returns_full_path_composed_from_project_and_filename(monkeypatch: Any) 
     _install_fake_kipy(monkeypatch)
     backend = _make_backend([_FakeDocumentSpecifier("DankroRunner.kicad_pcb", "/home/u/proj/pcb")])
 
-    assert backend.get_open_board_path() == "/home/u/proj/pcb/DankroRunner.kicad_pcb"
+    # The path is joined with the host's separator (KiCad reports native
+    # project paths, and callers normcase/resolve before comparing), so compare
+    # as paths: on Windows the result is "/home/u/proj/pcb\\DankroRunner...".
+    result = backend.get_open_board_path()
+    assert result is not None
+    assert Path(result) == Path("/home/u/proj/pcb/DankroRunner.kicad_pcb")
 
 
 def test_requests_pcb_document_type_explicitly(monkeypatch: Any) -> None:

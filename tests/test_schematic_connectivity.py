@@ -342,6 +342,204 @@ class TestBatchConnectLabels:
         assert "label_position" not in r["placed"][0]
         assert _wires(root) == []
 
+    @staticmethod
+    def _wired_pair(tmp_path):
+        """U1/2 wired (by batch_connect's facing-label route) to U5/1's NETX label."""
+        body = fx.symbol("test:IC", "U1", "IC", 50.8, 50.8) + fx.symbol(
+            "test:IC", "U5", "IC", 71.12, 53.34
+        )
+        root = fx.write_project(tmp_path, "p", body)
+        c = SchematicBatchCommands(types.SimpleNamespace())
+        r = c.batch_connect(
+            {"schematicPath": str(root), "connections": {"U5": {"1": "NETX"}, "U1": {"2": "NETX"}}}
+        )
+        assert "wired to existing label" in r["placed"][1]["note"]
+        assert _wires(root)
+        return root, c
+
+    def test_replace_removes_auto_wire_to_another_pins_label(self, tmp_path):
+        root, c = self._wired_pair(tmp_path)
+        r = c.batch_connect(
+            {"schematicPath": str(root), "connections": {"U1": {"2": "OTHER"}}, "replace": True}
+        )
+        assert r["success"] is True, r
+        replaced = r["placed"][0]["replaced"]
+        assert [x["type"] for x in replaced] == ["wire"]
+        assert replaced[0]["to"] == "NETX"
+        # U5 keeps its label; the wire that tied U1/2 to it is gone.
+        assert _wires(root) == []
+        assert sorted(n for _k, n, *_ in _labels(root)) == ["NETX", "OTHER"]
+        nets = HierarchyNets(root)
+        by_name = {next(iter(n["names"])): n for n in nets.nets.values() if n["names"]}
+        assert {(p["ref"], p["pin"]) for p in by_name["NETX"]["pins"]} == {("U5", "1")}
+        assert {(p["ref"], p["pin"]) for p in by_name["OTHER"]["pins"]} == {("U1", "2")}
+
+    def test_replace_keeps_auto_wire_already_on_the_new_net(self, tmp_path):
+        root, c = self._wired_pair(tmp_path)
+        before = len(_wires(root))
+        r = c.batch_connect(
+            {"schematicPath": str(root), "connections": {"U1": {"2": "NETX"}}, "replace": True}
+        )
+        assert r["success"] is True, r
+        assert not any(x["type"] == "wire" for x in r["placed"][0].get("replaced", []))
+        assert len(_wires(root)) >= before
+        nets = HierarchyNets(root)
+        netx = [n for n in nets.nets.values() if "NETX" in n["names"]][0]
+        assert {(p["ref"], p["pin"]) for p in netx["pins"]} == {("U1", "2"), ("U5", "1")}
+
+    def test_replace_keeps_a_wire_that_branches(self, tmp_path):
+        # U1/2 (55.88, 50.8) -> (60.96, 50.8), which branches up to label A
+        # and right to label B: the run serves more than this pin.
+        body = (
+            fx.symbol("test:IC", "U1", "IC", 50.8, 50.8)
+            + fx.wire(55.88, 50.8, 60.96, 50.8)
+            + fx.wire(60.96, 50.8, 60.96, 40.64)
+            + fx.wire(60.96, 50.8, 71.12, 50.8)
+            + fx.junction(60.96, 50.8)
+            + fx.label("A", 60.96, 40.64)
+            + fx.label("B", 71.12, 50.8)
+        )
+        root = fx.write_project(tmp_path, "p", body)
+        c = SchematicBatchCommands(types.SimpleNamespace())
+        r = c.batch_connect(
+            {"schematicPath": str(root), "connections": {"U1": {"2": "NEW"}}, "replace": True}
+        )
+        assert r["success"] is True, r
+        assert "replaced" not in r["placed"][0]
+        assert len(_wires(root)) == 3
+        assert sorted(n for _k, n, *_ in _labels(root)) == ["A", "B", "NEW"]
+
+    def test_replace_keeps_a_wire_to_a_bare_pin(self, tmp_path):
+        # A direct pin-to-pin wire (no label at its end) is the user's, not ours.
+        body = (
+            fx.symbol("test:IC", "U1", "IC", 50.8, 50.8)
+            + fx.symbol("test:IC", "U2", "IC", 71.12, 50.8)
+            + fx.wire(55.88, 50.8, 66.04, 50.8)
+        )
+        root = fx.write_project(tmp_path, "p", body)
+        c = SchematicBatchCommands(types.SimpleNamespace())
+        c.batch_connect(
+            {"schematicPath": str(root), "connections": {"U1": {"2": "NEW"}}, "replace": True}
+        )
+        assert len(_wires(root)) == 1
+
+
+def _scope_project(tmp_path: Path) -> Path:
+    """Root holds U1/U2 and sheet A; A uses VBUS (global) and SDA_A (local only)."""
+    root_body = (
+        fx.symbol("test:IC", "U1", "IC", 50.8, 50.8)
+        + fx.symbol("test:IC", "U2", "IC", 50.8, 76.2)
+        + fx.sheet("A", "a.kicad_sch", 101.6, 50.8)
+    )
+    a_body = fx.label("VBUS", 25.4, 25.4, kind="global_label") + fx.label("SDA_A", 25.4, 50.8)
+    return fx.write_project(tmp_path, "proj", root_body, {"a.kicad_sch": a_body})
+
+
+@pytest.mark.unit
+class TestLabelScopeAuto:
+    """S3: scope="auto" picks a global label for a net already used on another sheet."""
+
+    def test_auto_picks_global_only_for_names_used_elsewhere(self, tmp_path):
+        root = _scope_project(tmp_path)
+        c = SchematicBatchCommands(types.SimpleNamespace())
+        r = c.batch_connect(
+            {
+                "schematicPath": str(root),
+                "connections": {"U1": {"1": "VBUS", "2": "LOCAL_ONLY"}, "U2": {"2": "SDA_A"}},
+                "scope": "auto",
+            }
+        )
+        assert r["success"] is True, r
+        kinds = {row["net"]: row["labelType"] for row in r["placed"]}
+        assert kinds == {"VBUS": "global_label", "LOCAL_ONLY": "label", "SDA_A": "global_label"}
+        assert {(k, n) for k, n, *_ in _labels(root)} == {
+            ("global_label", "VBUS"),
+            ("label", "LOCAL_ONLY"),
+            ("global_label", "SDA_A"),
+        }
+        # SDA_A exists on A only as a local label: the global one does not join it.
+        assert any("SDA_A" in w and "a.kicad_sch" in w for w in r.get("warnings", []))
+        assert not any("'VBUS'" in w for w in r.get("warnings", []))
+
+    def test_default_scope_is_unchanged(self, tmp_path):
+        root = _scope_project(tmp_path)
+        c = SchematicBatchCommands(types.SimpleNamespace())
+        r = c.batch_connect({"schematicPath": str(root), "connections": {"U1": {"1": "VBUS"}}})
+        assert r["success"] is True
+        assert "labelType" not in r["placed"][0]
+        assert [(k, n) for k, n, *_ in _labels(root)] == [("label", "VBUS")]
+
+    def test_explicit_scope_global_and_invalid(self, tmp_path):
+        root = _scope_project(tmp_path)
+        c = SchematicBatchCommands(types.SimpleNamespace())
+        r = c.batch_connect(
+            {"schematicPath": str(root), "connections": {"U1": {"1": "X"}}, "scope": "global"}
+        )
+        assert r["success"] is True
+        assert [(k, n) for k, n, *_ in _labels(root)] == [("global_label", "X")]
+        bad = c.batch_connect(
+            {"schematicPath": str(root), "connections": {"U1": {"2": "Y"}}, "scope": "sheet"}
+        )
+        assert bad["success"] is False and "scope" in bad["message"]
+
+    def test_auto_from_a_sub_sheet_sees_the_root(self, tmp_path):
+        root = fx.write_project(
+            tmp_path,
+            "proj",
+            fx.label("+BATT", 10.16, 10.16, kind="global_label")
+            + fx.sheet("A", "a.kicad_sch", 101.6, 50.8),
+            {"a.kicad_sch": fx.symbol("test:IC", "U7", "IC", 50.8, 50.8)},
+        )
+        sub = tmp_path / "a.kicad_sch"
+        c = SchematicBatchCommands(types.SimpleNamespace())
+        r = c.batch_connect(
+            {"schematicPath": str(sub), "connections": {"U7": {"1": "+BATT"}}, "scope": "auto"}
+        )
+        assert r["placed"][0]["labelType"] == "global_label"
+        assert root.exists()
+
+    def test_resolve_label_scope_reports_sheets(self, tmp_path):
+        from commands.schematic_connectivity import resolve_label_scope
+
+        root = _scope_project(tmp_path)
+        info = resolve_label_scope(root, ["VBUS", "SDA_A", "NEW"])
+        assert info["NEW"] == {"labelType": "label", "sheets": [], "localOnly": []}
+        assert info["VBUS"]["labelType"] == "global_label"
+        assert info["VBUS"]["localOnly"] == []
+        assert [Path(f).name for f in info["SDA_A"]["localOnly"]] == ["a.kicad_sch"]
+
+    def test_connect_to_net_scope_auto(self, tmp_path):
+        from kicad_interface import KiCADInterface
+
+        root = _scope_project(tmp_path)
+        iface = KiCADInterface.__new__(KiCADInterface)
+        iface.board = None
+        r = iface._handle_connect_to_net(
+            {
+                "schematicPath": str(root),
+                "componentRef": "U1",
+                "pinName": "1",
+                "netName": "VBUS",
+                "scope": "auto",
+            }
+        )
+        assert r["success"] is True, r
+        assert r["label_type"] == "global_label"
+        r = iface._handle_connect_to_net(
+            {
+                "schematicPath": str(root),
+                "componentRef": "U1",
+                "pinName": "2",
+                "netName": "FRESH",
+                "scope": "auto",
+            }
+        )
+        assert r["label_type"] == "label"
+        assert {(k, n) for k, n, *_ in _labels(root)} == {
+            ("global_label", "VBUS"),
+            ("label", "FRESH"),
+        }
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #  #5g — dangling wires after delete_schematic_component
@@ -533,8 +731,11 @@ def test_assert_connectivity_requires_expectations(tmp_path):
 #  S3 — relabel_net
 # ──────────────────────────────────────────────────────────────────────────
 def _relabel_project(tmp_path: Path) -> Path:
+    # The root's local VBUS label is wired to the Sub sheet pin, so it is the
+    # same net as Sub's hierarchical label.
     root_body = (
-        fx.label("VBUS", 10.16, 10.16)
+        fx.label("VBUS", 10.16, 53.34)
+        + fx.wire(10.16, 53.34, 50.8, 53.34)
         + fx.label("VBUS", 20.32, 10.16, kind="global_label")
         + fx.label("VBUS_SENSE", 30.48, 10.16)
         + fx.sheet("Sub", "sub.kicad_sch", 50.8, 50.8, pins=[("VBUS", 50.8, 53.34)])
@@ -585,3 +786,140 @@ class TestRelabelNet:
         root = _relabel_project(tmp_path)
         r = relabel_net({"schematicPath": str(root), "oldName": "NOPE", "newName": "X"})
         assert r["success"] is False
+
+
+def _scoped_project(tmp_path: Path) -> Path:
+    """Two sub-sheets with same-named local labels that are different nets.
+
+    * root: local SDA (alone), global VCC
+    * a.kicad_sch ("A"): local SDA (alone); local VCC wired to a global VCC
+    * b.kicad_sch ("B"): local SDA (alone); local VCC (alone)
+    """
+    root_body = (
+        fx.label("SDA", 10.16, 10.16)
+        + fx.label("VCC", 20.32, 10.16, kind="global_label")
+        + fx.sheet("A", "a.kicad_sch", 50.8, 50.8)
+        + fx.sheet("B", "b.kicad_sch", 101.6, 50.8)
+    )
+    a_body = (
+        fx.label("SDA", 25.4, 25.4)
+        + fx.label("VCC", 25.4, 50.8)
+        + fx.wire(25.4, 50.8, 50.8, 50.8)
+        + fx.label("VCC", 50.8, 50.8, kind="global_label")
+    )
+    b_body = fx.label("SDA", 25.4, 25.4) + fx.label("VCC", 25.4, 50.8)
+    return fx.write_project(
+        tmp_path, "proj", root_body, {"a.kicad_sch": a_body, "b.kicad_sch": b_body}
+    )
+
+
+def _names(path: Path, kind: str = "label"):
+    return sorted(n for k, n, *_ in _labels(path) if k == kind)
+
+
+@pytest.mark.unit
+class TestRelabelNetScoping:
+    """Local labels are per sheet: a same-named local label elsewhere is another net."""
+
+    def test_bare_name_renames_only_the_given_sheets_local_label(self, tmp_path):
+        root = _scoped_project(tmp_path)
+        r = relabel_net({"schematicPath": str(root), "oldName": "SDA", "newName": "I2C_SDA"})
+        assert r["success"] is True, r
+        assert r["renamed"] == 1
+        assert _names(root) == ["I2C_SDA"]
+        assert _names(tmp_path / "a.kicad_sch") == ["SDA", "VCC"]
+        assert _names(tmp_path / "b.kicad_sch") == ["SDA", "VCC"]
+        assert {Path(u["file"]).name for u in r["untouchedLocalLabels"]} == {
+            "a.kicad_sch",
+            "b.kicad_sch",
+        }
+        assert r["warnings"]
+
+    def test_hierarchical_path_names_the_sheet(self, tmp_path):
+        root = _scoped_project(tmp_path)
+        r = relabel_net({"schematicPath": str(root), "oldName": "/B/SDA", "newName": "SDA_B"})
+        assert r["success"] is True, r
+        assert r["renamed"] == 1
+        assert _names(tmp_path / "b.kicad_sch") == ["SDA_B", "VCC"]
+        assert _names(root) == ["SDA"]
+        assert _names(tmp_path / "a.kicad_sch") == ["SDA", "VCC"]
+
+    def test_given_sub_sheet_scopes_a_bare_name(self, tmp_path):
+        _scoped_project(tmp_path)
+        r = relabel_net(
+            {"schematicPath": str(tmp_path / "a.kicad_sch"), "oldName": "SDA", "newName": "X"}
+        )
+        assert r["renamed"] == 1
+        assert _names(tmp_path / "a.kicad_sch") == ["VCC", "X"]
+        assert _names(tmp_path / "b.kicad_sch") == ["SDA", "VCC"]
+
+    def test_global_net_takes_local_labels_wired_to_it_only(self, tmp_path):
+        root = _scoped_project(tmp_path)
+        r = relabel_net({"schematicPath": str(root), "oldName": "VCC", "newName": "VCC_3V3"})
+        assert r["success"] is True, r
+        # Global labels on root and A, plus A's local label on the same wire.
+        assert r["renamed"] == 3
+        assert _names(root, "global_label") == ["VCC_3V3"]
+        assert _names(tmp_path / "a.kicad_sch", "global_label") == ["VCC_3V3"]
+        assert _names(tmp_path / "a.kicad_sch") == ["SDA", "VCC_3V3"]
+        # B's local VCC is wired to nothing global: a separate net /B/VCC.
+        assert _names(tmp_path / "b.kicad_sch") == ["SDA", "VCC"]
+
+    def test_name_absent_from_the_named_sheet_fails_with_a_hint(self, tmp_path):
+        _scoped_project(tmp_path)
+        before = (tmp_path / "a.kicad_sch").read_text(encoding="utf-8")
+        r = relabel_net(
+            {
+                "schematicPath": str(tmp_path / "b.kicad_sch"),
+                "oldName": "/A/NOPE",
+                "newName": "X",
+            }
+        )
+        assert r["success"] is False
+        r = relabel_net(
+            {"schematicPath": str(tmp_path / "proj.kicad_sch"), "oldName": "/Z/SDA", "newName": "X"}
+        )
+        assert r["success"] is False and "not found" in r["message"]
+        assert (tmp_path / "a.kicad_sch").read_text(encoding="utf-8") == before
+
+    def test_local_label_only_on_another_sheet_reports_where(self, tmp_path):
+        root = fx.write_project(
+            tmp_path,
+            "proj",
+            fx.sheet("A", "a.kicad_sch", 50.8, 50.8),
+            {"a.kicad_sch": fx.label("SDA", 25.4, 25.4)},
+        )
+        r = relabel_net({"schematicPath": str(root), "oldName": "SDA", "newName": "X"})
+        assert r["success"] is False
+        assert "a.kicad_sch" in r["message"] and "/A/SDA" in r["message"]
+        assert _names(tmp_path / "a.kicad_sch") == ["SDA"]
+
+    def test_hierarchical_label_follows_sheet_pin_down_and_up(self, tmp_path):
+        # root: local EN wired to sheet pin EN of A; A: hierarchical EN, wired
+        # to sheet pin EN of nested C; C: hierarchical EN.
+        root = fx.write_project(
+            tmp_path,
+            "proj",
+            fx.label("EN", 10.16, 53.34)
+            + fx.wire(10.16, 53.34, 50.8, 53.34)
+            + fx.sheet("A", "a.kicad_sch", 50.8, 50.8, pins=[("EN", 50.8, 53.34)]),
+            {
+                "a.kicad_sch": fx.label("EN", 25.4, 25.4, kind="hierarchical_label")
+                + fx.wire(25.4, 25.4, 50.8, 25.4)
+                + fx.sheet("C", "c.kicad_sch", 50.8, 22.86, pins=[("EN", 50.8, 25.4)]),
+                "c.kicad_sch": fx.label("EN", 25.4, 25.4, kind="hierarchical_label"),
+            },
+        )
+        # Start in the middle sheet: the rename must reach both ends.
+        r = relabel_net({"schematicPath": str(root), "oldName": "/A/EN", "newName": "ENABLE"})
+        assert r["success"] is True, r
+        assert r["renamed"] == 5  # 3 labels + 2 sheet pins
+        assert _names(root) == ["ENABLE"]
+        assert _names(tmp_path / "a.kicad_sch", "hierarchical_label") == ["ENABLE"]
+        assert _names(tmp_path / "c.kicad_sch", "hierarchical_label") == ["ENABLE"]
+        assert '(pin "ENABLE" bidirectional' in root.read_text(encoding="utf-8")
+        assert '(pin "ENABLE" bidirectional' in (tmp_path / "a.kicad_sch").read_text(
+            encoding="utf-8"
+        )
+        nets = HierarchyNets(root)
+        assert not any("EN" in n["names"] for n in nets.nets.values())
