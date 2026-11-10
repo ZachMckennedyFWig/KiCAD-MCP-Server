@@ -14,16 +14,65 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from utils.file_io import FileTransaction, read_text_preserve_newline, write_text_atomic
 from utils.sexpr_format import (
     QUOTED_VALUE,
     QUOTED_VALUE_SKIP,
     escape_sexpr_string,
+    iter_child_offsets,
+    match_paren,
     unescape_sexpr_string,
 )
 from utils.sheet_tree import instance_paths, project_name
 from utils.symbol_instances import references_for_new_symbol
 
 logger = logging.getLogger("kicad_interface")
+
+# One (lib ...) row of a sym-lib-table. Name, type and URI may each be quoted
+# (URIs with spaces: OneDrive, network shares) or bare. Quoted values are taken
+# literally: hand-written Windows tables carry raw backslashes in paths.
+_TABLE_ROW_RE = re.compile(
+    r"\(lib\s+"
+    r'\(name\s+(?:"([^"]*)"|([^"\)\s]+))\)\s*'
+    r'\(type\s+(?:"([^"]*)"|([^"\)\s]+))\)\s*'
+    r'\(uri\s+(?:"([^"]*)"|([^"\)\s]+))',
+    re.IGNORECASE,
+)
+
+# Head token and (for property / symbol) the first quoted argument of a list.
+_HEAD_RE = re.compile(r"\(\s*([A-Za-z_][A-Za-z0-9_]*)(?:\s+" + QUOTED_VALUE + r")?")
+_EXTENDS_RE = re.compile(r"\(\s*extends\s+" + QUOTED_VALUE + r"\s*\)")
+_UNIT_SUFFIX_RE = re.compile(r"_(\d+)_(\d+)$")
+# Properties a derived symbol only overrides when it gives them a value
+# (KiCad's LIB_SYMBOL::Flatten keeps the parent's keywords / filters otherwise).
+_INHERIT_IF_EMPTY = {"ki_keywords", "ki_fp_filters"}
+
+
+def _quoted_or_bare(quoted: Optional[str], bare: Optional[str]) -> Optional[str]:
+    return quoted if quoted is not None else bare
+
+
+class SymbolLibraryError(ValueError):
+    """A library symbol was found but cannot be embedded faithfully."""
+
+
+def _children(block: str) -> List[Tuple[int, int, str, Optional[str]]]:
+    """Direct children of the list starting at the first ``(`` of *block*.
+
+    Returns ``(start, end_inclusive, head_token, first_quoted_arg)`` per child.
+    String-aware: parens inside quoted pin names (``"PA13(JTMS"``) are text.
+    """
+    out = []
+    for off in iter_child_offsets(block):
+        end = match_paren(block, off)
+        if end == -1:
+            raise SymbolLibraryError("unbalanced parentheses in symbol definition")
+        m = _HEAD_RE.match(block, off)
+        head = m.group(1) if m else ""
+        arg = unescape_sexpr_string(m.group(2)) if m and m.group(2) is not None else None
+        out.append((off, end, head, arg))
+    return out
+
 
 #: First schematic file-format version that accepts ``(body_style ...)`` and
 #: ``(in_pos_files ...)`` inside a placed ``(symbol ...)``. Both tokens are
@@ -78,7 +127,8 @@ class DynamicSymbolLoader:
     Key rules for KiCad 9 .kicad_sch format:
     - Top-level symbols in lib_symbols must have library prefix: (symbol "Device:R" ...)
     - Sub-symbols must NOT have library prefix: (symbol "R_0_1" ...), (symbol "R_1_1" ...)
-    - Parent symbols must appear BEFORE child symbols that use (extends ...)
+    - No (extends ...) inside a sheet: derived symbols are embedded flattened
+    - The library text is embedded verbatim; only the top-level name changes
     """
 
     def __init__(self, project_path: Optional[Path] = None):
@@ -190,15 +240,23 @@ class DynamicSymbolLoader:
                         logger.info(f"Found '{library_name}' in project sym-lib-table: {resolved}")
                         return resolved
 
-            # 2. Check global user sym-lib-table
-            for global_table in self._global_sym_lib_table_paths():
-                if global_table.exists():
-                    resolved = self._resolve_library_from_table(global_table, library_name)
-                    if resolved:
-                        logger.info(
-                            f"Found '{library_name}' in global sym-lib-table {global_table}: {resolved}"
-                        )
-                        return resolved
+            # 2. Check the global user sym-lib-table — only the newest one.
+            # KiCad reads just its own version's table; KiCad 10's holds a
+            # single (type "Table") row standing for every stock library.
+            # Falling through to an older 9.0/8.0 table here resolved stock
+            # names to an older KiCad install that was still on disk, so
+            # placed symbols carried KiCad 8 geometry (TPS22917DBV QOD on the
+            # CT row, SolderJumper pins at ±3.81, USB-C shield "S1" for "SH")
+            # and symbols new in KiCad 10 (RP2350B, TPS22810DBV) were
+            # "not found" (#5, #5e, #5p).
+            global_table = self._global_sym_lib_table()
+            if global_table is not None:
+                resolved = self._resolve_library_from_table(global_table, library_name)
+                if resolved:
+                    logger.info(
+                        f"Found '{library_name}' in global sym-lib-table {global_table}: {resolved}"
+                    )
+                    return resolved
 
             # 3. Fall back to bundled / well-known KiCad symbol directories
             for lib_dir in self.find_kicad_symbol_libraries():
@@ -240,270 +298,345 @@ class DynamicSymbolLoader:
                 candidates.append(base / v / "sym-lib-table")
         return candidates
 
-    def _resolve_library_from_table(self, table_path: Path, library_name: str) -> Optional[Path]:
-        """Parse a sym-lib-table file and return the resolved path for the given library nickname."""
+    def _global_sym_lib_table(self) -> Optional[Path]:
+        """The user-global sym-lib-table KiCad itself would read: the newest one present."""
+        for candidate in self._global_sym_lib_table_paths():
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def _resolve_library_from_table(
+        self, table_path: Path, library_name: str, _seen: Optional[set] = None
+    ) -> Optional[Path]:
+        """Return the resolved path of ``library_name`` from a sym-lib-table.
+
+        ``(type "Table")`` rows name another table to search in their place
+        (KiCad 10's global table is a single such row,
+        ``${KICAD10_TEMPLATE_DIR}/sym-lib-table``); they are followed
+        recursively, with ``_seen`` stopping a table that includes itself.
+        Disabled rows are skipped, as KiCad skips them.
+        """
+        seen = set() if _seen is None else _seen
+        table_key = os.path.normcase(os.path.realpath(str(table_path)))
+        if table_key in seen:
+            return None
+        seen.add(table_key)
         try:
             with open(table_path, "r", encoding="utf-8") as f:
                 content = f.read()
+        except OSError as e:
+            logger.warning(f"Could not read sym-lib-table {table_path}: {e}")
+            return None
 
-            # Name and URI may be quoted (with embedded spaces, e.g. OneDrive paths)
-            # or bare. Match a quoted "..." form first, otherwise a bareword that
-            # excludes whitespace and parens.
-            lib_pattern = (
-                r"\(lib\s+"
-                r'\(name\s+(?:"([^"]+)"|([^"\)\s]+))\)\s*'
-                r"\(type\s+[^)]+\)\s*"
-                r'\(uri\s+(?:"([^"]+)"|([^"\)\s]+))'
-            )
-            for match in re.finditer(lib_pattern, content, re.IGNORECASE):
-                # Groups: 1=quoted name, 2=bare name, 3=quoted uri, 4=bare uri
-                nickname = match.group(1) or match.group(2)
-                if nickname != library_name:
-                    continue
-                uri = match.group(3) or match.group(4)
-                resolved = self._resolve_sym_uri(uri)
-                if resolved and Path(resolved).exists():
-                    return Path(resolved)
-        except Exception as e:
-            logger.warning(f"Could not parse sym-lib-table {table_path}: {e}")
+        base_dir = Path(table_path).parent
+        for match in _TABLE_ROW_RE.finditer(content):
+            nickname = _quoted_or_bare(match.group(1), match.group(2))
+            lib_type = _quoted_or_bare(match.group(3), match.group(4)) or ""
+            uri = _quoted_or_bare(match.group(5), match.group(6)) or ""
+            row_end = match_paren(content, match.start())
+            if row_end != -1 and re.search(
+                r"\(disabled\s*(?:yes)?\s*\)", content[match.start() : row_end + 1]
+            ):
+                continue
+            if lib_type.lower() == "table":
+                nested = self._resolve_sym_uri(uri, base_dir)
+                if nested and Path(nested).is_file():
+                    found = self._resolve_library_from_table(Path(nested), library_name, seen)
+                    if found:
+                        return found
+                else:
+                    logger.debug(f"Could not resolve nested library table URI: {uri}")
+                continue
+            if nickname != library_name:
+                continue
+            resolved = self._resolve_sym_uri(uri, base_dir)
+            if resolved and Path(resolved).exists():
+                return Path(resolved)
         return None
 
-    def _resolve_sym_uri(self, uri: str) -> Optional[str]:
-        """Resolve environment variables in a sym-lib-table URI."""
-        env_map = {
-            "KICAD10_SYMBOL_DIR": [
-                "/usr/share/kicad/symbols",
-                "C:/Program Files/KiCad/10.0/share/kicad/symbols",
-                "/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols",
-            ],
-            "KICAD9_SYMBOL_DIR": [
-                "C:/Program Files/KiCad/9.0/share/kicad/symbols",
-                "/usr/share/kicad/symbols",
-                "/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols",
-            ],
-            "KICAD8_SYMBOL_DIR": [
-                "C:/Program Files/KiCad/8.0/share/kicad/symbols",
-            ],
-            "KIPRJMOD": [str(self.project_path)] if self.project_path else [],
-        }
-        result = uri
-        for var, candidates in env_map.items():
-            if f"${{{var}}}" in result:
-                for candidate in candidates:
-                    candidate_path = result.replace(f"${{{var}}}", candidate)
-                    if Path(candidate_path).exists():
-                        return candidate_path
-                # Fallback: try OS env
-                if var in os.environ:
-                    return result.replace(f"${{{var}}}", os.environ[var])
+    def _path_vars(self) -> Dict[str, str]:
+        """Values for the path variables a sym-lib-table URI can reference.
+
+        Every ``KICAD*_SYMBOL_DIR`` stands for the newest discovered install's
+        symbol directory (or the MCP's KICAD*_SYMBOL_DIR override), the same
+        mapping the search/list symbol tools use, so placement and search can
+        never resolve one nickname to two different files. The process
+        environment wins over everything, as it does in KiCad.
+        """
+        values: Dict[str, str] = {}
+        symbol_dirs = self.find_kicad_symbol_libraries()
+        if symbol_dirs:
+            for var in _SYMBOL_DIR_ENV_VARS + ("KISYSSYM",):
+                values[var] = str(symbol_dirs[0])
+        try:
+            from utils.platform_helper import PlatformHelper
+
+            template_dir = PlatformHelper.find_kicad_template_dir()
+            if template_dir:
+                for var in (
+                    "KICAD10_TEMPLATE_DIR",
+                    "KICAD9_TEMPLATE_DIR",
+                    "KICAD8_TEMPLATE_DIR",
+                    "KICAD_TEMPLATE_DIR",
+                ):
+                    values[var] = str(template_dir)
+            third_party = PlatformHelper.find_kicad_3rd_party_dir()
+            if third_party:
+                for var in (
+                    "KICAD10_3RD_PARTY",
+                    "KICAD9_3RD_PARTY",
+                    "KICAD8_3RD_PARTY",
+                    "KICAD_3RD_PARTY",
+                ):
+                    values[var] = str(third_party)
+            values.update({k: str(v) for k, v in PlatformHelper.load_kicad_env_vars().items() if v})
+        except Exception as e:  # pragma: no cover - discovery is best effort
+            logger.debug(f"KiCad path variable discovery failed: {e}")
+        if self.project_path:
+            values["KIPRJMOD"] = str(self.project_path)
+        return values
+
+    def _resolve_sym_uri(self, uri: str, base_dir: Optional[Path] = None) -> Optional[str]:
+        """Expand ``${VAR}`` / ``$(VAR)`` in a sym-lib-table URI.
+
+        A relative result is taken relative to ``base_dir`` (the table's own
+        directory). Unknown variables are left in place, so the path simply
+        does not exist and the row is skipped.
+        """
+        values = self._path_vars()
+
+        def _sub(m: "re.Match") -> str:
+            var = m.group(1) or m.group(2)
+            if os.environ.get(var):
+                return os.environ[var]
+            return values.get(var, m.group(0))
+
+        result = re.sub(r"\$\{([A-Za-z0-9_]+)\}|\$\(([A-Za-z0-9_]+)\)", _sub, uri)
+        result = os.path.expanduser(result)
+        if base_dir is not None and not os.path.isabs(result) and "${" not in result:
+            result = str(Path(base_dir) / result)
         return result
 
-    def _extract_symbol_block(self, text: str, symbol_name: str) -> Optional[str]:
+    # ------------------------------------------------------------------ #
+    # Library symbol extraction: verbatim text, extends flattened         #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _find_symbol_span(text: str, symbol_name: str) -> Optional[Tuple[int, int]]:
+        """``(start, end_inclusive)`` of the ``(symbol "<symbol_name>" ...)`` list.
+
+        String-aware (``match_paren``), and not tied to KiCad's one-token-per-
+        line layout: the old line/paren counter lost its place on a pin name
+        such as ``"PA13(JTMS"`` and could not find a symbol in a compact
+        single-line library at all. When the name also occurs as a nested list
+        (a top-level symbol literally named like another's ``X_1_1`` unit),
+        the least-indented occurrence wins: the top-level one.
         """
-        Extract a complete symbol block from a library or schematic file by matching
-        parentheses depth. Returns the raw text of the symbol definition.
-        """
-        lines = text.split("\n")
-        start = None
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            # Match exact symbol name (not sub-symbols like Name_0_1)
-            if stripped.startswith(f'(symbol "{symbol_name}"') and not re.match(
-                r'.*_\d+_\d+"', stripped
-            ):
-                start = i
-                break
-
-        if start is None:
-            return None
-
-        depth = 0
-        end = None
-        for i in range(start, len(lines)):
-            for ch in lines[i]:
-                if ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                    if depth == 0:
-                        end = i
-                        break
-            if end is not None:
-                break
-
-        if end is None:
-            return None
-
-        return "\n".join(lines[start : end + 1])
-
-    def _iter_top_level_items(self, symbol_block: str) -> list:
-        """
-        Extract each top-level s-expression item from inside a symbol block.
-        Starts after the first line (symbol header) and stops before the final
-        closing parenthesis.  Returns a list of raw text strings.
-        """
-        lines = symbol_block.split("\n")
-        items = []
-        i = 1  # skip first line: (symbol "Name" ...)
-        n = len(lines)
-
-        while i < n:
-            line = lines[i]
-            stripped = line.strip()
-
-            if not stripped:
-                i += 1
-                continue
-
-            # The final closing paren of the symbol itself
-            if stripped == ")" and i == n - 1:
-                break
-
-            if not stripped.startswith("("):
-                i += 1
-                continue
-
-            # Collect a balanced s-expression starting here
-            depth = 0
-            item_start = i
-            while i < n:
-                for ch in lines[i]:
-                    if ch == "(":
-                        depth += 1
-                    elif ch == ")":
-                        depth -= 1
-                i += 1
-                if depth == 0:
+        pattern = re.compile(
+            r'\(symbol\s+"' + re.escape(escape_sexpr_string(symbol_name)) + r'"(?=[\s)])'
+        )
+        best: Optional[Tuple[int, int]] = None
+        best_indent = None
+        for m in pattern.finditer(text):
+            line_start = text.rfind("\n", 0, m.start()) + 1
+            prefix = text[line_start : m.start()]
+            indent = len(prefix) if not prefix.strip() else 10**9
+            if best is None or indent < best_indent:
+                end = match_paren(text, m.start())
+                if end == -1:
+                    continue
+                best, best_indent = (m.start(), end), indent
+                if indent <= 1:
                     break
+        return best
 
-            items.append("\n".join(lines[item_start:i]))
+    def _extract_symbol_block(self, text: str, symbol_name: str) -> Optional[str]:
+        """Return the raw text of a symbol definition, byte-for-byte.
 
-        return items
-
-    def _inline_extends_symbol(self, lib_content: str, symbol_name: str, child_block: str) -> str:
+        The text includes the leading indentation of its first line (when only
+        whitespace precedes it), so every line carries the library's own
+        indentation and can be re-indented uniformly.
         """
-        Fully inline a child symbol that uses (extends "ParentName") by merging
-        the parent's pins / graphics into the child definition.
-
-        KiCad 9 does NOT support (extends ...) inside a schematic's lib_symbols
-        section.  This method produces a self-contained, fully-resolved symbol
-        block – exactly what KiCad itself writes when saving a schematic.
-
-        Algorithm:
-          1. Extract the parent block from the library text.
-          2. Take every top-level item from the parent (pin_names, properties,
-             sub-symbols, …).
-          3. For each property, use the child's override if one exists; otherwise
-             keep the parent's value.
-          4. Rename parent sub-symbols (ParentName_0_1 → ChildName_0_1).
-          5. Append any child-only properties that do not exist in the parent.
-          6. Return the merged block named after the child – no (extends …) left.
-        """
-        extends_match = re.search(r'\(extends "([^"]+)"\)', child_block)
-        if not extends_match:
-            return child_block
-
-        parent_name = extends_match.group(1)
-        parent_block = self._extract_symbol_block(lib_content, parent_name)
-        if not parent_block:
-            logger.warning(
-                f"Cannot resolve parent '{parent_name}' for '{symbol_name}' "
-                "- stripping extends clause (symbol may be incomplete)"
-            )
-            return re.sub(r"\s*\(extends \"[^\"]+\"\)\n?", "", child_block)
-
-        # Collect child property overrides: prop_name -> raw block text
-        child_props: dict = {}
-        for item in self._iter_top_level_items(child_block):
-            m = re.match(r'[\s\t]*\(property "([^"]+)"', item)
-            if m:
-                child_props[m.group(1)] = item
-
-        # Walk parent items, applying child overrides
-        body_lines = []
-        parent_prop_names: set = set()
-
-        for item in self._iter_top_level_items(parent_block):
-            prop_match = re.match(r'[\s\t]*\(property "([^"]+)"', item)
-            sub_match = re.search(r'\(symbol "' + re.escape(parent_name) + r'_\d+_\d+"', item)
-
-            if prop_match:
-                pname = prop_match.group(1)
-                parent_prop_names.add(pname)
-                body_lines.append(child_props[pname] if pname in child_props else item)
-            elif sub_match:
-                # Rename ParentName_0_1 → ChildName_0_1
-                body_lines.append(item.replace(f'"{parent_name}_', f'"{symbol_name}_'))
-            elif re.match(r"[\s\t]*\(extends ", item):
-                pass  # drop extends clause
-            else:
-                body_lines.append(item)  # pin_names, in_bom, on_board …
-
-        # Append child-only properties absent from parent
-        for pname, pblock in child_props.items():
-            if pname not in parent_prop_names:
-                body_lines.append(pblock)
-
-        first_line = parent_block.split("\n")[0].replace(f'"{parent_name}"', f'"{symbol_name}"')
-        last_line = parent_block.split("\n")[-1]
-
-        return first_line + "\n" + "\n".join(body_lines) + "\n" + last_line
-
-    def _read_symdir_shard(self, lib_dir: Path, symbol_name: str) -> Optional[str]:
-        """Read the per-symbol shard ``<symbol>.kicad_sym`` from a ``.kicad_symdir``."""
-        shard = lib_dir / f"{symbol_name}.kicad_sym"
-        if not shard.exists():
+        span = self._find_symbol_span(text, symbol_name)
+        if span is None:
             return None
-        try:
-            with open(shard, "r", encoding="utf-8") as f:
-                return f.read()
-        except OSError as e:
-            logger.warning(f"Could not read symdir shard {shard}: {e}")
-            return None
+        start, end = span
+        line_start = text.rfind("\n", 0, start) + 1
+        if not text[line_start:start].strip():
+            start = line_start
+        return text[start : end + 1]
 
-    def _resolve_symdir_extends(
-        self, lib_dir: Path, symbol_name: str, block: str, _seen: Optional[set] = None
+    @staticmethod
+    def _rename_symbol_header(block: str, new_name: str) -> str:
+        """Rename the top-level ``(symbol "<name>"`` token of *block*."""
+        return re.sub(
+            r'(\(symbol\s+)"(?:[^"\\]|\\.)*"',
+            lambda m: f'{m.group(1)}"{escape_sexpr_string(new_name)}"',
+            block,
+            count=1,
+        )
+
+    def _flatten_extends(
+        self,
+        symbol_name: str,
+        block: str,
+        parent_lookup,
+        _chain: Optional[List[str]] = None,
     ) -> str:
-        """Inline ``(extends "Parent")`` for a sharded (``.kicad_symdir``) library.
+        """Resolve ``(extends "Parent")`` to any depth, the way KiCad saves it.
 
-        Unlike a single-file library, a derived symbol's parent lives in its own
-        sibling shard ``<Parent>.kicad_sym`` and is therefore absent from this
-        symbol's file (issue #282). Read the parent shard, resolve it recursively
-        (a parent may itself extend a grandparent in yet another shard), then merge
-        the fully-resolved parent into the child with the shared single-level
-        inliner. When the parent shard is missing or the chain is cyclic, hand the
-        inliner an empty library so it falls back to its graceful strip-and-warn.
+        KiCad does not accept ``(extends ...)`` inside a schematic's
+        ``lib_symbols``; on save it writes ``LIB_SYMBOL::Flatten()``: the root
+        ancestor's definition (flags, pins, graphics) renamed to the derived
+        symbol, the unit sub-symbols renamed ``<Child>_<unit>_<style>``, and
+        the derived symbol's own fields replacing the inherited ones (fields
+        only the child has are added). This does the same as text surgery on
+        the library's own bytes, so nothing is re-serialised.
+
+        The old inliner resolved one level only: a grandchild such as
+        ``Memory_RAM:APS6404L-3SQRx-SN`` (-> APS6404L-SQRx-SN ->
+        APS1604M-SQRx-SN) inherited its parent's *unresolved* block, came out
+        with no pins and no ``_1_1`` sub-unit, and broke kicad-skip on every
+        later call on the sheet (#5b, #5o).
+
+        ``parent_lookup(name)`` returns a parent's raw block or None. A missing
+        parent or a cyclic chain raises SymbolLibraryError: embedding a
+        pinless half-symbol is worse than refusing.
         """
-        extends_match = re.search(r'\(extends "([^"]+)"\)', block)
-        if not extends_match:
+        m = None
+        for start, end, head, arg in _children(block):
+            if head == "extends":
+                m = _EXTENDS_RE.match(block, start)
+                break
+        if m is None:
             return block
 
-        parent_name = extends_match.group(1)
-        seen = set() if _seen is None else _seen
+        parent_name = unescape_sexpr_string(m.group(1))
+        chain = (_chain or []) + [symbol_name]
+        if parent_name in chain:
+            raise SymbolLibraryError(
+                f"Cyclic (extends ...) chain: {' -> '.join(chain + [parent_name])}"
+            )
+        parent_block = parent_lookup(parent_name)
+        if parent_block is None:
+            raise SymbolLibraryError(
+                f"Symbol '{symbol_name}' extends '{parent_name}', which is not in the library "
+                f"(chain: {' -> '.join(chain + [parent_name])})"
+            )
+        resolved_parent = self._flatten_extends(parent_name, parent_block, parent_lookup, chain)
 
-        parent_content = ""
-        if parent_name not in seen:
-            seen.add(parent_name)
-            shard = self._read_symdir_shard(lib_dir, parent_name)
-            if shard is not None:
-                parent_block = self._extract_symbol_block(shard, parent_name)
-                if parent_block is not None:
-                    # Fully resolve the parent (extends-free) before merging so
-                    # multi-level chains inline completely.
-                    parent_content = self._resolve_symdir_extends(
-                        lib_dir, parent_name, parent_block, seen
+        # The derived symbol's own fields, verbatim.
+        child_props: Dict[str, str] = {}
+        child_order: List[str] = []
+        for start, end, head, arg in _children(block):
+            if head == "property" and arg is not None:
+                text = block[start : end + 1]
+                if arg in _INHERIT_IF_EMPTY and re.match(
+                    r'\(\s*property\s+"(?:[^"\\]|\\.)*"\s+""', text
+                ):
+                    continue
+                child_props[arg] = text
+                child_order.append(arg)
+
+        edits: List[Tuple[int, int, str]] = []  # (start, end_exclusive, replacement)
+        last_prop_end = None
+        last_prop_sep = "\n"
+        first_unit_start = None
+        prev_end = None
+        parent_children = _children(resolved_parent)
+        for start, end, head, arg in parent_children:
+            if head == "property" and arg is not None:
+                if arg in child_props:
+                    edits.append((start, end + 1, child_props.pop(arg)))
+                last_prop_end = end + 1
+                if prev_end is not None:
+                    last_prop_sep = resolved_parent[prev_end:start]
+            elif head == "symbol" and arg is not None:
+                um = _UNIT_SUFFIX_RE.search(arg)
+                if um and arg == f"{parent_name}_{um.group(1)}_{um.group(2)}":
+                    hm = re.compile(r'(\(\s*symbol\s+)"(?:[^"\\]|\\.)*"').match(
+                        resolved_parent, start
                     )
+                    new = escape_sexpr_string(f"{symbol_name}_{um.group(1)}_{um.group(2)}")
+                    edits.append((hm.start(), hm.end(), f'{hm.group(1)}"{new}"'))
+                if first_unit_start is None:
+                    first_unit_start = start
+            prev_end = end + 1
 
-        return self._inline_extends_symbol(parent_content, symbol_name, block)
+        # Fields only the derived symbol has go after the inherited ones.
+        extra = [child_props[name] for name in child_order if name in child_props]
+        if extra:
+            if last_prop_end is None:
+                if first_unit_start is not None:
+                    line_start = resolved_parent.rfind("\n", 0, first_unit_start) + 1
+                    last_prop_end = line_start - 1 if line_start > 0 else first_unit_start
+                else:
+                    last_prop_end = match_paren(resolved_parent, resolved_parent.find("("))
+            sep = last_prop_sep if last_prop_sep.strip() == "" else "\n"
+            edits.append((last_prop_end, last_prop_end, "".join(sep + t for t in extra)))
+
+        out = resolved_parent
+        for start, end, repl in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+            out = out[:start] + repl + out[end:]
+        return self._rename_symbol_header(out, symbol_name)
+
+    def _validate_symbol_block(self, full_name: str, block: str, source: Path) -> None:
+        """Refuse to embed a symbol KiCad or kicad-skip could not read back.
+
+        Checked before anything is written (#5c): balanced parentheses, no
+        leftover ``(extends ...)``, at least one ``<Name>_<unit>_<style>``
+        sub-unit (kicad-skip crashes on a lib symbol with none), and a clean
+        s-expression parse.
+        """
+        bare = full_name.split(":", 1)[-1]
+        first = block.find("(")
+        if first == -1 or match_paren(block, first) == -1:
+            raise SymbolLibraryError(f"Symbol '{full_name}' in {source} is not balanced")
+        units = 0
+        drawables = 0
+        for _s, _e, head, arg in _children(block[first:]):
+            if head == "extends":
+                raise SymbolLibraryError(
+                    f"Symbol '{full_name}' still has an (extends ...) after flattening"
+                )
+            if head == "symbol" and arg is not None:
+                if arg.startswith(bare + "_") and _UNIT_SUFFIX_RE.search(arg):
+                    units += 1
+            elif head in ("pin", "rectangle", "polyline", "circle", "arc", "text", "bezier"):
+                drawables += 1
+        if units == 0:
+            hint = (
+                " Its pins/graphics sit directly under the symbol (a 'flat' vendor symbol);"
+                f" run repair_flat_symbols on {source} first."
+                if drawables
+                else ""
+            )
+            raise SymbolLibraryError(
+                f"Symbol '{full_name}' has no unit sub-symbols ('{bare}_1_1' ...); embedding it"
+                f" would make the sheet unreadable to kicad-skip.{hint}"
+            )
+        try:
+            import sexpdata
+
+            sexpdata.loads(block[first:])
+        except Exception as e:
+            raise SymbolLibraryError(f"Symbol '{full_name}' in {source} does not parse: {e}")
 
     def extract_symbol_from_library(self, library_name: str, symbol_name: str) -> Optional[str]:
         """
         Extract a symbol definition from a KiCad .kicad_sym library file.
         Returns the raw text block, ready to be injected into a schematic.
 
-        The returned block has:
-        - Top-level name prefixed with library: (symbol "Library:Name" ...)
-        - Sub-symbol names WITHOUT prefix: (symbol "Name_0_1" ...)
+        The text is the library's own, byte-for-byte (#5e): the only changes
+        are the ones KiCad itself makes when it embeds a symbol —
+        - the top-level name gets its library prefix: (symbol "Library:Name" ...)
+        - an ``(extends ...)`` chain of any depth is flattened, with the
+          inherited unit sub-symbols renamed to ``Name_<unit>_<style>``.
+        Sub-symbol names never carry the library prefix.
+
+        Returns None when the library or symbol does not exist; raises
+        SymbolLibraryError (a ValueError) when the symbol exists but cannot be
+        embedded faithfully (missing parent, no sub-units, unparsable).
         """
         cache_key = f"{library_name}:{symbol_name}"
         if cache_key in self.symbol_cache:
@@ -531,7 +664,8 @@ class DynamicSymbolLoader:
         # mid-session, so a hit is honoured only while the mtime matches. (For
         # a symdir symbol whose (extends ...) parent lives in a sibling shard,
         # a parent-only edit is invisible to this stat — the mutating handlers
-        # call clear_library_caches() to cover that.)
+        # call clear_library_caches() to cover that.) Failures that raise are
+        # never cached.
         mod_key = (str(lib_path), symbol_name)
         current_mtime = _src_mtime_ns()
         entry = _SYMBOL_BLOCK_CACHE.get(mod_key)
@@ -540,111 +674,147 @@ class DynamicSymbolLoader:
             self.symbol_cache[cache_key] = cached
             return cached
 
-        # KiCAD 10 directory library: each symbol is its own file
         if lib_path.is_dir():
             if not src_file.exists():
                 logger.warning(f"Symbol '{symbol_name}' not found in directory library {lib_path}")
                 _SYMBOL_BLOCK_CACHE[mod_key] = (current_mtime, None)
                 return None
-            with open(src_file, "r", encoding="utf-8") as f:
-                lib_content = f.read()
+            lib_content = src_file.read_text(encoding="utf-8")
+
+            def parent_lookup(name: str) -> Optional[str]:
+                # Sharded (.kicad_symdir) library: a parent lives in its own
+                # sibling shard, not in this symbol's file (#282).
+                shard = self._read_symdir_shard(lib_path, name)
+                return None if shard is None else self._extract_symbol_block(shard, name)
+
         else:
-            with open(lib_path, "r", encoding="utf-8") as f:
-                lib_content = f.read()
+            lib_content = lib_path.read_text(encoding="utf-8")
+
+            def parent_lookup(name: str) -> Optional[str]:
+                return self._extract_symbol_block(lib_content, name)
 
         block = self._extract_symbol_block(lib_content, symbol_name)
         if block is None:
-            logger.warning(f"Symbol '{symbol_name}' not found in {library_name}")
+            logger.warning(f"Symbol '{symbol_name}' not found in {library_name} ({lib_path})")
             _SYMBOL_BLOCK_CACHE[mod_key] = (current_mtime, None)
             return None
 
-        # If the symbol uses (extends "ParentName"), inline the parent content
-        # so that the result is a fully self-contained definition.
-        # (extends ...) is only valid in .kicad_sym files; KiCad 9 refuses to
-        # load a schematic whose lib_symbols section contains it.
-        if re.search(r'\(extends "([^"]+)"\)', block):
-            parent_name = re.search(r'\(extends "([^"]+)"\)', block).group(1)
-            logger.info(f"Symbol {symbol_name} extends {parent_name}, inlining parent content")
-            if lib_path.is_dir():
-                # Sharded (.kicad_symdir) library: the parent is in a sibling
-                # shard, not in this symbol's file, so resolve across shards (#282).
-                block = self._resolve_symdir_extends(lib_path, symbol_name, block)
-            else:
-                block = self._inline_extends_symbol(lib_content, symbol_name, block)
+        try:
+            block = self._flatten_extends(symbol_name, block, parent_lookup)
+        except SymbolLibraryError as e:
+            raise SymbolLibraryError(f"{library_name}:{symbol_name}: {e}") from None
 
-        # Prefix top-level symbol name with library
         full_name = f"{library_name}:{symbol_name}"
-        block = block.replace(
-            f'(symbol "{symbol_name}"',
-            f'(symbol "{full_name}"',
-            1,  # Only first occurrence (top-level)
-        )
-        # Sub-symbols like "Name_0_1" keep their short names (already correct from library)
+        block = self._rename_symbol_header(block, full_name)
+        self._validate_symbol_block(full_name, block, src_file)
 
-        result = block
+        self.symbol_cache[cache_key] = block
+        _SYMBOL_BLOCK_CACHE[mod_key] = (current_mtime, block)
+        logger.info(f"Extracted symbol {full_name} from {src_file} ({len(block)} chars)")
+        return block
 
-        self.symbol_cache[cache_key] = result
-        _SYMBOL_BLOCK_CACHE[mod_key] = (current_mtime, result)
-        logger.info(f"Extracted symbol {full_name} ({len(result)} chars)")
-        return result
+    def _read_symdir_shard(self, lib_dir: Path, symbol_name: str) -> Optional[str]:
+        """Read the per-symbol shard ``<symbol>.kicad_sym`` from a ``.kicad_symdir``."""
+        shard = lib_dir / f"{symbol_name}.kicad_sym"
+        if not shard.exists():
+            return None
+        try:
+            with open(shard, "r", encoding="utf-8") as f:
+                return f.read()
+        except OSError as e:
+            logger.warning(f"Could not read symdir shard {shard}: {e}")
+            return None
+
+    @staticmethod
+    def _lib_symbols_span(content: str) -> Optional[Tuple[int, int]]:
+        """``(start, end_inclusive)`` of the sheet's ``(lib_symbols ...)`` list."""
+        m = re.search(r"\(lib_symbols(?=[\s)])", content)
+        if not m:
+            return None
+        end = match_paren(content, m.start())
+        return None if end == -1 else (m.start(), end)
+
+    @staticmethod
+    def _reindent(block: str, indent: str, unit: str = "\t") -> str:
+        """Re-indent a verbatim block so its first line starts at *indent*.
+
+        Only leading whitespace changes: the block's own common prefix (the
+        library's depth-1 indentation) is replaced by *indent* on every line,
+        and the library's leading tabs become *unit* (the sheet's own indent
+        step). KiCad escapes newlines inside strings, so every physical line
+        is structure, never string content.
+        """
+        lines = block.split("\n")
+        first = lines[0]
+        base = first[: len(first) - len(first.lstrip())]
+        out = []
+        for i, line in enumerate(lines):
+            if not line.strip():
+                out.append(line)
+                continue
+            if i == 0:
+                rest = line.lstrip(" \t")
+            elif base and line.startswith(base):
+                rest = line[len(base) :]
+            else:
+                rest = line
+            body = rest.lstrip("\t")
+            out.append(indent + unit * (len(rest) - len(body)) + body)
+        return "\n".join(out)
+
+    def _insert_lib_symbol(self, content: str, symbol_block: str) -> str:
+        """Return *content* with *symbol_block* appended inside ``lib_symbols``."""
+        span = self._lib_symbols_span(content)
+        if span is None:
+            raise ValueError("No lib_symbols section found in schematic")
+        lib_start, lib_end = span
+        line_start = content.rfind("\n", 0, lib_start) + 1
+        outer = content[line_start:lib_start]
+        outer = outer if not outer.strip() else ""
+        unit = "\t" if ("\t" in outer or "\n\t" in content[:4096]) else "  "
+        inner = outer + unit
+        indented = self._reindent(symbol_block, inner, unit)
+
+        close_line_start = content.rfind("\n", 0, lib_end) + 1
+        if close_line_start > lib_start and not content[close_line_start:lib_end].strip():
+            # The closing paren sits on its own line: insert whole lines before it.
+            return content[:close_line_start] + indented + "\n" + content[close_line_start:]
+        return content[:lib_end] + "\n" + indented + "\n" + outer + content[lib_end:]
 
     def inject_symbol_into_schematic(
         self, schematic_path: Path, library_name: str, symbol_name: str
     ) -> bool:
         """
         Inject a symbol definition into a schematic's lib_symbols section.
-        Uses text manipulation to preserve file formatting.
+
+        The library text is embedded verbatim (see extract_symbol_from_library)
+        and validated before anything is written; the write is atomic. A
+        symbol already embedded in this sheet is left as it is — refreshing an
+        embedded copy moves the pins of instances already wired to it, which
+        is update_symbol_from_library's job.
         """
         full_name = f"{library_name}:{symbol_name}"
+        schematic_path = Path(schematic_path)
 
-        with open(schematic_path, "r", encoding="utf-8") as f:
-            content = f.read()
+        content, newline = read_text_preserve_newline(schematic_path)
 
-        # Check if symbol already exists
-        if f'(symbol "{full_name}"' in content:
+        span = self._lib_symbols_span(content)
+        if span is None:
+            raise ValueError("No lib_symbols section found in schematic")
+        existing = re.compile(r'\(symbol\s+"' + re.escape(escape_sexpr_string(full_name)) + r'"')
+        if existing.search(content, span[0], span[1]):
             logger.info(f"Symbol {full_name} already exists in schematic")
             return True
 
-        # Extract symbol from library
+        # Extract (and validate) before touching the file.
         symbol_block = self.extract_symbol_from_library(library_name, symbol_name)
         if not symbol_block:
             raise ValueError(f"Symbol '{symbol_name}' not found in library '{library_name}'")
 
-        # Indent the block to match lib_symbols indentation (4 spaces for top-level)
-        indented_lines = []
-        for line in symbol_block.split("\n"):
-            # Add 4-space indent for the content inside lib_symbols
-            indented_lines.append("    " + line if line.strip() else line)
-        indented_block = "\n".join(indented_lines)
+        content = self._insert_lib_symbol(content, symbol_block)
+        write_text_atomic(schematic_path, content, newline)
 
-        # Find the end of lib_symbols section using string search (format-independent,
-        # works even when sexpdata.dumps() has compacted the file to a single line)
-        lib_sym_start = content.find("(lib_symbols")
-        if lib_sym_start == -1:
-            raise ValueError("No lib_symbols section found in schematic")
-
-        depth = 0
-        lib_sym_end = lib_sym_start
-        for i in range(lib_sym_start, len(content)):
-            if content[i] == "(":
-                depth += 1
-            elif content[i] == ")":
-                depth -= 1
-                if depth == 0:
-                    lib_sym_end = i
-                    break
-        else:
-            raise ValueError("No lib_symbols section found in schematic")
-
-        # Insert the symbol block just before the closing ) of lib_symbols
-        content = content[:lib_sym_end] + "\n    " + indented_block + "\n  " + content[lib_sym_end:]
-
-        with open(schematic_path, "w", encoding="utf-8") as f:
-            f.write(content)
-
-        # Handle both Path objects and strings
-        sch_name = schematic_path.name if hasattr(schematic_path, "name") else str(schematic_path)
-        logger.info(f"Injected symbol {full_name} into {sch_name}")
+        logger.info(f"Injected symbol {full_name} into {schematic_path.name}")
         return True
 
     @staticmethod
@@ -1083,8 +1253,7 @@ class DynamicSymbolLoader:
 
         body = "\n".join(part for part in [properties_str, pins_str, instances_str] if part)
 
-        with open(schematic_path, "r", encoding="utf-8") as f:
-            content = f.read()
+        content, newline = read_text_preserve_newline(Path(schematic_path))
 
         # Emit the KiCad 10-only symbol attributes only into files whose declared
         # format version accepts them (#351). A KiCad 8 or 9 file never contains
@@ -1125,8 +1294,7 @@ class DynamicSymbolLoader:
         else:
             content = content[:insert_at] + instance_block + "\n  " + content[insert_at:]
 
-        with open(schematic_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        write_text_atomic(Path(schematic_path), content, newline)
 
         logger.info(f"Added component instance {reference} ({full_lib_id}) at ({x}, {y})")
         return True
@@ -1184,26 +1352,31 @@ class DynamicSymbolLoader:
             unit:  For multi-unit symbols, which unit to place (1=A, 2=B, …). Default 1.
             angle: Placement rotation in degrees (KiCad CCW-in-screen). Default 0.
             project_path: Optional project directory for project-local sym-lib-table.
+
+        All-or-nothing: the library symbol is validated before anything is
+        written, and if any step raises, the schematic is restored byte-for-
+        byte (no orphan instance, no half-injected lib_symbols entry — #5c).
         """
         if project_path:
             self.project_path = project_path
-        # Ensure symbol definition is in lib_symbols
-        self.inject_symbol_into_schematic(schematic_path, library_name, symbol_name)
+        with FileTransaction(Path(schematic_path)):
+            # Ensure symbol definition is in lib_symbols
+            self.inject_symbol_into_schematic(schematic_path, library_name, symbol_name)
 
-        # Add the component instance (property positions come from the injected lib def)
-        return self.create_component_instance(
-            schematic_path,
-            library_name,
-            symbol_name,
-            reference=reference,
-            value=value,
-            footprint=footprint,
-            x=x,
-            y=y,
-            unit=unit,
-            angle=angle,
-            mirror_y=mirror_y,
-        )
+            # Add the component instance (property positions come from the injected lib def)
+            return self.create_component_instance(
+                schematic_path,
+                library_name,
+                symbol_name,
+                reference=reference,
+                value=value,
+                footprint=footprint,
+                x=x,
+                y=y,
+                unit=unit,
+                angle=angle,
+                mirror_y=mirror_y,
+            )
 
 
 if __name__ == "__main__":
@@ -1231,8 +1404,8 @@ if __name__ == "__main__":
 
     print("\n3. Testing extends resolution...")
     block = loader.extract_symbol_from_library("Regulator_Switching", "LM2596S-5")
-    if block and "LM2596S-12" in block:
-        print(f"   OK: LM2596S-5 includes parent LM2596S-12 ({len(block)} chars)")
+    if block and "(extends" not in block and '(symbol "LM2596S-5_' in block:
+        print(f"   OK: LM2596S-5 flattened from its parent ({len(block)} chars)")
     else:
         print(f"   FAIL: extends not resolved")
 

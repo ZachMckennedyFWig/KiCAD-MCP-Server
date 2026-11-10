@@ -122,16 +122,21 @@ def test_multi_level_extends_chain_resolves(tmp_path):
     assert '(symbol "TestLib:Top"' in block
 
 
-def test_missing_parent_shard_degrades_gracefully(tmp_path):
+def test_missing_parent_shard_is_refused_with_a_reason(tmp_path):
+    """A derived symbol whose parent is missing is refused, not embedded half-built.
+
+    Stripping the (extends) used to "degrade gracefully" into a pinless symbol
+    with no unit sub-symbol, which kicad-skip cannot parse, so every later call
+    on the sheet failed (#5b). Refusing up front leaves the sheet untouched and
+    tells the caller which parent is missing.
+    """
+    from commands.dynamic_symbol_loader import SymbolLibraryError
+
     loader = _make_symdir(
         tmp_path,
         "TestLib",
         {"Orphan": _derived_shard("Orphan", "Ghost")},  # no Ghost.kicad_sym
     )
 
-    block = loader.extract_symbol_from_library("TestLib", "Orphan")
-
-    # No crash; the unresolved (extends) is stripped so the file stays loadable.
-    assert block is not None
-    assert "(extends" not in block
-    assert '(symbol "TestLib:Orphan"' in block
+    with pytest.raises(SymbolLibraryError, match="Ghost"):
+        loader.extract_symbol_from_library("TestLib", "Orphan")

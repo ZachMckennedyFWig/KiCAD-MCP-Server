@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from commands.dynamic_symbol_loader import DynamicSymbolLoader
+from utils.file_io import read_text_preserve_newline, write_text_atomic
 from utils.sexpr_format import prettify
 
 _MIRROR_SUFFIX = re.compile(r"__m\d+(?:_\d+)?$")
@@ -75,12 +76,22 @@ def _indent_block(block: str) -> str:
 
 
 def _library_block(loader: DynamicSymbolLoader, library_name: str, symbol_name: str) -> str | None:
+    """The library text to embed (verbatim, extends flattened), or None if unavailable.
+
+    Raises ValueError when the symbol exists but cannot be embedded faithfully
+    (missing ``extends`` parent, no unit sub-symbols).
+    """
     if _MIRROR_SUFFIX.search(symbol_name):
         return None
     block = loader.extract_symbol_from_library(library_name, symbol_name)
     if not block:
         return None
     return _adapt_library_block_for_schematic(block)
+
+
+def _same_tokens(a: str, b: str) -> bool:
+    """True when two s-expression blocks differ only in whitespace/indentation."""
+    return a.split() == b.split()
 
 
 def _iter_mirror_blocks(
@@ -109,8 +120,8 @@ def repair_mirror_lib_symbols(
 ) -> int:
     if not backup_path.exists():
         return 0
-    content = schematic_path.read_text(encoding="utf-8")
-    backup = backup_path.read_text(encoding="utf-8")
+    content, newline = read_text_preserve_newline(schematic_path)
+    backup, _ = read_text_preserve_newline(backup_path)
     rng = _lib_symbols_range(content)
     backup_rng = _lib_symbols_range(backup)
     if not rng or not backup_rng:
@@ -140,7 +151,7 @@ def repair_mirror_lib_symbols(
     for start, end, new in sorted(replacements, key=lambda r: r[0], reverse=True):
         content = content[:start] + new + content[end:]
     if restored:
-        schematic_path.write_text(prettify(content), encoding="utf-8")
+        write_text_atomic(schematic_path, prettify(content), newline)
     return restored
 
 
@@ -148,12 +159,12 @@ def update_schematic_symbols(
     schematic_path: Path,
     library_name: str,
     only_symbols: set[str] | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     loader = DynamicSymbolLoader(project_path=schematic_path.parent)
-    content = schematic_path.read_text(encoding="utf-8")
+    content, newline = read_text_preserve_newline(schematic_path)
     rng = _lib_symbols_range(content)
     if not rng:
-        return {"updated": 0, "injected": 0, "skipped": 0}
+        return {"updated": 0, "injected": 0, "skipped": 0, "errors": []}
 
     lib_start, lib_end = rng
     targets = sorted(
@@ -162,9 +173,10 @@ def update_schematic_symbols(
     if only_symbols:
         targets = [s for s in targets if s in only_symbols]
     if not targets:
-        return {"updated": 0, "injected": 0, "skipped": 0}
+        return {"updated": 0, "injected": 0, "skipped": 0, "errors": []}
 
     updated = injected = skipped = 0
+    errors: list[dict[str, str]] = []
     replacements: list[tuple[int, int, str, str]] = []
 
     for symbol_name in targets:
@@ -172,9 +184,15 @@ def update_schematic_symbols(
             skipped += 1
             continue
         full_name = f"{library_name}:{symbol_name}"
-        new_block = _library_block(loader, library_name, symbol_name)
+        try:
+            new_block = _library_block(loader, library_name, symbol_name)
+        except ValueError as e:
+            skipped += 1
+            errors.append({"symbol": full_name, "error": str(e)})
+            continue
         if not new_block:
             skipped += 1
+            errors.append({"symbol": full_name, "error": "not found in library"})
             continue
 
         marker = f'(symbol "{full_name}"'
@@ -185,7 +203,7 @@ def update_schematic_symbols(
             continue
 
         old_block, _ = _extract_paren_block(content, sym_start)
-        if old_block.strip() == new_block.strip():
+        if _same_tokens(old_block, new_block):
             continue
         replacements.append(
             (sym_start, sym_start + len(old_block), old_block, _indent_block(new_block))
@@ -195,9 +213,9 @@ def update_schematic_symbols(
     if replacements:
         for start, end, _old, new in sorted(replacements, key=lambda r: r[0], reverse=True):
             content = content[:start] + new + content[end:]
-        schematic_path.write_text(prettify(content), encoding="utf-8")
+        write_text_atomic(schematic_path, prettify(content), newline)
 
-    return {"updated": updated, "injected": injected, "skipped": skipped}
+    return {"updated": updated, "injected": injected, "skipped": skipped, "errors": errors}
 
 
 def update_symbol_from_library(params: dict[str, Any]) -> dict[str, Any]:
@@ -244,25 +262,37 @@ def update_symbol_from_library(params: dict[str, Any]) -> dict[str, Any]:
         total_injected += counts["injected"]
         total_skipped += counts["skipped"]
         total_mirror += mirror_restored
-        if counts["updated"] or counts["injected"] or mirror_restored:
-            results.append(
-                {
-                    "schematic": str(sch),
-                    "updated": counts["updated"],
-                    "injected": counts["injected"],
-                    "skipped": counts["skipped"],
-                    "mirror_restored": mirror_restored,
-                }
-            )
+        if counts["updated"] or counts["injected"] or mirror_restored or counts.get("errors"):
+            entry = {
+                "schematic": str(sch),
+                "updated": counts["updated"],
+                "injected": counts["injected"],
+                "skipped": counts["skipped"],
+                "mirror_restored": mirror_restored,
+            }
+            if counts.get("errors"):
+                entry["errors"] = counts["errors"]
+            results.append(entry)
 
+    changed = sum(
+        1 for r in results if r.get("updated") or r.get("injected") or r.get("mirror_restored")
+    )
+    problems = sorted(
+        {f"{e['symbol']}: {e['error']}" for r in results for e in r.get("errors", [])}
+    )
+    message = (
+        f"Updated {changed} schematic(s): "
+        f"{total_updated} symbol(s) updated, {total_injected} injected, "
+        f"{total_skipped} skipped, {total_mirror} mirror block(s) restored"
+    )
+    if problems:
+        message += ". Not refreshed: " + "; ".join(problems[:5])
+        if len(problems) > 5:
+            message += f"; ... and {len(problems) - 5} more"
     return {
         "success": True,
-        "message": (
-            f"Updated {len(results)} schematic(s): "
-            f"{total_updated} symbol(s) updated, {total_injected} injected, "
-            f"{total_skipped} skipped, {total_mirror} mirror block(s) restored"
-        ),
-        "schematics_changed": len(results),
+        "message": message,
+        "schematics_changed": changed,
         "updated": total_updated,
         "injected": total_injected,
         "skipped": total_skipped,

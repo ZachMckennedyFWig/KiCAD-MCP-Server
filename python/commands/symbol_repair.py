@@ -18,7 +18,10 @@ import logging
 import os
 import re
 import traceback
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from utils.file_io import read_text_preserve_newline, write_text_atomic
 
 logger = logging.getLogger("kicad_interface")
 
@@ -177,8 +180,7 @@ class SymbolRepairCommands:
             if not os.path.isfile(path):
                 return {"success": False, "message": f"File not found: {path}"}
 
-            with open(path, "r", encoding="utf-8") as f:
-                text = f.read()
+            text, newline = read_text_preserve_newline(Path(path))
 
             if path.endswith(".kicad_sym"):
                 container_start = text.find("(kicad_symbol_lib")
@@ -238,8 +240,7 @@ class SymbolRepairCommands:
                     ),
                 }
 
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(new_text)
+            write_text_atomic(Path(path), new_text, newline)
             logger.info(
                 "repair_flat_symbols: wrapped %d flat symbol(s) in %s",
                 len(repaired),

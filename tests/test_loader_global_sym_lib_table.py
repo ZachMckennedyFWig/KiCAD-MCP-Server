@@ -27,6 +27,9 @@ def _write_lib(tmp_path: Path, name: str, symbols: list) -> Path:
         parts.append(f'  (symbol "{sym}" (pin_numbers (hide yes)) (pin_names (hide yes))')
         parts.append(f'    (property "Reference" "R" (at 0 0 0))')
         parts.append(f'    (property "Value" "{sym}" (at 0 0 0))')
+        parts.append(f'    (symbol "{sym}_1_1"')
+        parts.append('      (pin passive line (at 0 0 0) (length 2.54) (name "~") (number "1"))')
+        parts.append("    )")
         parts.append(f"  )")
     parts.append(")")
     path = tmp_path / f"{name}.kicad_sym"

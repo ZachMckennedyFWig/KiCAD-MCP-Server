@@ -492,4 +492,4 @@ class TestUpdateSchematicSymbols:
         ):
             result = update_schematic_symbols(sch, "Device")
 
-        assert result == {"updated": 0, "injected": 0, "skipped": 0}
+        assert result == {"updated": 0, "injected": 0, "skipped": 0, "errors": []}

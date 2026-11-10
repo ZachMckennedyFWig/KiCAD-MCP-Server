@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import sexpdata
 from commands.schematic import SchematicLoadError, SchematicManager
 from sexpdata import Symbol
+from utils.file_io import patch_kicad_skip_utf8
 
 try:
     from skip import Schematic  # noqa: F401 (unused here, but tests patch this name)
@@ -23,6 +24,10 @@ except ImportError:
     Schematic = None
 
 logger = logging.getLogger("kicad_interface")
+
+# Pin lookup goes through kicad-skip (SchematicManager.load_schematic), which
+# would otherwise decode the sheet with the locale codec (#2).
+patch_kicad_skip_utf8()
 
 
 class PinLocator:
