@@ -139,6 +139,15 @@ a wired part, since orphaned labels otherwise produce label_dangling ERC
 errors. Default false for backward compatibility (delete-then-re-add
 workflows rely on labels surviving).
 
+deleteAttachedWires (defaults to deleteAttachedLabels) also trims wires left
+dangling at the deleted pins, e.g. an auto-drawn wire from a PWR_FLAG. A wire is
+removed only when its end sits on a deleted pin with nothing else there; the
+trim continues through bare corners and stops at the first junction, pin, label
+or sheet pin, so wires that still connect other things are kept. A label left
+floating at the far end of a removed stub is removed with the label pass.
+Returns {success, reference, deleted_count, deleted_labels?, deleted_wires?
+[{start:{x,y}, end:{x,y}}] (mm), ...}.
+
 Note: This tool operates on schematic files (.kicad_sch).
 To remove a footprint from a PCB, use delete_component instead.`,
     {
@@ -153,6 +162,13 @@ To remove a footprint from a PCB, use delete_component instead.`,
           "Also delete net labels sitting on the deleted component's pin positions, " +
             "unless still attached to a wire or another component's pin (default false)",
         ),
+      deleteAttachedWires: z
+        .boolean()
+        .optional()
+        .describe(
+          "Also trim wires left dangling at the deleted pins, back to the first junction, " +
+            "pin, label or sheet pin (default: same as deleteAttachedLabels)",
+        ),
       unit: z
         .number()
         .int()
@@ -166,14 +182,17 @@ To remove a footprint from a PCB, use delete_component instead.`,
       schematicPath: string;
       reference: string;
       deleteAttachedLabels?: boolean;
+      deleteAttachedWires?: boolean;
       unit?: number;
     }) => {
       const result = await callKicadScript("delete_schematic_component", args);
       if (result.success) {
-        const labelNote =
-          Array.isArray(result.deleted_labels) && result.deleted_labels.length > 0
-            ? ` (also removed ${result.deleted_labels.length} attached label(s))`
-            : "";
+        const extras: string[] = [];
+        if (Array.isArray(result.deleted_labels) && result.deleted_labels.length > 0)
+          extras.push(`${result.deleted_labels.length} attached label(s)`);
+        if (Array.isArray(result.deleted_wires) && result.deleted_wires.length > 0)
+          extras.push(`${result.deleted_wires.length} dangling wire segment(s)`);
+        const labelNote = extras.length > 0 ? ` (also removed ${extras.join(" and ")})` : "";
         return {
           content: [
             {
@@ -2296,6 +2315,119 @@ edit_schematic_component and set its value to an empty string.`,
           },
         ],
       };
+    },
+  );
+
+  // Verify intended pin -> net assignments against KiCad's own netlist
+  server.tool(
+    "assert_connectivity",
+    `Check intended pin-to-net assignments against the netlist KiCad itself exports
+(kicad-cli sch export netlist, run on the project's ROOT schematic so the whole
+hierarchy is included). ERC cannot see a label sitting on the wrong pin; this can.
+
+expectations: {"U7": {"5": "+3V3", "6": "GND"}, "J1": {"S1": "GND"}} — keys are
+pin numbers (pin names are accepted as a fallback). Net names match either exactly
+or on their last hierarchical path component, so "+5V" matches "/Power/+5V". Use
+"NC" (or null / "") for a pin that must stay unconnected.
+
+saveAs stores the merged expectation set (by name, default "default") in
+<project>/.kicad-mcp/connectivity.json; useStored re-runs a stored set (optionally
+merged with new expectations), so the check can be repeated after every edit at
+almost no token cost. Nothing in the design is modified.
+
+Returns only problems: {success, passed, message, checkedPins,
+mismatches:[{ref, pin, pinfunction, expected, actual}], missing:[{ref, pin?, reason}],
+singlePinNets:[{net, ref, pin}] (named nets on the listed refs with one pin only),
+unexpectedNoConnects:[{ref, pin, net, expected?, reason?}], rootSchematic, savedTo?}.`,
+    {
+      schematicPath: z
+        .string()
+        .optional()
+        .describe(
+          "Any .kicad_sch of the project; the project's root schematic is used for the netlist",
+        ),
+      projectPath: z
+        .string()
+        .optional()
+        .describe("Alternative to schematicPath: the .kicad_pro file or the project directory"),
+      expectations: z
+        .record(z.string(), z.record(z.string(), z.string().nullable()))
+        .optional()
+        .describe('Map of reference -> {pin: expectedNet}; "NC" or null = must be unconnected'),
+      saveAs: z
+        .string()
+        .optional()
+        .describe(
+          "Store the expectation set under this name in <project>/.kicad-mcp/connectivity.json",
+        ),
+      useStored: z
+        .string()
+        .optional()
+        .describe("Load the stored expectation set with this name (merged with expectations)"),
+      timeout: z
+        .number()
+        .optional()
+        .describe("kicad-cli timeout in seconds (default 120)"),
+    },
+    async (args: any) => {
+      const r = await callKicadScript("assert_connectivity", args);
+      if (r.success === false)
+        return { content: [{ type: "text", text: `Failed: ${r.message || "Unknown error"}` }] };
+      if (r.passed)
+        return {
+          content: [
+            {
+              type: "text",
+              text: `PASS: ${r.message}${r.savedTo ? ` (saved set '${r.savedTo.set}' to ${r.savedTo.path})` : ""}`,
+            },
+          ],
+        };
+      return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
+    },
+  );
+
+  // Rename a net's labels on every sheet of the hierarchy
+  server.tool(
+    "relabel_net",
+    `Rename a net across the whole sheet hierarchy: every label, global_label and
+hierarchical_label whose text equals oldName (a hierarchical name like "/Power/+5V" is
+reduced to "+5V") gets newName, and the parent sheet pins bound to a renamed
+hierarchical label are renamed with it so the sheet interface stays connected.
+Power symbols are left alone unless includePowerSymbols=true (their Value is the
+net name). sheetOnly=true limits label renames to the given sheet (local labels with
+the same text on other sheets are different nets). Edits are textual; nothing else
+in the files changes. dryRun=true reports what would change without writing.
+
+Returns {success, dryRun, message, renamed, changes:[{file, label?, global_label?,
+hierarchical_label?, sheet_pin?, power_symbol?}], rootSchematic, sheetsScanned}.`,
+    {
+      schematicPath: z
+        .string()
+        .describe("Any .kicad_sch of the project; the whole hierarchy from its root is edited"),
+      oldName: z.string().describe("Current net/label text"),
+      newName: z.string().describe("New label text (plain, no '/' path)"),
+      sheetOnly: z
+        .boolean()
+        .optional()
+        .describe("Only rename labels on schematicPath itself (default false)"),
+      includePowerSymbols: z
+        .boolean()
+        .optional()
+        .describe("Also change the Value of power symbols named oldName (default false)"),
+      dryRun: z.boolean().optional().describe("Report the changes without writing (default false)"),
+    },
+    async (args: any) => {
+      const r = await callKicadScript("relabel_net", args);
+      if (r.success === false)
+        return { content: [{ type: "text", text: `Failed: ${r.message || "Unknown error"}` }] };
+      const lines = [r.message];
+      for (const c of r.changes || []) {
+        const parts = Object.entries(c)
+          .filter(([k]) => k !== "file")
+          .map(([k, v]) => `${k}=${v}`);
+        lines.push(`  ${c.file}: ${parts.join(", ")}`);
+      }
+      return { content: [{ type: "text", text: lines.join("\n") }] };
     },
   );
 }

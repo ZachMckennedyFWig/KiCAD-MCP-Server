@@ -126,6 +126,9 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set<string>([
   "run_drc",
   // Schematic inspection. run_erc, generate_netlist and the view tools work in
   // temporary directories; validate_* run kicad-cli on a copy.
+  // assert_connectivity reads a temp netlist; saveAs only writes its own
+  // expectation file under <project>/.kicad-mcp/, never the design.
+  "assert_connectivity",
   "find_orphaned_wires",
   "find_overlapping_elements",
   "find_wires_crossing_symbols",

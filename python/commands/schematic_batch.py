@@ -20,6 +20,14 @@ from typing import Any, Dict, List
 
 from commands.dynamic_symbol_loader import DynamicSymbolLoader
 from commands.pin_locator import PinLocator
+from commands.schematic_autowire import (
+    _DIRS,
+    _boxes_overlap,
+    _label_bbox,
+    _orthogonal_route,
+    _route_conflict,
+    _sheet_geometry,
+)
 from commands.schematic_text_utils import (
     _extract_property_position,
     _find_facing_label,
@@ -528,6 +536,7 @@ class SchematicBatchCommands:
             schematic_path = params.get("schematicPath")
             connections = params.get("connections")
             replace = bool(params.get("replace", False))
+            avoid_fields = bool(params.get("avoidFieldOverlap", True))
             label_type = params.get("labelType") or params.get("label_type") or "label"
             if label_type not in ("label", "global_label"):
                 return {
@@ -611,6 +620,15 @@ class SchematicBatchCommands:
                         raw_angle = locator.get_pin_angle(sch_path, ref, resolved_pin) or 0
                         orientation = int(round(raw_angle / 90) * 90) % 360
 
+                        # replace=true clears EVERY label kind on the pin (local,
+                        # global, hierarchical) — and a label at the end of a
+                        # bare stub from it — before anything is placed (#5f).
+                        # Clearing only local labels left an old global label
+                        # behind, merging two nets.
+                        removed_labels: List[Dict[str, Any]] = []
+                        if replace:
+                            removed_labels = self._delete_labels_at(sch_path, position)
+
                         # Facing-label auto-wiring is only meaningful for local labels;
                         # global labels join their net by name (one placed per pin).
                         existing_pos = (
@@ -618,17 +636,34 @@ class SchematicBatchCommands:
                             if label_type == "label"
                             else None
                         )
+                        route = None
+                        route_note = None
                         if existing_pos:
-                            if WireManager.add_wire(sch_path, list(position), existing_pos):
-                                placed.append(
-                                    {
-                                        "ref": ref,
-                                        "pin": str(pin_id),
-                                        "net": net_name,
-                                        "position": {"x": position[0], "y": position[1]},
-                                        "note": f"wired to existing label at ({existing_pos[0]},{existing_pos[1]})",
-                                    }
-                                )
+                            route = _orthogonal_route(position, orientation, existing_pos)
+                            if route is None:
+                                route_note = "facing label not reachable orthogonally"
+                            else:
+                                conflict = _route_conflict(_sheet_geometry(sch_path), route)
+                                if conflict:
+                                    route_note = f"auto-wire skipped: {conflict}"
+                                    route = None
+                        if route:
+                            if len(route) == 2:
+                                ok = WireManager.add_wire(sch_path, route[0], route[1])
+                            else:
+                                ok = WireManager.add_polyline_wire(sch_path, route)
+                            if ok:
+                                row = {
+                                    "ref": ref,
+                                    "pin": str(pin_id),
+                                    "net": net_name,
+                                    "position": {"x": position[0], "y": position[1]},
+                                    "note": f"wired to existing label at ({existing_pos[0]},{existing_pos[1]})",
+                                    "wire": [{"x": p[0], "y": p[1]} for p in route],
+                                }
+                                if removed_labels:
+                                    row["replaced"] = removed_labels
+                                placed.append(row)
                                 placed_positions[pos_key] = net_name
                             else:
                                 failed.append(
@@ -641,27 +676,39 @@ class SchematicBatchCommands:
                                 )
                             continue
 
-                        if replace:
-                            WireManager.delete_label(
-                                sch_path, net_name, list(position), tolerance=0.5
+                        label_pos = list(position)
+                        offset_note = None
+                        if avoid_fields:
+                            label_pos, offset_note = self._offset_label_from_fields(
+                                sch_path, locator, ref, position, orientation, net_name
                             )
-                            self._delete_labels_at(sch_path, position)
+
+                        if label_pos != list(position) and not WireManager.add_wire(
+                            sch_path, list(position), label_pos
+                        ):
+                            label_pos, offset_note = list(position), None
 
                         if WireManager.add_label(
                             sch_path,
                             net_name,
-                            position,
+                            label_pos,
                             label_type=label_type,
                             orientation=orientation,
                         ):
-                            placed.append(
-                                {
-                                    "ref": ref,
-                                    "pin": str(pin_id),
-                                    "net": net_name,
-                                    "position": {"x": position[0], "y": position[1]},
-                                }
-                            )
+                            row = {
+                                "ref": ref,
+                                "pin": str(pin_id),
+                                "net": net_name,
+                                "position": {"x": position[0], "y": position[1]},
+                            }
+                            if label_pos != list(position):
+                                row["label_position"] = {"x": label_pos[0], "y": label_pos[1]}
+                            notes = [n for n in (route_note, offset_note) if n]
+                            if notes:
+                                row["note"] = "; ".join(notes)
+                            if removed_labels:
+                                row["replaced"] = removed_labels
+                            placed.append(row)
                             placed_positions[pos_key] = net_name
                         else:
                             failed.append(
@@ -694,100 +741,154 @@ class SchematicBatchCommands:
             return {"success": False, "message": str(e)}
 
     @staticmethod
-    def _delete_labels_at(sch_path, position):
-        """Drop any (label ...) within 0.5mm of *position* (used by batch_connect replace=True)."""
+    def _delete_labels_at(sch_path, position, tolerance=0.5):
+        """Remove every label on the pin at *position* (batch_connect replace=True).
+
+        Covers all three label kinds — ``label``, ``global_label`` and
+        ``hierarchical_label`` (#5f: only local labels used to go, so an old
+        global label stayed on the pin and merged two nets). A label at the far
+        end of a bare stub wire from the pin (one wire, nothing else attached
+        at its far end) is removed together with that stub. Returns the
+        removed labels as [{type, text, position}].
+        """
+        removed: List[Dict[str, Any]] = []
         try:
             import sexpdata
             from sexpdata import Symbol
             from utils.sexpr_format import dumps as kicad_dumps
 
-            data = sexpdata.loads(sch_path.read_text(encoding="utf-8"))
-            changed = False
-            new_data = []
-            for item in data:
-                if isinstance(item, list) and len(item) > 0 and item[0] == Symbol("label"):
-                    at = next(
+            label_tags = {Symbol("label"), Symbol("global_label"), Symbol("hierarchical_label")}
+            data = sexpdata.loads(Path(sch_path).read_text(encoding="utf-8"))
+            px, py = float(position[0]), float(position[1])
+
+            def near(x, y, tx, ty):
+                return abs(x - tx) < tolerance and abs(y - ty) < tolerance
+
+            def label_at(item):
+                at = next(
+                    (
+                        p
+                        for p in item[1:]
+                        if isinstance(p, list) and len(p) >= 3 and p[0] == Symbol("at")
+                    ),
+                    None,
+                )
+                return (float(at[1]), float(at[2])) if at is not None else None
+
+            # Far ends of bare stubs leaving the pin.
+            wires = [
+                (i, WireManager._parse_wire(item))
+                for i, item in enumerate(data)
+                if WireManager._parse_wire(item) is not None
+            ]
+            stub_ends: Dict[tuple, int] = {}
+            for i, (a, b, _w, _t) in wires:
+                if near(a[0], a[1], px, py):
+                    far = b
+                elif near(b[0], b[1], px, py):
+                    far = a
+                else:
+                    continue
+                others = sum(
+                    1
+                    for j, (c, d, _w2, _t2) in wires
+                    if j != i and (near(c[0], c[1], *far) or near(d[0], d[1], *far))
+                )
+                if others == 0:
+                    stub_ends[(round(far[0], 4), round(far[1], 4))] = i
+
+            pin_positions = WireManager._collect_pin_positions(data)
+            drop = set()
+            for idx, item in enumerate(data):
+                if not (isinstance(item, list) and item and item[0] in label_tags):
+                    continue
+                pos = label_at(item)
+                if pos is None:
+                    continue
+                hit = near(pos[0], pos[1], px, py)
+                if not hit:
+                    stub = next(
                         (
-                            p
-                            for p in item[1:]
-                            if isinstance(p, list) and len(p) >= 3 and p[0] == Symbol("at")
+                            wi
+                            for (sx, sy), wi in stub_ends.items()
+                            if near(pos[0], pos[1], sx, sy)
+                            and not any(near(pos[0], pos[1], qx, qy) for qx, qy in pin_positions)
                         ),
                         None,
                     )
-                    if (
-                        at
-                        and abs(float(at[1]) - position[0]) < 0.5
-                        and abs(float(at[2]) - position[1]) < 0.5
-                    ):
-                        changed = True
+                    if stub is None:
                         continue
-                new_data.append(item)
-            if changed:
-                sch_path.write_text(kicad_dumps(new_data), encoding="utf-8")
+                    drop.add(stub)
+                drop.add(idx)
+                removed.append(
+                    {
+                        "type": str(item[0]),
+                        "text": str(item[1]) if len(item) > 1 else "",
+                        "position": {"x": pos[0], "y": pos[1]},
+                    }
+                )
+            if drop:
+                new_data = [item for i, item in enumerate(data) if i not in drop]
+                WireManager.sync_junctions(new_data)
+                Path(sch_path).write_text(kicad_dumps(new_data), encoding="utf-8")
         except Exception as e:
             logger.warning(f"replace cleanup failed: {e}")
+        return removed
+
+    @staticmethod
+    def _offset_label_from_fields(sch_path, locator, ref, position, orientation, net_name):
+        """Where to put a label on a two-pin part's pin so it clears Ref/Value text.
+
+        The label normally sits on the pin. For two-pin parts (passives), when
+        its text box would overlap a visible Reference/Value field of any
+        symbol, it is pushed outward along the pin direction by 2.54 or
+        5.08 mm (the caller draws the stub wire) — provided the new spot does
+        not land on an existing connection. Returns ([x, y], note-or-None).
+        """
+        pin = [float(position[0]), float(position[1])]
+        try:
+            all_pins = locator.get_all_symbol_pins(sch_path, ref) or {}
+            if len(all_pins) != 2:
+                return pin, None
+            geom = _sheet_geometry(sch_path)
+            if not geom["fields"]:
+                return pin, None
+
+            def clear(x, y):
+                box = _label_bbox(x, y, orientation, net_name)
+                return not any(_boxes_overlap(box, f, margin=0.1) for f in geom["fields"])
+
+            if clear(*pin):
+                return pin, None
+            d = _DIRS.get(int(orientation) % 360)
+            if d is None:
+                return pin, None
+            for step in (2.54, 5.08):
+                cand = [round(pin[0] + d[0] * step, 4), round(pin[1] + d[1] * step, 4)]
+                if not clear(*cand):
+                    continue
+                if _route_conflict(geom, [pin, cand]) is not None:
+                    continue
+                if (round(cand[0], 3), round(cand[1], 3)) in geom["points"]:
+                    continue
+                return cand, f"label moved {step} mm out along the pin to clear a field"
+        except Exception as e:
+            logger.debug(f"label field-offset check skipped for {ref}: {e}")
+        return pin, None
 
     @staticmethod
     def _pwr_flag_warnings(sch_path, locator, placed):
-        """Warn about power nets that have no PWR_FLAG attached."""
-        keywords = {
-            "VCC",
-            "VDD",
-            "VIN",
-            "VBUS",
-            "VBAT",
-            "GND",
-            "AGND",
-            "DGND",
-            "PGND",
-            "+5V",
-            "+3V3",
-            "+12V",
-            "+3.3V",
-            "+5.0V",
-            "PWR",
-            "POWER",
-            "AVCC",
-        }
-        try:
-            placed_nets = {p["net"] for p in placed}
-            power_nets = {n for n in placed_nets if any(kw in n.upper() for kw in keywords)}
-            if not power_nets:
-                return []
-            pwr_flag_nets: set = set()
-            try:
-                from skip import Schematic
+        """Warn about nets touched by this call that ERC will report as undriven.
 
-                sch_obj = Schematic(str(sch_path))
-                pwr_flag_refs = [
-                    sym.property.Reference.value
-                    for sym in getattr(sch_obj, "symbol", [])
-                    if "PWR_FLAG" in (sym.lib_id.value if hasattr(sym, "lib_id") else "")
-                    and hasattr(sym.property, "Reference")
-                ]
-                for pref in pwr_flag_refs:
-                    ppin = locator.get_pin_location(sch_path, pref, "1")
-                    if not ppin:
-                        all_p = locator.get_all_symbol_pins(sch_path, pref) or {}
-                        ppin = next(iter(all_p.values())) if all_p else None
-                    if ppin:
-                        for pl in placed:
-                            if (
-                                abs(pl["position"]["x"] - ppin[0]) < 0.5
-                                and abs(pl["position"]["y"] - ppin[1]) < 0.5
-                            ):
-                                pwr_flag_nets.add(pl["net"])
-            except Exception:
-                pass
-            missing = sorted(power_nets - pwr_flag_nets)
-            if missing:
-                return [
-                    f"Power nets without PWR_FLAG: {', '.join(missing)}. "
-                    "Add a PWR_FLAG component to each to suppress ERC power-pin errors."
-                ]
-        except Exception:
-            pass
-        return []
+        Only nets holding a ``power_in`` pin and no ``power_out`` pin (a
+        PWR_FLAG or a regulator output), evaluated over the whole sheet
+        hierarchy rather than the items of this call (#6). Plain signal nets
+        whose names merely look like power (DRV_PWR_EN, VIN_SENSE) are never
+        reported, nor are nets flagged on another sheet or in an earlier call.
+        """
+        from commands.schematic_connectivity import power_driver_warnings
+
+        return power_driver_warnings(Path(sch_path), placed)
 
     def batch_add_and_connect(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Place multiple components and connect their pins in a single call."""

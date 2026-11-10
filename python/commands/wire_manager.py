@@ -1023,6 +1023,108 @@ class WireManager:
             return False
 
     @staticmethod
+    def _collect_sheet_pin_positions(sch_data: list) -> List[Tuple[float, float]]:
+        """(x, y) of every hierarchical sheet pin (``(sheet ... (pin "N" t (at x y a)))``)."""
+        positions: List[Tuple[float, float]] = []
+        for item in sch_data:
+            if not (isinstance(item, list) and item and item[0] == Symbol("sheet")):
+                continue
+            for part in item[1:]:
+                if not (isinstance(part, list) and len(part) > 1 and part[0] == _SYM_PIN):
+                    continue
+                at = next(
+                    (
+                        p
+                        for p in part[1:]
+                        if isinstance(p, list) and len(p) >= 3 and p[0] == _SYM_AT
+                    ),
+                    None,
+                )
+                if at is not None:
+                    positions.append((float(at[1]), float(at[2])))
+        return positions
+
+    @staticmethod
+    def prune_dangling_wires(
+        sch_data: list, seed_points: List[Tuple[float, float]]
+    ) -> List[Tuple[Tuple[float, float], Tuple[float, float]]]:
+        """Remove wire runs left dangling at *seed_points* (e.g. a deleted symbol's pins).
+
+        Starting at each seed, a wire end is "dead" when exactly one wire ends
+        there and nothing else connects at that point: no remaining component
+        pin, no label of any kind, no sheet pin, and the point is not on the
+        interior of another wire (a T). A dead end's wire is removed and the
+        walk continues from its other end, so a bent run (pin -> corner ->
+        corner -> ...) is trimmed back to the first point that still serves a
+        connection: a junction (two or more remaining wires), another pin, a
+        label or a sheet pin. Wires that still connect other things are never
+        touched.
+
+        Mutates *sch_data* in place (junctions are re-synced when anything is
+        removed) and returns the removed segments as ((x1, y1), (x2, y2)) in mm.
+        """
+
+        def key(x: float, y: float) -> Tuple[int, int]:
+            return (round(float(x) * _IU_PER_MM), round(float(y) * _IU_PER_MM))
+
+        anchors = set()
+        for x, y in WireManager._collect_pin_positions(sch_data):
+            anchors.add(key(x, y))
+        for x, y in WireManager._collect_sheet_pin_positions(sch_data):
+            anchors.add(key(x, y))
+        label_types = {_SYM_LABEL, _SYM_GLOBAL_LABEL, _SYM_HIERARCHICAL_LABEL}
+        for item in sch_data:
+            if isinstance(item, list) and item and item[0] in label_types:
+                at = next(
+                    (
+                        p
+                        for p in item[1:]
+                        if isinstance(p, list) and len(p) >= 3 and p[0] == _SYM_AT
+                    ),
+                    None,
+                )
+                if at is not None:
+                    anchors.add(key(at[1], at[2]))
+
+        removed: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+        work = [key(x, y) for x, y in seed_points]
+        seen_guard = 0
+        while work:
+            seen_guard += 1
+            if seen_guard > 100000:  # pathological input; never loop forever
+                break
+            pt = work.pop()
+            if pt in anchors:
+                continue
+            ends_here = []
+            segments = []
+            for idx, item in enumerate(sch_data):
+                parsed = WireManager._parse_wire(item)
+                if parsed is None:
+                    continue
+                (x1, y1), (x2, y2), _, _ = parsed
+                k1, k2 = key(x1, y1), key(x2, y2)
+                segments.append((idx, k1, k2))
+                if pt in (k1, k2):
+                    ends_here.append((idx, k1, k2, (x1, y1), (x2, y2)))
+            if len(ends_here) != 1:
+                continue
+            idx, k1, k2, p1, p2 = ends_here[0]
+            if any(
+                _strictly_inside(pt, (a[0], a[1], b[0], b[1]))
+                for sidx, a, b in segments
+                if sidx != idx
+            ):
+                continue
+            del sch_data[idx]
+            removed.append((p1, p2))
+            work.append(k2 if pt == k1 else k1)
+
+        if removed:
+            WireManager.sync_junctions(sch_data)
+        return removed
+
+    @staticmethod
     def create_orthogonal_path(
         start: List[float], end: List[float], prefer_horizontal_first: bool = True
     ) -> List[List[float]]:
