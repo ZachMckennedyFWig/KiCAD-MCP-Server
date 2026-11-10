@@ -58,6 +58,68 @@ All notable changes to the KiCAD MCP Server project are documented here.
 - **Per-tool command timeouts.** Batch schematic tools, exports and syncs get
   600 s, checks 900 s. `KICAD_MCP_COMMAND_TIMEOUT_MS`,
   `KICAD_MCP_TOOL_TIMEOUTS` and `KICAD_MCP_TIMEOUT_GRACE_MS` override them.
+- **Board inspection** (new `inspection` category): `query_region` lists the
+  pads, tracks, vias, zones and text in a window; `net_report` gives length
+  per layer, vias, widths, islands and plane-split crossings per net;
+  `connected_items` and `why_unconnected` show a net's islands and the
+  nearest gap between them. `get_board_2d_view` takes `region`, `scale`,
+  `highlightNets`, `showRatsnest` and `showDrcMarkers`.
+- **Board editing:** `add_copper`, `remove_copper`, `unroute` (with
+  `includeLocked`), `move_components` and `place_relative` with collision and
+  airwire feedback, `add_rule_area`, `edit_zone`, `set_pad_zone_connection`
+  and `split_plane`. Each takes `dryRun`, and `drcDelta` returns the new and
+  resolved DRC violations.
+- **DRC rules with feedback:** `add_drc_rule`, `list_drc_rules` and
+  `remove_drc_rule`. A rule is checked with kicad-cli before it is written,
+  because KiCad 10 silently ignores the whole `.kicad_dru` when one rule is
+  malformed (for example a clearance without a unit).
+- **Standards profile:** `check_standards` reads `standards.yaml` (or JSON)
+  from the project: fab minimums, regions with allowed nets, plane-split
+  crossings, net-class widths and layers, GND vias, exposed-pad via arrays
+  and decoupling distance. `run_drc` appends its findings when a profile
+  exists.
+- **Routing workflows:** `fanout_to_planes`, `route_connection` (grid A*
+  router with 45° moves), `route_bus` and `length_match`.
+- **Orchestrated `autoroute`:** `nets`, `lockExisting`, `stripRuleAreas`,
+  `forbidRegionsForNets`, `passes`, `stallTimeout`, `importMode: "if_better"`.
+  Unrouted connections are reported as KiCad counts them, with a DRC delta
+  and the log tail. `async: true` returns a job id.
+- **Background jobs:** `job_status`, `job_list`, `job_cancel` and
+  `job_apply`. Board changes from a job are applied only by `job_apply`.
+- **Finishing** (new `finishing` category): `stitch_ground`,
+  `tidy_silkscreen` (stroke-geometry collisions), `add_pin_labels`,
+  `cleanup_dangling` (rolls back if connectivity gets worse) and
+  `transplant_layout` (copies routing from a reference board after checking
+  every pad).
+- **BOM and fab output:** `apply_property_map` sets LCSC numbers and flags by
+  rule across the hierarchy; `jlc_bom_report` gives the loading fee, stock
+  and fee-free alternatives; `jlc_find_alternative` searches by parameters;
+  `fab_package` writes Gerbers, drill, BOM, CPL (with JLC rotation
+  corrections), a hand-solder list and check reports in one call.
+- **Snapshots** (new `snapshots` category): `list_snapshots`,
+  `diff_snapshots` and `restore_snapshot`. `KICAD_MCP_AUTO_SNAPSHOT=1`
+  snapshots the files a tool can change before every mutation.
+- **`run_pcbnew_script`** runs Python against a fresh load of the board in a
+  separate process, with helpers for KiCad 10's SWIG pitfalls. It is hidden
+  in the readonly and manufacturing modes.
+- **`group_components`** is implemented with `PCB_GROUP`.
+- **`sync_schematic_to_board` is a full update from the schematic:**
+  `dryRun`, `removeExtra`, pad nets from the netlist, and Value, Datasheet,
+  custom fields, DNP and exclude-from-BOM synced.
+- **Label `scope: "auto"`** on `batch_connect`, `batch_add_and_connect` and
+  `connect_to_net` places a global label when the net already exists on
+  another sheet.
+
+### Removed
+
+- `add_component_annotation` (use `add_board_text`), `export_position_file`
+  (use `export_pos`) and `export_vrml` (use `export_3d` or `export_3d_cli`).
+  None of them had an implementation.
+- MCP resources whose commands did not exist: component groups and
+  visualization, board and component 3D views, library component details,
+  project properties and project files. The other component, library and
+  project resources now call existing commands.
+- A test now fails if TypeScript calls a command Python does not route.
 
 ### Bug Fixes
 
@@ -85,7 +147,9 @@ All notable changes to the KiCAD MCP Server project are documented here.
   after the grace period is restarted. A timeout used to leave a
   `.kicad_sch` at 0 bytes.
 - **`batch_connect(replace=true)` removes global and hierarchical labels**,
-  not just local ones.
+  not just local ones, and the old auto-drawn wire to another pin's label.
+- **`relabel_net` no longer renames unrelated local labels** with the same
+  name on other sheets.
 - **Deleting a component removes the wires left dangling** on its pins
   (`deleteAttachedWires`), trimming back to the nearest junction.
 - **The PWR_FLAG warning only names nets that need one**: a `power_in` pin and

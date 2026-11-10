@@ -5,8 +5,8 @@
      in this file are preserved, so improving the wording here is safe. -->
 
 **Version:** 2.8.3
-**Tools registered on the server:** 254
-**Tools indexed for keyword discovery:** 254 in 20 categories
+**Tools registered on the server:** 289
+**Tools indexed for keyword discovery:** 289 in 25 categories
 **Last updated:** 2026-11-10
 
 ## How to read this document
@@ -83,7 +83,7 @@ _Source: `src/tools/board.ts`_
 
 ---
 
-## Component Management (28 tools)
+## Component Management (27 tools)
 
 _Source: `src/tools/component.ts`_
 
@@ -98,7 +98,6 @@ _Source: `src/tools/component.ts`_
 | `set_footprint_type`        | Set the placement type (through_hole / smd / unspecified) and optional exclusion flags on a placed PCB footprint.                           | `component` |
 | `find_component`            | Search components by reference or value                                                                                                     | `component` |
 | `get_component_properties`  | Get all properties of a component                                                                                                           | `component` |
-| `add_component_annotation`  | Add annotation/comment to component                                                                                                         | `component` |
 | `group_components`          | Group multiple components together                                                                                                          | `component` |
 | `replace_component`         | Replace component with different footprint                                                                                                  | `component` |
 | `get_component_pads`        | Get all pad information for a component                                                                                                     | `component` |
@@ -164,7 +163,7 @@ _Source: `src/tools/design-rules.ts`_
 
 ---
 
-## Export and Fabrication Output (27 tools)
+## Export and Fabrication Output (25 tools)
 
 _Source: `src/tools/export.ts`_
 
@@ -176,8 +175,6 @@ _Source: `src/tools/export.ts`_
 | `export_3d`             | Export 3D model (STEP, STL, VRML, OBJ)                                                                                                                | `export`  |
 | `export_bom`            | Export Bill of Materials (CSV, XML, HTML, JSON)                                                                                                       | `export`  |
 | `export_netlist`        | Export netlist (KiCad, Spice, Cadstar, OrcadPCB2)                                                                                                     | `export`  |
-| `export_position_file`  | Export component position file for pick and place                                                                                                     | `export`  |
-| `export_vrml`           | Export VRML 3D model                                                                                                                                  | `export`  |
 | `export_gerbers`        | Plot Gerber files for a PCB via kicad-cli, exposing the full Plot-dialog option set (X2, netlist attributes, DNP handling, soldermask subtraction,... | `export`  |
 | `export_drill`          | Generate drill files for a PCB via kicad-cli, exposing the full Excellon/Gerber drill option set (format, drill origin, zero suppression, oval...     | `export`  |
 | `export_ipc2581`        | Export the PCB in IPC-2581 format via kicad-cli.                                                                                                      | `export`  |
@@ -475,6 +472,41 @@ _Source: `src/tools/router.ts`_
 
 ---
 
+## board-edit.ts (13 tools)
+
+_Source: `src/tools/board-edit.ts`_
+
+| Tool                      | Description                                                                                                                                       | Discovery   |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
+| `add_copper`              | Add tracks (polylines) and vias in one all-or-nothing batch (MCP_ISSUES E1).                                                                      | `routing`   |
+| `remove_copper`           | Remove tracks/arcs/vias matching a filter (MCP_ISSUES E1).                                                                                        | `routing`   |
+| `unroute`                 | Remove all tracks and vias of the given nets (MCP_ISSUES E1).                                                                                     | `routing`   |
+| `move_components`         | Move/rotate/flip several footprints with collision feedback (MCP_ISSUES E2).                                                                      | `component` |
+| `place_relative`          | Place a part relative to another part or one of its pads, e.g.                                                                                    | `component` |
+| `add_rule_area`           | Add a rule area (keepout) on copper layers forbidding tracks, vias, pads, pours and/or footprints (MCP_ISSUES E3).                                | `board`     |
+| `edit_zone`               | Change an existing zone or rule area found by zone (uuid), zoneName, or net (+ layer); several matches need all=true (the error lists them).      | `board`     |
+| `set_pad_zone_connection` | Set per-pad zone connection overrides: solid, thermal, none, thermal_tht or inherit (back to the zone's setting).                                 | `board`     |
+| `split_plane`             | Build a multi-net plane on one layer in one call (MCP_ISSUES E3).                                                                                 | `board`     |
+| `add_drc_rule`            | Append KiCad custom DRC rule(s) to the project's .kicad_dru with feedback (MCP_ISSUES C2).                                                        | `drc`       |
+| `list_drc_rules`          | List the custom rules in the project's .kicad_dru: name, condition, layer, severity, constraints.                                                 | `drc`       |
+| `remove_drc_rule`         | Remove custom rule(s) by name from the project's .kicad_dru (atomic write; comments directly above a rule go with it).                            | `drc`       |
+| `check_standards`         | Check the board against the project's standards profile (standards.yaml/.yml/.json next to the project; MCP_ISSUES §2.9): fab minimums (track,... | `drc`       |
+
+---
+
+## board-query.ts (4 tools)
+
+_Source: `src/tools/board-query.ts`_
+
+| Tool              | Description                | Discovery    |
+| ----------------- | -------------------------- | ------------ |
+| `query_region`    | (no description in source) | `inspection` |
+| `net_report`      | (no description in source) | `inspection` |
+| `connected_items` | (no description in source) | `inspection` |
+| `why_unconnected` | (no description in source) | `inspection` |
+
+---
+
 ## digikey-api.ts (3 tools)
 
 _Source: `src/tools/digikey-api.ts`_
@@ -484,6 +516,37 @@ _Source: `src/tools/digikey-api.ts`_
 | `digikey_test_connection`            | Verify that the server's Digi-Key credentials work: fetch a token and run one search.                                                                 | `digikey` |
 | `digikey_search_parts`               | Search Digi-Key by part number, manufacturer part number, or a parametric phrase ('0402 100nF 50V X7R'), returning stock, price, lifecycle status,... | `digikey` |
 | `digikey_check_library_availability` | Look up every symbol in a .kicad_sym on Digi-Key and report which parts are obsolete, out of stock, unfindable, or missing a part number...           | `digikey` |
+
+---
+
+## fab-bom.ts (8 tools)
+
+_Source: `src/tools/fab-bom.ts`_
+
+| Tool                   | Description                | Discovery         |
+| ---------------------- | -------------------------- | ----------------- |
+| `apply_property_map`   | (no description in source) | `schematic_batch` |
+| `jlc_bom_report`       | (no description in source) | `jlcpcb`          |
+| `jlc_find_alternative` | (no description in source) | `jlcpcb`          |
+| `fab_package`          | (no description in source) | `export`          |
+| `list_snapshots`       | (no description in source) | `snapshots`       |
+| `restore_snapshot`     | (no description in source) | `snapshots`       |
+| `diff_snapshots`       | (no description in source) | `snapshots`       |
+| `run_pcbnew_script`    | (no description in source) | `snapshots`       |
+
+---
+
+## finishing.ts (5 tools)
+
+_Source: `src/tools/finishing.ts`_
+
+| Tool                | Description                                                                                                                                           | Discovery   |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
+| `stitch_ground`     | Place stitching vias for a pour net (default GND): a grid inside the net's pours, a ring along Edge.Cuts and via fences along polylines or a zone...  | `finishing` |
+| `tidy_silkscreen`   | Re-place (and optionally resize) footprint reference designators on the silkscreen so they clear pads/mask openings, other silk, other courtyards...  | `finishing` |
+| `add_pin_labels`    | Add silkscreen text labels next to chosen pads of one footprint (e.g.                                                                                 | `finishing` |
+| `cleanup_dangling`  | Trim dangling track stubs back to their last junction (pad, via, track or zone contact) instead of deleting whole segments, repeating along a stub... | `finishing` |
+| `transplant_layout` | Copy routing (tracks, arcs, vias, zones, rule areas) from a reference .kicad_pcb around a source anchor footprint onto the loaded board around a...   | `finishing` |
 
 ---
 
@@ -507,6 +570,32 @@ _Source: `src/tools/gui-driver.ts`_
 
 ---
 
+## jobs.ts (4 tools)
+
+_Source: `src/tools/jobs.ts`_
+
+| Tool         | Description                                                                                                                              | Discovery |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| `job_status` | State of a background job started by a long tool (e.g.                                                                                   | `jobs`    |
+| `job_list`   | List background jobs known to this server session (newest last), without results or logs.                                                | `jobs`    |
+| `job_cancel` | Cancel a running background job (kills its child processes).                                                                             | `jobs`    |
+| `job_apply`  | Write a finished job's result into the board (for autoroute: replace the .kicad_pcb with the routed and evaluated copy, then reload it). | `jobs`    |
+
+---
+
+## routing-workflows.ts (4 tools)
+
+_Source: `src/tools/routing-workflows.ts`_
+
+| Tool               | Description                                                                                                                                         | Discovery           |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| `fanout_to_planes` | Plane fan-out (R1): for every SMD pad on the given plane nets (e.g.                                                                                 | `routing_workflows` |
+| `route_connection` | Route one connection of a net with a grid A\* router (R3): 45-degree moves on the allowed copper layers, layer changes through vias, obstacles =... | `routing_workflows` |
+| `route_bus`        | Route several connections (e.g.                                                                                                                     | `routing_workflows` |
+| `length_match`     | Report the routed length of nets and differential pairs against a target (R5).                                                                      | `routing_workflows` |
+
+---
+
 ## toolboxes.ts (3 tools)
 
 _Source: `src/tools/toolboxes.ts`_
@@ -525,10 +614,10 @@ _Source: `src/tools/toolboxes.ts`_
 | ------------------------ | -------------------------------------- | ------- |
 | `project.ts`             | Project and Board Files                | 13      |
 | `board.ts`               | Board Management                       | 21      |
-| `component.ts`           | Component Management                   | 28      |
+| `component.ts`           | Component Management                   | 27      |
 | `routing.ts`             | Routing                                | 19      |
 | `design-rules.ts`        | Design Rules and DRC                   | 7       |
-| `export.ts`              | Export and Fabrication Output          | 27      |
+| `export.ts`              | Export and Fabrication Output          | 25      |
 | `schematic.ts`           | Schematic                              | 48      |
 | `schematic-batch.ts`     | Schematic Batch Operations             | 9       |
 | `schematic-hierarchy.ts` | Hierarchical Sheets                    | 5       |
@@ -546,37 +635,48 @@ _Source: `src/tools/toolboxes.ts`_
 | `pcb-import.ts`          | PCB Import                             | 1       |
 | `ui.ts`                  | KiCad UI and Backend                   | 3       |
 | `router.ts`              | Tool Discovery                         | 3       |
+| `board-edit.ts`          | board-edit.ts                          | 13      |
+| `board-query.ts`         | board-query.ts                         | 4       |
 | `digikey-api.ts`         | digikey-api.ts                         | 3       |
+| `fab-bom.ts`             | fab-bom.ts                             | 8       |
+| `finishing.ts`           | finishing.ts                           | 5       |
 | `gui-driver.ts`          | gui-driver.ts                          | 11      |
+| `jobs.ts`                | jobs.ts                                | 4       |
+| `routing-workflows.ts`   | routing-workflows.ts                   | 4       |
 | `toolboxes.ts`           | toolboxes.ts                           | 3       |
-| **Total**                |                                        | **254** |
+| **Total**                |                                        | **289** |
 
 ## Summary by discovery category
 
-These are the categories `search_tools` searches. They cover 254 of the 254 registered tools.
+These are the categories `search_tools` searches. They cover 289 of the 289 registered tools.
 
 | Category                   | Tools indexed |
 | -------------------------- | ------------- |
-| `board`                    | 17            |
-| `component`                | 24            |
-| `export`                   | 27            |
-| `drc`                      | 8             |
+| `board`                    | 21            |
+| `component`                | 25            |
+| `export`                   | 26            |
+| `drc`                      | 12            |
 | `schematic`                | 38            |
 | `library`                  | 9             |
 | `symbol_library`           | 17            |
 | `symbol_pins`              | 3             |
 | `schematic_hierarchy`      | 7             |
 | `schematic_layout`         | 12            |
-| `schematic_batch`          | 6             |
-| `routing`                  | 16            |
+| `schematic_batch`          | 7             |
+| `routing`                  | 19            |
+| `inspection`               | 4             |
+| `finishing`                | 5             |
 | `autoroute`                | 4             |
+| `routing_workflows`        | 4             |
+| `jobs`                     | 4             |
 | `validation`               | 2             |
 | `footprint`                | 5             |
 | `import`                   | 2             |
-| `jlcpcb`                   | 7             |
+| `jlcpcb`                   | 9             |
 | `parts-registry`           | 3             |
 | `digikey`                  | 3             |
 | `gui-driver`               | 11            |
-| **Indexed total**          | **254**       |
+| `snapshots`                | 4             |
+| **Indexed total**          | **289**       |
 | Registered but not indexed | 0             |
-| **Registered total**       | **254**       |
+| **Registered total**       | **289**       |

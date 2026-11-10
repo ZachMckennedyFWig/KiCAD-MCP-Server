@@ -23,8 +23,8 @@ The [Model Context Protocol](https://modelcontextprotocol.io/) is an open standa
 
 **Key Capabilities:**
 
-- 254 tools registered, every one of them indexed for keyword discovery
-- 254 tools across 20 categories with JSON Schema validation
+- 289 tools registered, every one of them indexed for keyword discovery
+- 289 tools across 25 categories with JSON Schema validation
 - Keyword tool discovery via `search_tools` / `get_category_tools`
 - Optional toolboxes: start with a 37-tool core and open the rest by category,
   to save context and stay under client tool limits
@@ -665,10 +665,11 @@ instead of guessing:
 
 - **33 core tools** that `search_tools` surfaces first, covering the
   operations nearly every session needs
-- **20 categories** (board, component, export, drc, schematic, library,
+- **25 categories** (board, component, export, drc, schematic, library,
   symbol_library, symbol_pins, schematic_hierarchy, schematic_layout,
-  schematic_batch, routing, autoroute, validation, parts-registry, digikey,
-  gui-driver, footprint, import, jlcpcb)
+  schematic_batch, routing, inspection, finishing, autoroute,
+  routing_workflows, jobs, validation, parts-registry, digikey, gui-driver,
+  footprint, import, jlcpcb, snapshots)
 - **Discovery tools**:
   - `list_tool_categories` - Browse all available categories
   - `get_category_tools` - View tools in a specific category
@@ -681,7 +682,7 @@ below, do.
 
 ### Toolboxes
 
-The full set is about 250 tool definitions. Every one a client loads costs
+The full set is about 290 tool definitions. Every one a client loads costs
 context, and some clients cap the count: VS Code Copilot stops at 128 tools.
 Set `KICAD_MCP_TOOLBOXES` in the server's environment to load only what you
 need. Each category above is a toolbox.
@@ -796,10 +797,10 @@ Access project state without executing tools:
 
 ## Available Tools
 
-The server exposes every tool directly, so your assistant can call any of them without a discovery step -- just ask for what you want to accomplish. All **254 tools** are also indexed into 20 functional categories, so `search_tools` and `get_category_tools` can find one by keyword, and each category doubles as a [toolbox](#toolboxes).
+The server exposes every tool directly, so your assistant can call any of them without a discovery step -- just ask for what you want to accomplish. All **289 tools** are also indexed into 25 functional categories, so `search_tools` and `get_category_tools` can find one by keyword, and each category doubles as a [toolbox](#toolboxes).
 
 The lists below are a curated tour of the most useful tools, not the full set.
-For the complete, generated reference of all 254 tools -- including how each one
+For the complete, generated reference of all 289 tools -- including how each one
 is discovered -- see [Tool Inventory](docs/TOOL_INVENTORY.md).
 
 ### Project Management (12 tools)
