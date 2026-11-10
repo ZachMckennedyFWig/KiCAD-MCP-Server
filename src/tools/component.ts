@@ -349,47 +349,21 @@ export function registerComponentTools(server: McpServer, callKicadScript: Comma
   );
 
   // ------------------------------------------------------
-  // Add Component Annotation Tool
-  // ------------------------------------------------------
-  server.tool(
-    "add_component_annotation",
-    "Add a text annotation or comment to a PCB component.",
-    {
-      reference: z.string().describe("Reference designator of the component (e.g., 'R5')"),
-      annotation: z.string().describe("Annotation or comment text to add"),
-      visible: z
-        .boolean()
-        .optional()
-        .describe("Whether the annotation should be visible on the PCB"),
-    },
-    async ({ reference, annotation, visible }) => {
-      logger.debug(`Adding annotation to component: ${reference}`);
-      const result = await callKicadScript("add_component_annotation", {
-        reference,
-        annotation,
-        visible,
-      });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result),
-          },
-        ],
-      };
-    },
-  );
-
-  // ------------------------------------------------------
   // Group Components Tool
   // ------------------------------------------------------
   server.tool(
     "group_components",
-    "Group multiple PCB components together by name for easier selection and manipulation.",
+    "Put PCB footprints into a named KiCad group (what Ctrl+G does in the PCB editor), so they " +
+      "select, move and rotate together; saved in the .kicad_pcb. An existing group with the " +
+      "same name is extended. A footprint can be in only one group, so one already in another " +
+      "group is moved (reported in movedFromOtherGroup). Fails without changing anything if a " +
+      "reference is not on the board. Returns {success, group: {name, created, members}, added}.",
     {
-      references: z.array(z.string()).describe("Reference designators of components to group"),
-      groupName: z.string().describe("Name for the component group"),
+      references: z
+        .array(z.string())
+        .min(1)
+        .describe("Reference designators of the footprints to group, e.g. ['U1', 'C1', 'C2']"),
+      groupName: z.string().describe("Group name; an existing group with this name is extended"),
     },
     async ({ references, groupName }) => {
       logger.debug(`Grouping components: ${references.join(", ")} as ${groupName}`);

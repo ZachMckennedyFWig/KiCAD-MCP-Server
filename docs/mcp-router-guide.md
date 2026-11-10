@@ -5,7 +5,7 @@
 > longer uses. The `execute_tool` dispatcher shown throughout was deleted in
 > 2026-05 (commit `963a39c`) because MCP clients could not see the tools behind
 > it. Today every tool is registered directly and the router tools
-> (`list_tool_categories`, `search_tools`, `get_tool_help`) are a searchable
+> (`list_tool_categories`, `get_category_tools`, `search_tools`) are a searchable
 > catalogue that saves no context. Read
 > [docs/ROUTER_QUICK_START.md](ROUTER_QUICK_START.md) for how discovery
 > actually works, and treat this file as background reading on the pattern

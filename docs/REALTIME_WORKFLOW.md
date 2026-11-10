@@ -147,12 +147,12 @@ Claude: [uses get_board_info MCP tool]
 
 - `get_board_info` - Get all components and their positions
 - `get_project_info` - Get project metadata
-- `list_components` - List all components (if implemented)
+- `get_component_list` - List all components
 
 **Modifying board:**
 
 - `place_component` - Add new components
-- `add_trace` - Add copper traces
+- `route_trace` - Add copper traces
 - `add_via` - Add vias
 - `add_copper_pour` - Add copper zones
 - `add_mounting_hole` - Add mounting holes

@@ -123,6 +123,10 @@ def wire(x1, y1, x2, y2):
     )
 
 
+def junction(x, y):
+    return f'\n  (junction (at {x} {y}) (diameter 0) (color 0 0 0 0) (uuid "{uid()}"))'
+
+
 def sheet(name, filename, x, y, pins=(), w=20.32, h=10.16):
     pin_text = "".join(
         f'\n    (pin "{pname}" bidirectional (at {px} {py} 180) '

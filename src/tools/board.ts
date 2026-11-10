@@ -479,7 +479,7 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
   // ------------------------------------------------------
   server.tool(
     "add_board_text",
-    "Add a text label to a PCB layer (e.g. silkscreen, fab, courtyard).",
+    "Add a text label to a PCB layer (e.g. silkscreen, fab, courtyard). Also the way to annotate or comment a component: place the text next to it, e.g. on F.Fab.",
     {
       text: z.string().describe("Text content"),
       position: z

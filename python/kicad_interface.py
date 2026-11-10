@@ -408,6 +408,7 @@ try:
     from commands.board import BoardCommands
     from commands.board.origin import BoardOriginCommands
     from commands.component import ComponentCommands
+    from commands.component_groups import group_components
     from commands.connection_schematic import ConnectionManager
     from commands.datasheet_manager import DatasheetManager
     from commands.design_rules import DesignRuleCommands
@@ -625,6 +626,7 @@ class KiCADInterface(SchematicHandlersMixin):
             "duplicate_component": self.component_commands.duplicate_component,
             "set_footprint_type": self.component_commands.set_footprint_type,
             "replace_component": self.component_commands.replace_component,
+            "group_components": lambda params: group_components(self.board, params),
             # Routing commands
             "add_net": self.routing_commands.add_net,
             "route_trace": self.routing_commands.route_trace,
@@ -1294,7 +1296,11 @@ class KiCADInterface(SchematicHandlersMixin):
                     elif command == "save_project":
                         self._record_board_signature()
                         self._last_auto_save_status = None
-                    elif command in self._BOARD_MUTATING_COMMANDS:
+                    elif command in self._BOARD_MUTATING_COMMANDS and not (
+                        # A dry run (sync_schematic_to_board dryRun) changed nothing.
+                        isinstance(result, dict)
+                        and result.get("dryRun") is True
+                    ):
                         # Auto-save after every board mutation via SWIG.
                         # Prevents data loss if Claude hits context limit before
                         # an explicit save_project call.  When auto-save refuses
@@ -1380,6 +1386,7 @@ class KiCADInterface(SchematicHandlersMixin):
         "add_copper_pour",
         "add_zone",
         "replace_component",
+        "group_components",
         "refill_zones",
         "import_svg_logo",
         "sync_schematic_to_board",
@@ -3137,10 +3144,34 @@ class KiCADInterface(SchematicHandlersMixin):
             if not all([schematic_path, component_ref, pin_name, net_name]):
                 return {"success": False, "message": "Missing required parameters"}
 
+            # scope: "local" (default) / "global" / "auto" -- auto picks a global
+            # label when the net name is already used on another sheet (S3).
+            scope = params.get("scope") or "local"
+            scope_info = None
+            if scope == "auto":
+                from commands.schematic_connectivity import resolve_label_scope
+
+                scope_info = resolve_label_scope(Path(schematic_path), [net_name])[net_name]
+                label_type = scope_info["labelType"]
+            elif scope in ("local", "global"):
+                label_type = "global_label" if scope == "global" else "label"
+            else:
+                return {
+                    "success": False,
+                    "message": f"invalid scope '{scope}'; expected 'local', 'global' or 'auto'",
+                }
+
             # Use ConnectionManager with new WireManager integration
             result = ConnectionManager.connect_to_net(
-                Path(schematic_path), component_ref, pin_name, net_name
+                Path(schematic_path), component_ref, pin_name, net_name, label_type=label_type
             )
+            if scope_info and scope_info["localOnly"] and isinstance(result, dict):
+                result.setdefault("warnings", []).append(
+                    f"scope=auto placed a global label for '{net_name}', but "
+                    + ", ".join(Path(f).name for f in scope_info["localOnly"])
+                    + " use(s) only local/hierarchical labels of that name, which a global "
+                    "label does not join."
+                )
 
             # Also assign the net to the pad on the PCB board
             if self.board and isinstance(result, dict) and result.get("success"):
@@ -3870,7 +3901,7 @@ class KiCADInterface(SchematicHandlersMixin):
         """Generate a component placement (position) file via kicad-cli
         (`pcb export pos`).
 
-        This is the rich CLI sibling of export_position_file: full option set
+        The pick-and-place export (there is no separate export_position_file): full option set
         (side, format, units, bottom-negate-X, drill origin, SMD-only, TH/DNP
         exclusion, gerber board edge). Reads the saved .kicad_pcb.
         """
@@ -4361,7 +4392,7 @@ class KiCADInterface(SchematicHandlersMixin):
     def _handle_export_3d_cli(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Export a 3D model of the PCB via kicad-cli (`pcb export <fmt>`).
 
-        Rich CLI sibling of export_3d / export_vrml. The ``format`` param selects
+        Rich CLI sibling of export_3d (VRML is format="vrml"). The ``format`` param selects
         the subcommand (step, glb, stl, ply, brep, xao, vrml) and only flags valid
         for that subcommand are forwarded. STEP/glb/stl/ply/brep/xao share the
         geometry/include flag set; vrml uses units + models-dir instead. Reads the

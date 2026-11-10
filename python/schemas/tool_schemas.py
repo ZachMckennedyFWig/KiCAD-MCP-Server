@@ -2771,6 +2771,14 @@ SCHEMATIC_TOOLS = [
                     "type": "string",
                     "description": "Name of the net to connect to",
                 },
+                "scope": {
+                    "type": "string",
+                    "enum": ["local", "global", "auto"],
+                    "description": (
+                        "'local' = label (default), 'global' = global_label, 'auto' = "
+                        "global_label when the net name is already used on another sheet"
+                    ),
+                },
             },
             "required": ["schematicPath", "componentRef", "pinName", "netName"],
         },
@@ -2932,7 +2940,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "sync_schematic_to_board",
         "title": "Sync Schematic to PCB (F8)",
-        "description": "Reads net connections from the schematic and assigns them to matching component pads in the PCB board file. Equivalent to KiCAD Pcbnew F8 'Update PCB from Schematic'. Must be called after placing components and before routing traces, so that pad-to-net assignments are correct.",
+        "description": "Update the PCB from the schematic, equivalent to KiCAD Pcbnew F8 'Update PCB from Schematic': adds missing footprints, swaps changed ones, re-nets every pad, syncs Value/Datasheet/custom fields, DNP and exclude-from-BOM, and reports (removeExtra: removes) footprints whose symbol is gone. dryRun returns the change report without writing. Must be called after placing components and before routing traces, so that pad-to-net assignments are correct.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2949,6 +2957,17 @@ SCHEMATIC_TOOLS = [
                     "description": (
                         "Replace board footprints whose schematic Footprint field changed, "
                         "keeping position, rotation, side and nets (default true)"
+                    ),
+                },
+                "dryRun": {
+                    "type": "boolean",
+                    "description": "Report every change without modifying the board (default false)",
+                },
+                "removeExtra": {
+                    "type": "boolean",
+                    "description": (
+                        "Remove footprints whose reference is no longer in the schematic "
+                        "(default false: only reported)"
                     ),
                 },
             },

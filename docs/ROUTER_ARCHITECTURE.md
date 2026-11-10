@@ -116,8 +116,7 @@ Beyond basic placement.
 - `edit_component` - Edit component properties
 - `find_component` - Find component by reference/value
 - `get_component_properties` - Get component properties
-- `add_component_annotation` - Add component annotation
-- `group_components` - Group components together
+- `group_components` - Put footprints into a named PCB group
 - `replace_component` - Replace component with another
 
 #### 3. `export` - File Export & Manufacturing (8 tools)
@@ -132,8 +131,7 @@ Generate output files for fabrication and documentation.
 - `export_3d` - Export 3D model (STEP/STL/VRML/OBJ)
 - `export_bom` - Export bill of materials
 - `export_netlist` - Export netlist
-- `export_position_file` - Export component positions
-- `export_vrml` - Export VRML 3D model
+- `export_pos` - Export component positions (pick-and-place)
 
 #### 4. `drc` - Design Rules & Validation (9 tools)
 
@@ -158,8 +156,8 @@ Schematic editor operations.
 
 - `create_schematic` - Create new schematic
 - `add_schematic_component` - Add component to schematic
-- `add_wire` - Add wire connection
-- `add_schematic_connection` - Connect component pins
+- `add_schematic_wire` - Add wire connection
+- `batch_connect` - Connect component pins to nets
 - `add_schematic_net_label` - Add net label
 - `connect_to_net` - Connect pin to net
 - `get_net_connections` - Get net connections

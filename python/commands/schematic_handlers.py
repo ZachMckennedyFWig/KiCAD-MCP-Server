@@ -25,7 +25,7 @@ import sexpdata
 from commands.library_schematic import LibraryManager as SchematicLibraryManager
 from commands.schematic import SchematicLoadError, SchematicManager
 from commands.wire_manager import WireManager
-from utils.board_items import clone_footprint
+from utils.board_items import clone_footprint, delete_board_item
 from utils.interactive_schematic import reload_kicad_schematic
 from utils.kicad_cli import kicad_cli_not_found_message, resolve_kicad_cli
 from utils.project_settings_guard import preserve_project_settings
@@ -3215,16 +3215,69 @@ class SchematicHandlersMixin:
         )
         return pad_net_map, all_net_names
 
+    @staticmethod
+    def _sync_flag(value: Any, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() not in ("false", "0", "no", "off", "")
+        return bool(value)
+
+    def _extra_board_footprints(
+        self, board: Any, components: List[Dict[str, Any]]
+    ) -> List[Tuple[Any, Dict[str, Any]]]:
+        """Board footprints whose symbol is gone from the schematic.
+
+        A footprint is extra when no netlist component has its reference and
+        none is its schematic symbol (by UUID: a re-annotated part keeps its
+        footprint, #250). Board-only footprints (logos, mounting holes marked
+        "not in schematic") are never extra. Returns (footprint, report entry).
+        """
+        sch_refs = {c.get("reference") for c in components if c.get("reference")}
+        sch_uuids = {c.get("uuid") for c in components if c.get("uuid")}
+        extra: List[Tuple[Any, Dict[str, Any]]] = []
+        for fp in board.GetFootprints():
+            ref = fp.GetReference()
+            if ref in sch_refs:
+                continue
+            try:
+                if fp.IsBoardOnly():
+                    continue
+            except Exception:
+                pass
+            fp_uuid = self._board_symbol_uuid(fp)
+            if fp_uuid and fp_uuid in sch_uuids:
+                continue
+            try:
+                lib_id = fp.GetFPIDAsString()
+            except Exception:
+                lib_id = ""
+            extra.append((fp, {"reference": ref, "footprint": str(lib_id or "")}))
+        return extra
+
     def _handle_sync_schematic_to_board(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Sync schematic netlist to PCB board (equivalent to KiCAD F8 'Update PCB from Schematic').
-        Reads net connections from the schematic and assigns them to the matching pads in the PCB.
+        """Update the PCB from the schematic (KiCad's F8 "Update PCB from Schematic").
+
+        Works from the XML netlist kicad-cli exports: adds missing footprints,
+        swaps footprints whose schematic Footprint field changed
+        (updateFootprints, default on), reports footprints whose symbol is gone
+        and removes them with removeExtra, syncs Value / Datasheet /
+        Description / custom fields, DNP, exclude-from-BOM and the schematic
+        link, and re-nets every pad. dryRun returns the same change report
+        without touching the board. Without kicad-cli it falls back to the
+        server's own sheet parser for pad nets and adds nothing.
         """
         logger.info("Syncing schematic to board")
         try:
             from pathlib import Path
 
+            from utils.netlist_sync import sync_footprint_fields
+
             schematic_path = params.get("schematicPath")
             board_path = params.get("boardPath")
+            dry_run = self._sync_flag(params.get("dryRun"), False)
+            remove_extra = self._sync_flag(params.get("removeExtra"), False)
+            update_footprints = self._sync_flag(params.get("updateFootprints"), True)
 
             # Determine board to work with
             board = None
@@ -3268,94 +3321,160 @@ class SchematicHandlersMixin:
                     "message": f"Schematic not found. Provide schematicPath. Tried: {schematic_path}",
                 }
 
-            # Build the pad->net map from the sheets reachable from the root
+            # Pad nets: the netlist is authoritative (it is what F8 uses). The
+            # server's own sheet parser is the fallback without kicad-cli, and
+            # still lists the sheets it reached.
             sheets_scanned: list = []
             pad_net_map, net_names = self._build_hierarchical_pad_net_map(
                 schematic_path, sheets_out=sheets_scanned
             )
+            netlist = self._export_schematic_netlist(schematic_path)
+            components: List[Dict[str, Any]] = netlist["components"] if netlist else []
+            from_netlist = netlist is not None
+            if from_netlist:
+                pad_net_map = netlist["pin_net"]
+                net_names = set(pad_net_map.values())
+            comps_by_ref = {c["reference"]: c for c in components if c.get("reference")}
 
-            # Add missing footprints from the schematic to the board *before*
-            # we add nets and assign pads — F8 in KiCad does this implicitly
-            # ("Update PCB from Schematic"), but our previous implementation
-            # only mutated nets, leaving newly-added schematic symbols with no
-            # PCB footprint at all.
-            components = self._extract_components_from_schematic(schematic_path)
+            # Footprints whose symbol is gone: always reported, removed only on
+            # request (removeExtra) -- never in a dry run.
+            extra = self._extra_board_footprints(board, components) if components else []
+            removed_footprints: List[Dict[str, Any]] = []
+            extra_report: List[Dict[str, Any]] = []
+            for fp, entry in extra:
+                if remove_extra and not dry_run:
+                    # Delete, not Remove: Remove hands the C++ object to Python
+                    # and corrupts SWIG state when the reference drops (#247).
+                    delete_board_item(board, fp)
+                    removed_footprints.append(entry)
+                else:
+                    extra_report.append(entry)
+
+            # Add missing footprints from the schematic *before* nets are
+            # assigned, as F8 does.
             added_footprints, skipped_footprints = self._add_missing_footprints_from_schematic(
-                board, schematic_path, components=components
+                board, schematic_path, components=components, apply=not dry_run
             )
 
             # Footprints whose schematic Footprint field no longer matches the
             # board (#5h / B1). Swapped by default, like KiCad's F8 "Replace
             # footprints with those specified in the schematic"; with
             # updateFootprints=false they are only reported.
-            update_footprints = params.get("updateFootprints", True)
-            if isinstance(update_footprints, str):
-                update_footprints = update_footprints.strip().lower() not in ("false", "0", "no")
             footprint_changes = self._sync_changed_footprints(
-                board, schematic_path, components, apply=bool(update_footprints)
+                board, schematic_path, components, apply=update_footprints, dry_run=dry_run
             )
 
-            # Add all nets to board
+            # Value / Datasheet / custom fields, DNP, exclude-from-BOM, link.
+            field_updates: List[Dict[str, Any]] = []
+            for fp in board.GetFootprints():
+                comp = comps_by_ref.get(fp.GetReference())
+                if comp is None:
+                    continue
+                changes = sync_footprint_fields(fp, comp, apply=not dry_run)
+                if changes:
+                    field_updates.append({"reference": comp["reference"], "changes": changes})
+
+            # Nets. With the netlist, every numbered pad of a schematic part
+            # takes the netlist's net; a pad the symbol has no pin for is
+            # disconnected, as F8 does. Parts not in the schematic keep theirs.
             netinfo = board.GetNetInfo()
             nets_by_name = netinfo.NetsByName()
-            added_nets = []
-            for net_name in net_names:
-                if not nets_by_name.has_key(net_name):
-                    net_item = pcbnew.NETINFO_ITEM(board, net_name)
-                    board.Add(net_item)
-                    added_nets.append(net_name)
+            added_nets = sorted(n for n in net_names if not nets_by_name.has_key(n))
+            if not dry_run:
+                for net_name in added_nets:
+                    board.Add(pcbnew.NETINFO_ITEM(board, net_name))
+                nets_by_name = board.GetNetInfo().NetsByName()
 
-            # Refresh nets map after additions
-            netinfo = board.GetNetInfo()
-            nets_by_name = netinfo.NetsByName()
-
-            # Assign nets to pads (now also covers any footprints we just added)
             assigned_pads = 0
-            unmatched = []
+            changed_pads: List[Dict[str, Any]] = []
+            cleared_pads: List[str] = []
+            unmatched: List[str] = []
             for fp in board.GetFootprints():
                 ref = fp.GetReference()
+                if from_netlist and ref not in comps_by_ref:
+                    continue
                 for pad in fp.Pads():
-                    pad_num = pad.GetNumber()
-                    key = (ref, str(pad_num))
-                    if key in pad_net_map:
-                        net_name = pad_net_map[key]
-                        if nets_by_name.has_key(net_name):
-                            pad.SetNet(nets_by_name[net_name])
-                            assigned_pads += 1
-                    else:
+                    pad_num = str(pad.GetNumber())
+                    if from_netlist and not pad_num:
+                        continue  # unnumbered (mechanical) pads carry no net
+                    try:
+                        have = str(pad.GetNetname())
+                    except Exception:
+                        have = ""
+                    net_name = pad_net_map.get((ref, pad_num))
+                    if net_name is None:
                         unmatched.append(f"{ref}/{pad_num}")
+                        if from_netlist and have:
+                            cleared_pads.append(f"{ref}/{pad_num} ({have})")
+                            if not dry_run:
+                                pad.SetNet(netinfo.OrphanedItem())
+                        continue
+                    if have != net_name:
+                        changed_pads.append(
+                            {"pad": f"{ref}/{pad_num}", "from": have, "to": net_name}
+                        )
+                    if dry_run:
+                        assigned_pads += 1
+                    elif nets_by_name.has_key(net_name):
+                        pad.SetNet(nets_by_name[net_name])
+                        assigned_pads += 1
 
-            with preserve_project_settings(board_path):
-                board.Save(board_path)
+            if not dry_run:
+                with preserve_project_settings(board_path):
+                    board.Save(board_path)
 
-            # If board was loaded fresh, update internal reference
-            if params.get("boardPath"):
-                self.board = board
-                self._update_command_handlers()
+                # If board was loaded fresh, update internal reference
+                if params.get("boardPath"):
+                    self.board = board
+                    self._update_command_handlers()
 
-            # This tool wrote the .kicad_pcb itself, from the board now held in
-            # memory. Make that write the new on-disk baseline, otherwise the
-            # auto-save that follows sees our own write as an external change,
-            # refuses, and flags memory as unsaved (#5h / #5n).
-            adopt = getattr(self, "_adopt_board_file_write", None)
-            if callable(adopt) and board is self.board:
-                adopt({"mode": "memory", "path": board_path})
+                # This tool wrote the .kicad_pcb itself, from the board now held
+                # in memory. Make that write the new on-disk baseline, otherwise
+                # the auto-save that follows sees our own write as an external
+                # change, refuses, and flags memory as unsaved (#5h / #5n).
+                adopt = getattr(self, "_adopt_board_file_write", None)
+                if callable(adopt) and board is self.board:
+                    adopt({"mode": "memory", "path": board_path})
 
             logger.info(
-                f"sync_schematic_to_board: {len(added_nets)} nets added, "
-                f"{len(added_footprints)} footprints added, {assigned_pads} pads assigned"
+                f"sync_schematic_to_board{' (dry run)' if dry_run else ''}: "
+                f"{len(added_nets)} nets added, {len(added_footprints)} footprints added, "
+                f"{len(removed_footprints)} removed, {assigned_pads} pads assigned"
             )
-            # Every wired pin now carries a net (an unlabeled wire gets a
-            # Net-(REF-PadN) name), so an unmatched pad is one the schematic
-            # does not wire at all, or a pad the symbol does not have. Report
-            # all of them: a ten-entry sample buried a 25-pad failure (#400).
+            # Report every unmatched pad: a ten-entry sample buried a 25-pad
+            # failure (#400).
             warnings: List[str] = []
-            if unmatched:
+            if not from_netlist:
                 warnings.append(
-                    f"{len(unmatched)} pad(s) have no net in the schematic and were left "
-                    "unchanged: " + ", ".join(unmatched)
+                    "kicad-cli netlist export failed or kicad-cli is missing: pad nets came "
+                    "from the server's own sheet parser, and no footprints were added, "
+                    "swapped, removed or field-synced"
                 )
+            if unmatched:
+                if from_netlist:
+                    warnings.append(
+                        f"{len(unmatched)} pad(s) have no pin in their schematic symbol"
+                        + (
+                            f"; {len(cleared_pads)} lost their net: " + ", ".join(cleared_pads)
+                            if cleared_pads
+                            else ""
+                        )
+                        + ". Unmatched: "
+                        + ", ".join(unmatched)
+                    )
+                else:
+                    warnings.append(
+                        f"{len(unmatched)} pad(s) have no net in the schematic and were left "
+                        "unchanged: " + ", ".join(unmatched)
+                    )
                 logger.warning("sync_schematic_to_board: " + warnings[-1])
+            if extra_report:
+                warnings.append(
+                    f"{len(extra_report)} footprint(s) have no symbol in the schematic"
+                    + (" and would be kept" if dry_run else " and were kept")
+                    + " (pass removeExtra=true to remove them): "
+                    + ", ".join(e["reference"] for e in extra_report)
+                )
             root_dir = Path(schematic_path).parent
             sheet_names = []
             for p in sheets_scanned:
@@ -3378,25 +3497,39 @@ class SchematicHandlersMixin:
                         for m in mismatched
                     )
                 )
+            verb = "would be " if dry_run else ""
+            message = (
+                f"{'Dry run, nothing written. ' if dry_run else ''}PCB "
+                f"{'update from schematic' if dry_run else 'updated from schematic'}: "
+                f"{len(added_footprints)} footprints {verb}added, "
+                f"{len(replaced)} {verb}replaced, "
+                f"{len(removed_footprints)} {verb}removed, "
+                f"{len(extra_report)} without symbol kept, "
+                f"{len(field_updates)} with field changes, "
+                f"{len(added_nets)} nets {verb}added, {len(changed_pads)} pad nets {verb}changed"
+            )
             return {
                 "success": True,
-                "message": (
-                    f"PCB updated from schematic: {len(added_footprints)} footprints added, "
-                    f"{len(replaced)} footprints replaced, "
-                    f"{len(added_nets)} nets added, {assigned_pads} pads assigned"
-                ),
+                "dryRun": dry_run,
+                "message": message,
+                "netSource": "netlist" if from_netlist else "sheet-parser",
+                "footprints_added": added_footprints,
+                "footprints_skipped": skipped_footprints,
                 "footprints_replaced": replaced,
                 "footprints_mismatched": mismatched,
+                "footprints_removed": removed_footprints,
+                "footprints_without_symbol": extra_report,
+                "field_updates": field_updates,
                 "sheets_scanned": sheet_names,
                 "nets_added": added_nets,
                 "nets_total": len(net_names),
                 "pads_assigned": assigned_pads,
+                "pad_net_changes": changed_pads,
+                "pads_cleared": cleared_pads,
                 "unmatched_pad_count": len(unmatched),
                 "unmatched_pads": unmatched,
                 "unmatched_pads_sample": unmatched[:10],
                 "warnings": warnings,
-                "footprints_added": added_footprints,
-                "footprints_skipped": skipped_footprints,
             }
 
         except SchematicLoadError as e:
@@ -3408,21 +3541,28 @@ class SchematicHandlersMixin:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
-    def _extract_components_from_schematic(self, schematic_path: str) -> List[Dict[str, str]]:
-        """Run kicad-cli netlist export and return the flat list of components.
+    def _extract_components_from_schematic(self, schematic_path: str) -> List[Dict[str, Any]]:
+        """The netlist's components (see ``_export_schematic_netlist``), [] on failure."""
+        netlist = self._export_schematic_netlist(schematic_path)
+        return netlist["components"] if netlist else []
 
-        Each entry: {"reference": str, "value": str, "footprint": str}
-        Empty list on any failure (kicad-cli missing, parse error, etc.) — the
-        caller treats that as "no missing footprints to add".
+    def _export_schematic_netlist(self, schematic_path: str) -> Optional[Dict[str, Any]]:
+        """Run kicad-cli's XML netlist export and parse it.
+
+        Returns ``{"components": [...], "pin_net": {(ref, pin): net}}`` (see
+        ``utils.netlist_sync.parse_kicad_netlist``; each component has at least
+        reference, value, footprint and uuid), or None on any failure
+        (kicad-cli missing, export error, parse error).
         """
         import subprocess
         import tempfile
-        import xml.etree.ElementTree as ET
+
+        from utils.netlist_sync import parse_kicad_netlist
 
         kicad_cli = self._find_kicad_cli_static()
         if not kicad_cli:
             logger.warning("kicad-cli not found — sync will not add new footprints")
-            return []
+            return None
 
         with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
             tmp_path = tmp.name
@@ -3444,29 +3584,11 @@ class SchematicHandlersMixin:
                     f"kicad-cli netlist export failed (exit {result.returncode}): "
                     f"{result.stderr.strip()}"
                 )
-                return []
-
-            tree = ET.parse(tmp_path)
-            root = tree.getroot()
-            components = []
-            for comp in root.findall("./components/comp"):
-                # <tstamps> carries the schematic symbol UUID -- verified
-                # against kicad-cli 10.0: a bare UUID with no sheet path
-                # (instances of a reused sheet share it). Legacy exports
-                # could comma-join several; keep the first.
-                tstamps = (comp.findtext("tstamps") or "").replace(",", " ").split()
-                components.append(
-                    {
-                        "reference": comp.get("ref", ""),
-                        "value": comp.findtext("value", ""),
-                        "footprint": comp.findtext("footprint", ""),
-                        "uuid": tstamps[0] if tstamps else "",
-                    }
-                )
-            return components
+                return None
+            return parse_kicad_netlist(Path(tmp_path).read_text(encoding="utf-8"))
         except Exception as e:
-            logger.warning(f"Failed to extract components from schematic: {e}")
-            return []
+            logger.warning(f"Failed to read the schematic netlist: {e}")
+            return None
         finally:
             try:
                 Path(tmp_path).unlink()
@@ -3553,6 +3675,7 @@ class SchematicHandlersMixin:
         schematic_path: str,
         components: List[Dict[str, str]],
         apply: bool = True,
+        dry_run: bool = False,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Find (and with ``apply``, swap) board footprints whose lib id differs
         from the schematic symbol's Footprint field.
@@ -3561,7 +3684,9 @@ class SchematicHandlersMixin:
         link and pad nets by number (``utils.footprint_swap``); the caller then
         re-nets every pad from the schematic. Returns
         ``{"replaced": [...], "mismatched": [...]}`` where ``mismatched`` lists
-        the differences left in place, each with a ``reason``.
+        the differences left in place, each with a ``reason``. With ``dry_run``
+        nothing is loaded or swapped: a swap whose footprint file exists is
+        reported in ``replaced`` with ``dryRun: true``.
         """
         from pathlib import Path
 
@@ -3611,6 +3736,14 @@ class SchematicHandlersMixin:
                 entry["reason"] = f"library '{lib_name}' not in fp-lib-table"
                 mismatched.append(entry)
                 continue
+            if dry_run:
+                if (Path(library_path) / f"{fp_name}.kicad_mod").exists():
+                    entry["dryRun"] = True
+                    replaced.append(entry)
+                else:
+                    entry["reason"] = f"footprint '{fp_name}' not in '{lib_name}'"
+                    mismatched.append(entry)
+                continue
             try:
                 new_fp = load_library_footprint(library_path, fp_name)
                 _, report = swap_footprint(board, fp, new_fp, lib_name, fp_name)
@@ -3628,7 +3761,7 @@ class SchematicHandlersMixin:
                 entry["warning"] = report.get("warning")
             replaced.append(entry)
 
-        if replaced:
+        if replaced and not dry_run:
             logger.info(
                 "sync_schematic_to_board: replaced %d footprint(s): %s",
                 len(replaced),
@@ -3641,8 +3774,12 @@ class SchematicHandlersMixin:
         board: Any,
         schematic_path: str,
         components: Optional[List[Dict[str, str]]] = None,
+        apply: bool = True,
     ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
         """Add footprints to ``board`` for any schematic component not yet present.
+
+        With ``apply=False`` (a dry run) nothing is loaded or added: a component
+        whose footprint file exists in its library is reported as added.
 
         New footprints are placed at the board origin so the user can move them
         into position. Power/flag references (``#PWR``, ``#FLG``) are skipped —
@@ -3696,6 +3833,11 @@ class SchematicHandlersMixin:
                 continue
             if ref in existing_refs:
                 continue
+            if comp.get("exclude_from_board"):
+                skipped.append(
+                    {"reference": ref, "footprint": fp_str, "reason": "excluded from board"}
+                )
+                continue
 
             claimed = unclaimed_by_uuid.get(comp.get("uuid", ""))
             if claimed:
@@ -3739,6 +3881,20 @@ class SchematicHandlersMixin:
                         "reason": f"library '{lib_name}' not in fp-lib-table",
                     }
                 )
+                continue
+
+            if not apply:
+                if (Path(library_path) / f"{fp_name}.kicad_mod").exists():
+                    existing_refs.add(ref)
+                    added.append({"reference": ref, "footprint": fp_str})
+                else:
+                    skipped.append(
+                        {
+                            "reference": ref,
+                            "footprint": fp_str,
+                            "reason": f"footprint '{fp_name}' not in '{lib_name}'",
+                        }
+                    )
                 continue
 
             cache_key = (library_path, fp_name)

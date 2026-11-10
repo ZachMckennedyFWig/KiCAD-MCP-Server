@@ -173,7 +173,6 @@ export const EXPORT_TOOLS: ReadonlySet<string> = new Set<string>([
   "export_pcb_svg",
   "export_pdf",
   "export_pos",
-  "export_position_file",
   "export_sch_bom",
   "export_sch_dxf",
   "export_sch_hpgl",
@@ -184,7 +183,6 @@ export const EXPORT_TOOLS: ReadonlySet<string> = new Set<string>([
   "export_schematic_pdf",
   "export_schematic_svg",
   "export_svg",
-  "export_vrml",
 ]);
 
 /** Whether `mode` allows `tool`. */

@@ -149,7 +149,7 @@ export function registerExportTools(server: McpServer, callKicadScript: CommandF
   // ------------------------------------------------------
   server.tool(
     "export_3d",
-    "Export the PCB as a 3D model (STEP, STL, VRML or OBJ) including optional copper, solder mask, silkscreen and component 3D models.",
+    "Export the PCB as a 3D model (STEP, STL, VRML or OBJ) including optional copper, solder mask, silkscreen and component 3D models. For VRML pass format 'VRML'; export_3d_cli exposes the full kicad-cli option set (units, models-dir).",
     {
       outputPath: z.string().describe("Path to save the 3D model file"),
       format: z.enum(["STEP", "STL", "VRML", "OBJ"]).describe("3D model format"),
@@ -242,74 +242,6 @@ export function registerExportTools(server: McpServer, callKicadScript: CommandF
         schematicPath,
         outputPath,
         format,
-      });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result),
-          },
-        ],
-      };
-    },
-  );
-
-  // ------------------------------------------------------
-  // Export Position File Tool
-  // ------------------------------------------------------
-  server.tool(
-    "export_position_file",
-    "Export a component placement/position file (pick-and-place) for PCB assembly in CSV or ASCII format.",
-    {
-      outputPath: z.string().describe("Path to save the position file"),
-      format: z.enum(["CSV", "ASCII"]).optional().describe("File format (default: CSV)"),
-      units: z.enum(["mm", "mil", "inch"]).optional().describe("Units to use (default: mm)"),
-      side: z
-        .enum(["top", "bottom", "both"])
-        .optional()
-        .describe("Which board side to include (default: both)"),
-    },
-    async ({ outputPath, format, units, side }) => {
-      logger.debug(`Exporting position file to: ${outputPath}`);
-      const result = await callKicadScript("export_position_file", {
-        outputPath,
-        format,
-        units,
-        side,
-      });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result),
-          },
-        ],
-      };
-    },
-  );
-
-  // ------------------------------------------------------
-  // Export VRML Tool
-  // ------------------------------------------------------
-  server.tool(
-    "export_vrml",
-    "Export the PCB as a VRML 3D model for use in web viewers or simulation tools.",
-    {
-      outputPath: z.string().describe("Path to save the VRML file"),
-      includeComponents: z.boolean().optional().describe("Whether to include 3D component models"),
-      useRelativePaths: z
-        .boolean()
-        .optional()
-        .describe("Whether to use relative paths for 3D models"),
-    },
-    async ({ outputPath, includeComponents, useRelativePaths }) => {
-      logger.debug(`Exporting VRML to: ${outputPath}`);
-      const result = await callKicadScript("export_vrml", {
-        outputPath,
-        includeComponents,
-        useRelativePaths,
       });
 
       return {
@@ -599,7 +531,7 @@ export function registerExportTools(server: McpServer, callKicadScript: CommandF
   // ------------------------------------------------------
   server.tool(
     "export_pos",
-    "Generate a component placement (position / pick-and-place) file via kicad-cli, exposing the full CLI option set (side, format, units, bottom-negate-X, drill-file origin, SMD-only, exclude through-hole / DNP, gerber board edge). Rich CLI sibling of export_position_file. Reads the last SAVED state of the .kicad_pcb.",
+    "Generate a component placement (position / pick-and-place) file via kicad-cli, exposing the full CLI option set (side, format, units, bottom-negate-X, drill-file origin, SMD-only, exclude through-hole / DNP, gerber board edge). Use this for pick-and-place / position files. Reads the last SAVED state of the .kicad_pcb.",
     {
       outputPath: z.string().describe("Output position file path"),
       boardPath: z.string().optional().describe("Path to the .kicad_pcb (default: current board)"),
@@ -938,7 +870,7 @@ export function registerExportTools(server: McpServer, callKicadScript: CommandF
   // ------------------------------------------------------
   server.tool(
     "export_3d_cli",
-    "Export a 3D model of the PCB via kicad-cli. The `format` param selects the subcommand (step, glb, stl, ply, brep, xao, vrml); only flags valid for that subcommand are forwarded. STEP/glb/stl/ply/brep/xao share the geometry/include flag set (no-board-body, include-tracks/pads/zones/inner-copper/silkscreen/soldermask, fuse-shapes, fill-all-vias, component/net filters, min-distance, etc.; no-optimize-step is STEP-only); vrml uses units + models-dir/models-relative instead. Rich CLI sibling of export_3d and export_vrml. Reads the last SAVED state of the .kicad_pcb.",
+    "Export a 3D model of the PCB via kicad-cli. The `format` param selects the subcommand (step, glb, stl, ply, brep, xao, vrml); only flags valid for that subcommand are forwarded. STEP/glb/stl/ply/brep/xao share the geometry/include flag set (no-board-body, include-tracks/pads/zones/inner-copper/silkscreen/soldermask, fuse-shapes, fill-all-vias, component/net filters, min-distance, etc.; no-optimize-step is STEP-only); vrml uses units + models-dir/models-relative instead. Rich CLI sibling of export_3d (use format 'vrml' for a VRML model). Reads the last SAVED state of the .kicad_pcb.",
     {
       outputPath: z.string().describe("Output 3D model file path"),
       format: z

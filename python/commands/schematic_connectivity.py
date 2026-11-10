@@ -14,8 +14,9 @@ Three consumers share the code here:
 * ``assert_connectivity`` (S2) — checks intended pin->net assignments against
   the netlist ``kicad-cli sch export netlist`` produces, returning only the
   problems.
-* ``relabel_net`` (S3) — renames a net's labels (local, global, hierarchical and
-  the matching sheet pins) on every sheet of the hierarchy.
+* ``relabel_net`` (S3) — renames one net's labels: global labels on every sheet,
+  local and hierarchical labels only where they are that net, plus the matching
+  sheet pins.
 
 All coordinates are schematic millimetres, origin at the sheet's top-left
 corner, Y growing downwards (KiCad's file convention).
@@ -540,6 +541,83 @@ def power_driver_warnings(
 
 
 # ──────────────────────────────────────────────────────────────────────────
+#  Label scope ("auto": local or global)
+# ──────────────────────────────────────────────────────────────────────────
+LABEL_SCOPES = {"local": "label", "global": "global_label"}
+
+
+def _sheet_net_names(sexp: list) -> Dict[str, Set[str]]:
+    """Names a sheet gives nets, by kind: global (global labels, global power
+    symbols), local (labels, local power symbols) and hierarchical."""
+    out: Dict[str, Set[str]] = {"global": set(), "local": set(), "hierarchical": set()}
+    kind_of = {"global_label": "global", "label": "local", "hierarchical_label": "hierarchical"}
+    for item in sexp:
+        tag = _tag(item)
+        if tag in kind_of and len(item) > 1:
+            out[kind_of[tag]].add(str(item[1]))
+    lib_index = _lib_symbol_index(sexp)
+    for item in sexp:
+        if _tag(item) != "symbol" or _child(item, "lib_id") is None:
+            continue
+        lib_name_part = _child(item, "lib_name")
+        lib_id = str(_child(item, "lib_id")[1])
+        key = str(lib_name_part[1]) if lib_name_part is not None else lib_id
+        sym_def = lib_index.get(key) or lib_index.get(lib_id)
+        power = _power_kind(sym_def) if sym_def is not None else None
+        value = _prop(item, "Value")
+        if power and value:
+            out["global" if power == "global" else "local"].add(value)
+    return out
+
+
+def resolve_label_scope(
+    sch_path: Path, net_names: Iterable[str], cache: Optional[Dict[str, list]] = None
+) -> Dict[str, Dict[str, Any]]:
+    """Pick a label kind per net for ``scope: "auto"``.
+
+    A net whose name already appears on another sheet of the hierarchy (any
+    label kind or a power symbol), or as a global label on this sheet, gets a
+    ``global_label``; any other net a local ``label``. Each entry is
+    ``{"labelType": ..., "sheets": [other sheet files using the name],
+    "localOnly": [those where it is only a local/hierarchical label]}``. A
+    global label does not join a same-named local label, so callers warn about
+    ``localOnly`` sheets. Falls back to local labels when the hierarchy cannot
+    be read.
+    """
+    cache = cache if cache is not None else {}
+    names = list(dict.fromkeys(str(n) for n in net_names))
+    out: Dict[str, Dict[str, Any]] = {
+        n: {"labelType": "label", "sheets": [], "localOnly": []} for n in names
+    }
+    try:
+        sch_path = Path(sch_path).resolve()
+        root = find_root_schematic(sch_path, cache)
+        per_file: Dict[str, Dict[str, Set[str]]] = {}
+        for f in hierarchy_files(root, cache):
+            try:
+                per_file[str(f)] = _sheet_net_names(_load_sexp(f, cache))
+            except Exception as e:
+                logger.debug(f"label scope: cannot read {f}: {e}")
+        here = per_file.get(str(sch_path)) or _sheet_net_names(_load_sexp(sch_path, cache))
+    except Exception as e:
+        logger.warning(f"label scope auto: hierarchy not readable, using local labels: {e}")
+        return out
+    for name in names:
+        entry = out[name]
+        for sheet_key, kinds in per_file.items():
+            if sheet_key == str(sch_path):
+                continue
+            if name in kinds["global"]:
+                entry["sheets"].append(sheet_key)
+            elif name in kinds["local"] or name in kinds["hierarchical"]:
+                entry["sheets"].append(sheet_key)
+                entry["localOnly"].append(sheet_key)
+        if entry["sheets"] or name in here["global"]:
+            entry["labelType"] = "global_label"
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────
 #  kicad-cli netlist
 # ──────────────────────────────────────────────────────────────────────────
 def export_netlist(root_sch: Path, timeout: int = 120) -> Dict[str, Any]:
@@ -841,15 +919,155 @@ def assert_connectivity(params: Dict[str, Any]) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────────────
 #  relabel_net
 # ──────────────────────────────────────────────────────────────────────────
-def relabel_net(params: Dict[str, Any]) -> Dict[str, Any]:
-    """Rename every label of a net across the hierarchy (S3).
+def _sheet_name(item: list) -> str:
+    return _prop(item, "Sheetname") or _prop(item, "Sheet name") or ""
 
-    Renames ``label``, ``global_label`` and ``hierarchical_label`` items whose
-    text equals ``oldName`` (a hierarchical path like ``/Power/+5V`` is reduced
-    to its last component), plus the parent-sheet pins that bind a renamed
-    hierarchical label, so the sheet interface stays intact. Power symbols are
-    left alone unless ``includePowerSymbols`` is true (their Value is the net
-    name). Edits are textual, so the rest of each file is untouched.
+
+def _resolve_sheet_path(root: Path, names: List[str], cache: Dict[str, list]) -> Optional[Path]:
+    """The file of the sheet instance ``/names[0]/names[1]/...`` below *root*."""
+    current = Path(root).resolve()
+    for name in names:
+        try:
+            sexp = _load_sexp(current, cache)
+        except Exception:
+            return None
+        nxt = None
+        for item in sexp:
+            if _tag(item) != "sheet" or _sheet_name(item) != name:
+                continue
+            sheetfile = _prop(item, "Sheetfile") or _prop(item, "Sheet file")
+            if sheetfile:
+                nxt = (current.parent / sheetfile).resolve()
+            break
+        if nxt is None or not nxt.exists():
+            return None
+        current = nxt
+    return current
+
+
+def _sheet_name_paths(root: Path, cache: Dict[str, list], max_depth: int = 32) -> Dict[str, str]:
+    """{file: "/A/B/"} -- the first sheet-name path that instances each file."""
+    out: Dict[str, str] = {}
+
+    def walk(f: Path, prefix: str, depth: int) -> None:
+        if str(f) in out or depth > max_depth:
+            return
+        out[str(f)] = prefix
+        try:
+            sexp = _load_sexp(f, cache)
+        except Exception:
+            return
+        for item in sexp:
+            if _tag(item) != "sheet":
+                continue
+            sheetfile = _prop(item, "Sheetfile") or _prop(item, "Sheet file")
+            if sheetfile:
+                child = (f.parent / sheetfile).resolve()
+                if child.exists():
+                    walk(child, f"{prefix}{_sheet_name(item)}/", depth + 1)
+
+    walk(Path(root).resolve(), "/", 0)
+    return out
+
+
+def _label_points(sexp: list, name: str) -> List[Tuple[str, float, float]]:
+    """(kind, x_mm, y_mm) of every label of any kind whose text is *name*."""
+    out = []
+    for item in sexp:
+        tag = _tag(item)
+        if tag in _LABEL_KINDS and len(item) > 1 and str(item[1]) == name:
+            at = _child(item, "at")
+            if at is not None and len(at) >= 3:
+                out.append((tag, float(at[1]), float(at[2])))
+    return out
+
+
+def _relabel_scope(
+    files: List[Path],
+    cache: Dict[str, list],
+    old: str,
+    start: Path,
+    include_power: bool,
+) -> Set[str]:
+    """Sheet files on which the local/hierarchical labels ``old`` are the renamed net.
+
+    A local label is sheet-scoped: same-named local labels on two sheets are two
+    nets. The renamed net starts on *start*; it continues
+    * down a sheet pin named ``old`` that is wired into it (the child's
+      hierarchical label is the same net),
+    * up from a renamed hierarchical label to the parent sheet pin, and on into
+      the parent when that pin is wired to the parent's label ``old``,
+    * onto any sheet where a label ``old`` is wired to a global label ``old``
+      (or, with *include_power*, a power symbol ``old``) -- those are renamed
+      hierarchy-wide, so a local label on the same wire is the same net.
+    """
+    graphs: Dict[str, SheetGraph] = {}
+    groups: Dict[str, Dict[Point, _Group]] = {}
+    blocks: Dict[str, Dict[str, Path]] = {}
+    points: Dict[str, List[Tuple[str, float, float]]] = {}
+    for f in files:
+        key = str(f)
+        try:
+            sexp = _load_sexp(f, cache)
+            graphs[key] = SheetGraph(sexp, f)
+            groups[key] = graphs[key].groups()
+        except Exception as e:
+            logger.warning(f"relabel_net: connectivity of {f} not built: {e}")
+            continue
+        blocks[key] = {
+            b["uuid"]: b["file"] for b in _sheet_blocks(sexp, f.parent) if b["file"] is not None
+        }
+        points[key] = _label_points(sexp, old)
+
+    scope: Set[str] = {str(Path(start).resolve())}
+    while True:
+        before = set(scope)
+        hier_files = {
+            k for k in scope if any(kind == "hierarchical_label" for kind, *_ in points.get(k, []))
+        }
+        for key, graph in graphs.items():
+            roots: Set[Point] = set()
+            for kind, x, y in points.get(key, []):
+                if kind == "global_label" or key in scope:
+                    root = graph.root_of(x, y)
+                    if root is not None:
+                        roots.add(root)
+            for gkey, grp in groups[key].items():
+                if include_power and old in grp.global_names:
+                    roots.add(gkey)
+                for uid, pin in grp.sheet_pins:
+                    child = blocks[key].get(uid)
+                    if pin == old and child is not None and str(child) in hier_files:
+                        roots.add(gkey)
+            for gkey in roots:
+                net_grp = groups[key].get(gkey)
+                if net_grp is None:
+                    continue
+                if old in net_grp.local_names or old in net_grp.hier_names:
+                    scope.add(key)
+                for uid, pin in net_grp.sheet_pins:
+                    child = blocks[key].get(uid)
+                    if pin == old and child is not None and str(child) in graphs:
+                        scope.add(str(child))
+        if scope == before:
+            return scope
+
+
+def relabel_net(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Rename one net's labels across the hierarchy (S3).
+
+    ``oldName`` is a label text (``+5V``) or a KiCad net path (``/Power/+5V``,
+    ``/+5V`` for the root sheet). Local labels are sheet-scoped, so they are
+    renamed only on the sheet the path names (or, for a plain name, the given
+    ``schematicPath``) and on sheets the same net reaches: through a sheet pin
+    and its hierarchical label, or by being wired to a renamed global label.
+    Same-named local labels on other sheets are different nets and are left
+    alone (reported in ``untouchedLocalLabels``). Global labels named
+    ``oldName`` are renamed on every sheet, as are, with
+    ``includePowerSymbols``, power symbols. A renamed hierarchical label takes
+    the parent sheet pins bound to it along, so the sheet interface stays
+    intact. ``sheetOnly`` limits every label rename to the given sheet. Edits
+    are textual, so the rest of each file is untouched.
     """
     from utils.sexpr_format import escape_sexpr_string
 
@@ -879,50 +1097,65 @@ def relabel_net(params: Dict[str, Any]) -> Dict[str, Any]:
     root = find_root_schematic(sch_path, cache)
     files = hierarchy_files(root, cache)
 
+    # Where the local net lives: the sheet a "/Sheet/Sub/NAME" path names, else
+    # the sheet the caller gave.
+    start = sch_path.resolve()
+    old_str = str(old)
+    if old_str.startswith("/"):
+        sheet_names = [p for p in old_str.rstrip("/").split("/")[1:-1] if p]
+        resolved = _resolve_sheet_path(root, sheet_names, cache)
+        if resolved is None:
+            return {
+                "success": False,
+                "message": (
+                    f"Sheet path '/{'/'.join(sheet_names)}' of '{old_str}' not found in the "
+                    f"hierarchy of {root.name} (sheet names, as in KiCad's net names)"
+                ),
+                "rootSchematic": str(root),
+            }
+        start = resolved
+
     old_q = re.escape(escape_sexpr_string(old_leaf))
     new_raw = escape_sexpr_string(new_name)
-    label_re = re.compile(r'(\((label|global_label|hierarchical_label)\s+)"' + old_q + '"')
+    local_re = re.compile(r'(\((label|hierarchical_label)\s+)"' + old_q + '"')
+    global_re = re.compile(r'(\((global_label)\s+)"' + old_q + '"')
+    contents = {str(f): f.read_text(encoding="utf-8") for f in files}
 
-    # Which child files get a hierarchical label renamed -> their sheet pins
-    # in the parent must follow.
-    hier_files: Set[str] = set()
-    contents: Dict[str, str] = {}
-    for f in files:
-        text = f.read_text(encoding="utf-8")
-        contents[str(f)] = text
-        if re.search(r'\(hierarchical_label\s+"' + old_q + '"', text):
-            hier_files.add(str(f))
-
-    # sheetOnly limits label renames to the given sheet (local labels of the
-    # same name on other sheets are different nets); the parent sheet pins of a
-    # renamed hierarchical label are still updated wherever they live.
+    # sheetOnly: every label kind on the given sheet only.
     only = str(sch_path.resolve()) if params.get("sheetOnly") else None
     if only:
-        hier_files &= {only}
+        scope = {only}
+    else:
+        scope = _relabel_scope(files, cache, old_leaf, start, include_power)
+    # A child whose hierarchical labels are renamed -> its parent sheet pins follow.
+    hier_files = {
+        k
+        for k in scope
+        if k in contents
+        and re.search(r'\(hierarchical_label\s+"' + old_q + '"', contents[k]) is not None
+    }
 
     changes: List[Dict[str, Any]] = []
+    untouched: List[Dict[str, Any]] = []
     total = 0
     for f in files:
-        text = contents[str(f)]
-        if only and str(f) != only:
-            if not hier_files:
-                continue
-            new_text, sheet_pins = _rename_sheet_pins(text, f.parent, hier_files, old_q, new_raw)
-            if sheet_pins:
-                total += sheet_pins
-                changes.append({"file": str(f), "sheet_pin": sheet_pins})
-                if not dry_run:
-                    tmp = f.with_name(f.name + ".relabel.tmp")
-                    tmp.write_text(new_text, encoding="utf-8")
-                    os.replace(tmp, f)
-            continue
+        key = str(f)
+        text = contents[key]
         counts = {k: 0 for k in _LABEL_KINDS}
 
         def _sub_label(m: "re.Match[str]") -> str:
             counts[m.group(2)] += 1
             return m.group(1) + '"' + new_raw + '"'
 
-        new_text = label_re.sub(_sub_label, text)
+        new_text = text
+        if key in scope:
+            new_text = local_re.sub(_sub_label, new_text)
+        elif not only:
+            n_local = len(local_re.findall(text))
+            if n_local:
+                untouched.append({"file": key, "labels": n_local})
+        if not only or key == only:
+            new_text = global_re.sub(_sub_label, new_text)
 
         sheet_pins = 0
         if hier_files:
@@ -931,13 +1164,13 @@ def relabel_net(params: Dict[str, Any]) -> Dict[str, Any]:
             )
 
         power = 0
-        if include_power:
+        if include_power and (not only or key == only):
             new_text, power = _rename_power_values(new_text, escape_sexpr_string(old_leaf), new_raw)
 
         n = sum(counts.values()) + sheet_pins + power
         if n:
             total += n
-            entry = {"file": str(f), **{k: v for k, v in counts.items() if v}}
+            entry = {"file": key, **{k: v for k, v in counts.items() if v}}
             if sheet_pins:
                 entry["sheet_pin"] = sheet_pins
             if power:
@@ -948,14 +1181,29 @@ def relabel_net(params: Dict[str, Any]) -> Dict[str, Any]:
                 tmp.write_text(new_text, encoding="utf-8")
                 os.replace(tmp, f)
 
+    note = ""
+    if untouched:
+        name_paths = _sheet_name_paths(root, cache)
+        for u in untouched:
+            u["netPath"] = name_paths.get(u["file"], "/") + old_leaf
+        note = (
+            f"Local/hierarchical labels '{old_leaf}' on "
+            + ", ".join(f"{Path(u['file']).name} (net {u['netPath']})" for u in untouched)
+            + " belong to other nets (local labels are per sheet) and were not renamed. "
+            "To rename one, pass its net path as oldName or its sheet as schematicPath."
+        )
     if total == 0:
-        return {
+        out: Dict[str, Any] = {
             "success": False,
-            "message": f"No label named '{old_leaf}' found in the hierarchy of {root.name}",
+            "message": f"No label of net '{old_str}' found in the hierarchy of {root.name}",
             "rootSchematic": str(root),
             "sheetsScanned": len(files),
         }
-    return {
+        if untouched:
+            out["untouchedLocalLabels"] = untouched
+            out["message"] += ". " + note
+        return out
+    result: Dict[str, Any] = {
         "success": True,
         "dryRun": dry_run,
         "message": (
@@ -967,6 +1215,10 @@ def relabel_net(params: Dict[str, Any]) -> Dict[str, Any]:
         "rootSchematic": str(root),
         "sheetsScanned": len(files),
     }
+    if untouched:
+        result["untouchedLocalLabels"] = untouched
+        result["warnings"] = [note]
+    return result
 
 
 def _find_close(text: str, start: int) -> int:

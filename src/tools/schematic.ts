@@ -736,18 +736,28 @@ edit_schematic_component and set its value to an empty string.`,
     "connect_to_net",
     "Connect a component pin to a named net by adding a wire stub and net label at the exact pin endpoint. " +
       "The response includes pin_location (exact pin coords), label_location (where the label was placed), " +
-      "and wire_stub (the wire segment added) so you can confirm the placement.",
+      "and wire_stub (the wire segment added) so you can confirm the placement. " +
+      "scope selects the label kind (default 'local'; 'auto' = global when the net name is " +
+      "already used on another sheet); the response's label_type says which was placed.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       componentRef: z.string().describe("Component reference (e.g., U1, R1)"),
       pinName: z.string().describe("Pin name/number to connect"),
       netName: z.string().describe("Name of the net to connect to"),
+      scope: z
+        .enum(["local", "global", "auto"])
+        .optional()
+        .describe(
+          "'local' = label (default), 'global' = global_label, 'auto' = global_label when the " +
+            "net name is already used on another sheet of the hierarchy, else a local label",
+        ),
     },
     async (args: {
       schematicPath: string;
       componentRef: string;
       pinName: string;
       netName: string;
+      scope?: "local" | "global" | "auto";
     }) => {
       const result = await callKicadScript("connect_to_net", args);
       if (result.success) {
@@ -1651,7 +1661,17 @@ edit_schematic_component and set its value to an empty string.`,
   // Sync schematic to PCB board (equivalent to KiCAD F8 / "Update PCB from Schematic")
   server.tool(
     "sync_schematic_to_board",
-    "Import the schematic netlist into the PCB board — equivalent to pressing F8 in KiCAD (Tools → Update PCB from Schematic). MUST be called after the schematic is complete and before placing or routing components on the PCB. Without this step, the board has no footprints and no net assignments — place_component and route_pad_to_pad will produce an empty, unroutable board.",
+    "Import the schematic netlist into the PCB board — equivalent to pressing F8 in KiCAD (Tools → Update PCB from Schematic). MUST be called after the schematic is complete and before placing or routing components on the PCB. Without this step, the board has no footprints and no net assignments — place_component and route_pad_to_pad will produce an empty, unroutable board. " +
+      "Works from kicad-cli's XML netlist: adds missing footprints (at the origin), swaps footprints whose " +
+      "schematic Footprint field changed (updateFootprints), re-nets every numbered pad (a pad its symbol " +
+      "has no pin for is disconnected, as in F8; generated 'unconnected-(...)' names escape '/' as {slash}), " +
+      "and syncs Value, Datasheet, Description and custom fields (e.g. LCSC), DNP, exclude-from-BOM and " +
+      "the schematic link. Footprints whose symbol is gone are always reported (footprints_without_symbol) " +
+      "and removed only with removeExtra=true; board-only footprints are never touched. dryRun=true " +
+      "returns the same report without changing or saving the board. Returns {success, dryRun, message, " +
+      "footprints_added, footprints_replaced, footprints_mismatched, footprints_removed, " +
+      "footprints_without_symbol, field_updates:[{reference, changes:[{what, from, to}]}], nets_added, " +
+      "pad_net_changes:[{pad, from, to}], pads_cleared, unmatched_pads, warnings}.",
     {
       schematicPath: z.string().describe("Absolute path to the .kicad_sch schematic file"),
       boardPath: z.string().describe("Absolute path to the .kicad_pcb board file"),
@@ -1662,8 +1682,25 @@ edit_schematic_component and set its value to an empty string.`,
           "Replace board footprints whose schematic Footprint field changed, keeping position, " +
             "rotation, side and nets (default true). false only reports them in footprints_mismatched.",
         ),
+      dryRun: z
+        .boolean()
+        .optional()
+        .describe("Report every change without modifying or saving the board (default false)"),
+      removeExtra: z
+        .boolean()
+        .optional()
+        .describe(
+          "Remove footprints whose reference is no longer in the schematic (default false: they " +
+            "are only reported in footprints_without_symbol). Board-only footprints are kept.",
+        ),
     },
-    async (args: { schematicPath: string; boardPath: string; updateFootprints?: boolean }) => {
+    async (args: {
+      schematicPath: string;
+      boardPath: string;
+      updateFootprints?: boolean;
+      dryRun?: boolean;
+      removeExtra?: boolean;
+    }) => {
       const result = await callKicadScript("sync_schematic_to_board", args);
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -2061,7 +2098,7 @@ edit_schematic_component and set its value to an empty string.`,
   server.tool(
     "get_net_at_point",
     "Returns the net name at a given (x, y) coordinate in a schematic, or null if no net label " +
-      "or wire endpoint is present at that position. Faster than get_pin_net when you only need " +
+      "or wire endpoint is present at that position. Faster than get_wire_connections when you only need " +
       "the net name at a known coordinate and don't need pin traversal.",
     {
       schematicPath: z.string().describe("Path to the schematic file (.kicad_sch)"),
@@ -2355,10 +2392,7 @@ unexpectedNoConnects:[{ref, pin, net, expected?, reason?}], rootSchematic, saved
         .string()
         .optional()
         .describe("Load the stored expectation set with this name (merged with expectations)"),
-      timeout: z
-        .number()
-        .optional()
-        .describe("kicad-cli timeout in seconds (default 120)"),
+      timeout: z.number().optional().describe("kicad-cli timeout in seconds (default 120)"),
     },
     async (args: any) => {
       const r = await callKicadScript("assert_connectivity", args);
@@ -2380,22 +2414,33 @@ unexpectedNoConnects:[{ref, pin, net, expected?, reason?}], rootSchematic, saved
   // Rename a net's labels on every sheet of the hierarchy
   server.tool(
     "relabel_net",
-    `Rename a net across the whole sheet hierarchy: every label, global_label and
-hierarchical_label whose text equals oldName (a hierarchical name like "/Power/+5V" is
-reduced to "+5V") gets newName, and the parent sheet pins bound to a renamed
-hierarchical label are renamed with it so the sheet interface stays connected.
-Power symbols are left alone unless includePowerSymbols=true (their Value is the
-net name). sheetOnly=true limits label renames to the given sheet (local labels with
-the same text on other sheets are different nets). Edits are textual; nothing else
-in the files changes. dryRun=true reports what would change without writing.
+    `Rename one net across the sheet hierarchy. oldName is a label text ("+5V") or a KiCad
+net path ("/Power/+5V"; "/+5V" for the root sheet). Global labels named oldName are
+renamed on every sheet. Local labels are per sheet, so they (and hierarchical labels) are
+renamed only on the sheet the net path names - or, for a plain name, on schematicPath -
+and wherever that same net continues: through a sheet pin into the child's hierarchical
+label, from a hierarchical label up to the parent sheet pin and the parent's label, or by
+being wired to a renamed global label. Same-named local labels on other sheets are
+different nets and are left alone (listed in untouchedLocalLabels with their net paths).
+Parent sheet pins bound to a renamed hierarchical label are renamed with it so the sheet
+interface stays connected. Power symbols are left alone unless includePowerSymbols=true
+(their Value is the net name). sheetOnly=true limits label renames to schematicPath
+itself. Edits are textual; nothing else in the files changes. dryRun=true reports what
+would change without writing.
 
 Returns {success, dryRun, message, renamed, changes:[{file, label?, global_label?,
-hierarchical_label?, sheet_pin?, power_symbol?}], rootSchematic, sheetsScanned}.`,
+hierarchical_label?, sheet_pin?, power_symbol?}], rootSchematic, sheetsScanned,
+untouchedLocalLabels?:[{file, labels, netPath}]}.`,
     {
       schematicPath: z
         .string()
-        .describe("Any .kicad_sch of the project; the whole hierarchy from its root is edited"),
-      oldName: z.string().describe("Current net/label text"),
+        .describe(
+          "A .kicad_sch of the project: the hierarchy from its root is scanned, and for a " +
+            "plain oldName this is the sheet whose local labels are renamed",
+        ),
+      oldName: z
+        .string()
+        .describe("Current label text, or net path '/Sheet/NAME' naming the sheet of a local net"),
       newName: z.string().describe("New label text (plain, no '/' path)"),
       sheetOnly: z
         .boolean()
@@ -2418,6 +2463,7 @@ hierarchical_label?, sheet_pin?, power_symbol?}], rootSchematic, sheetsScanned}.
           .map(([k, v]) => `${k}=${v}`);
         lines.push(`  ${c.file}: ${parts.join(", ")}`);
       }
+      for (const w of r.warnings || []) lines.push(`Warning: ${w}`);
       return { content: [{ type: "text", text: lines.join("\n") }] };
     },
   );
