@@ -458,6 +458,18 @@ try:
     from commands.validate_kicad_files import validate_schematic, validate_symbol_library
     from commands.via_summary import ViaSummaryCommands
 
+    # BOM/sourcing, fab package, snapshots/undo, script escape hatch
+    # (MCP_ISSUES S4, S5, F3, I1, I3)
+    from commands.bom_tools import apply_property_map
+    from commands.fab_package import fab_package
+    from commands.jlc_sourcing import jlc_bom_report, jlc_find_alternative
+    from commands.script_runner import ScriptRunnerCommands
+    from commands.snapshots import (
+        SnapshotCommands,
+        maybe_auto_snapshot,
+        restore_schematic_targets,
+    )
+
     logger.info("Successfully imported all command handlers")
 except ImportError as e:
     logger.error(f"Failed to import command handlers: {e}")
@@ -560,6 +572,11 @@ class KiCADInterface(SchematicHandlersMixin):
         # Schematic-related classes don't need board reference
         # as they operate directly on schematic files
 
+        # Snapshots/undo and the pcbnew script runner (I1, I3) read the
+        # session's board path and dirty state.
+        self.snapshot_commands = SnapshotCommands(self)
+        self.script_runner = ScriptRunnerCommands(self)
+
         # Command routing dictionary
         self.command_routes = {
             # Project commands
@@ -578,6 +595,16 @@ class KiCADInterface(SchematicHandlersMixin):
             # Session state report (MCP_ISSUES I2); also backs the
             # kicad://project/status resource.
             "project_status": self._handle_project_status,
+            # BOM/sourcing (S4, S5), fab package (F3), snapshots/undo (I1),
+            # script escape hatch (I3)
+            "apply_property_map": apply_property_map,
+            "jlc_bom_report": jlc_bom_report,
+            "jlc_find_alternative": jlc_find_alternative,
+            "fab_package": fab_package,
+            "list_snapshots": self.snapshot_commands.list_snapshots,
+            "restore_snapshot": self.snapshot_commands.restore_snapshot,
+            "diff_snapshots": self.snapshot_commands.diff_snapshots,
+            "run_pcbnew_script": self.script_runner.run_pcbnew_script,
             # Board commands
             "set_board_size": self.board_commands.set_board_size,
             "set_board_origin": self.board_origin_commands.set_board_origin,
@@ -1120,6 +1147,10 @@ class KiCADInterface(SchematicHandlersMixin):
             if refusal:
                 return refusal
 
+            # Opt-in undo point (KICAD_MCP_AUTO_SNAPSHOT=1, MCP_ISSUES I1): copy
+            # the files this mutating tool can write; no-op otherwise, never raises.
+            auto_snapshot_id = maybe_auto_snapshot(self, command, params)
+
             if command in self.IPC_CAPABLE_COMMANDS and self._session_allows_ipc():
                 self._try_enable_ipc_backend()
                 # An IPC-pinned session whose connection died (GUI closed)
@@ -1185,6 +1216,8 @@ class KiCADInterface(SchematicHandlersMixin):
                 # Execute the command
                 result = handler(params)
                 logger.debug(f"Command result: {result}")
+                if auto_snapshot_id and isinstance(result, dict):
+                    result.setdefault("autoSnapshot", auto_snapshot_id)
 
                 # A command that wrote the .kicad_pcb itself (not through
                 # auto-save) reports it with this private key. Adopt the write
@@ -1403,6 +1436,7 @@ class KiCADInterface(SchematicHandlersMixin):
         "add_schematic_wire",
         "add_sheet_pin",
         "annotate_schematic",
+        "apply_property_map",
         "autoplace_schematic_fields",
         "backannotate_footprints",
         "batch_add_and_connect",
@@ -1430,6 +1464,7 @@ class KiCADInterface(SchematicHandlersMixin):
         "remove_schematic_component_property",
         "repair_flat_symbols",
         "replace_instance_lib_ids",
+        "restore_snapshot",
         "replace_schematic_component",
         "relabel_net",
         "rotate_schematic_component",
@@ -1444,6 +1479,7 @@ class KiCADInterface(SchematicHandlersMixin):
     # Whether a call writes, read the same way and with the same defaults as
     # each handler reads its parameters.
     _SCHEMATIC_WRITE_CONDITIONS = {
+        "apply_property_map": lambda p: not bool(p.get("dryRun", False)),
         "backannotate_footprints": lambda p: not bool(p.get("dryRun", False)),
         "enrich_datasheets": lambda p: not bool(p.get("dry_run", False)),
         "lint_offgrid": lambda p: bool(p.get("fix", False)),
@@ -1465,6 +1501,8 @@ class KiCADInterface(SchematicHandlersMixin):
             return []
         if command == "repair_flat_symbols":
             return [str(params["path"])]
+        if command == "restore_snapshot":
+            return restore_schematic_targets(params, None)
         if command == "create_schematic":
             # Same output path as create_schematic: `path` is a .kicad_sch file
             # or a directory. Only an existing file can be open and overwritten.

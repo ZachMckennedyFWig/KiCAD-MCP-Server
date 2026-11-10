@@ -164,6 +164,12 @@ export const MEDIUM_COMMANDS = [
   "find_duplicate_symbols",
   "search_jlcpcb_parts",
   "download_registry_part",
+  // Whole-hierarchy rewrites, catalog scans and whole-board text diffs (S4, S5, I1)
+  "apply_property_map",
+  "jlc_bom_report",
+  "jlc_find_alternative",
+  "diff_snapshots",
+  "restore_snapshot",
 ] as const;
 
 /**
@@ -183,6 +189,15 @@ export const JLCPCB_DOWNLOAD_TIMEOUT_MS = 3_600_000;
 
 /** Slack added to GUI tools that take their own `timeout` (seconds) parameters. */
 export const GUI_WAIT_OVERHEAD_MS = 30_000;
+
+/**
+ * `fab_package` runs several kicad-cli exports, a netlist export, DRC and ERC
+ * back to back (MCP_ISSUES F3); on a large board that is minutes.
+ */
+export const FAB_PACKAGE_TIMEOUT_MS = 1_800_000;
+
+/** Process start, board load and save around a `run_pcbnew_script` body. */
+export const SCRIPT_OVERHEAD_MS = 60_000;
 
 type Env = Record<string, string | undefined>;
 
@@ -232,6 +247,16 @@ export function computeCommandTimeout(
 
   if (command === "download_jlcpcb_database") {
     return JLCPCB_DOWNLOAD_TIMEOUT_MS;
+  }
+
+  if (command === "fab_package") {
+    return FAB_PACKAGE_TIMEOUT_MS;
+  }
+
+  if (command === "run_pcbnew_script") {
+    // The Python side kills the script at `timeout` seconds (default 60).
+    const scriptSec = Math.min(toPositiveNumber(p.timeout) ?? 60, 1800);
+    return Math.max(scriptSec * 1000 + SCRIPT_OVERHEAD_MS, MEDIUM_COMMAND_TIMEOUT_MS);
   }
   if ((CHECK_COMMANDS as readonly string[]).includes(command)) {
     return CHECK_COMMAND_TIMEOUT_MS;

@@ -94,6 +94,12 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set<string>([
   "search_parts_registry",
   "search_symbols",
   "suggest_jlcpcb_alternatives",
+  // JLC catalog reads (read-only SQLite) and snapshot inspection.
+  // restore_snapshot and run_pcbnew_script write the design: never here.
+  "jlc_bom_report",
+  "jlc_find_alternative",
+  "list_snapshots",
+  "diff_snapshots",
   // Board inspection. run_drc and get_drc_violations write a JSON report next
   // to the board; get_board_2d_view can write a preview image there.
   "check_clearance",
@@ -185,6 +191,8 @@ export const EXPORT_TOOLS: ReadonlySet<string> = new Set<string>([
   "export_schematic_svg",
   "export_svg",
   "export_vrml",
+  // Gerber/drill/BOM/CPL into outputDir plus check reports; reads the design only.
+  "fab_package",
 ]);
 
 /** Whether `mode` allows `tool`. */

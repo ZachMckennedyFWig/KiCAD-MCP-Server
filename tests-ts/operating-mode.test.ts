@@ -45,6 +45,10 @@ const MUST_STAY_WRITE = [
   "install_gui_driver",
   "kicad_gui_click",
   "refill_zones",
+  "apply_property_map",
+  "restore_snapshot",
+  // Executes arbitrary code: must never be reachable in readonly/manufacturing.
+  "run_pcbnew_script",
 ];
 
 const clients: Client[] = [];
@@ -119,6 +123,13 @@ describe("the mode lists", () => {
 
   it("keep tools that change things out of readonly", () => {
     expect(MUST_STAY_WRITE.filter((t) => READ_ONLY_TOOLS.has(t))).toEqual([]);
+  });
+
+  it("keep the arbitrary-code and restore tools out of manufacturing too", () => {
+    for (const tool of ["run_pcbnew_script", "restore_snapshot", "apply_property_map"]) {
+      expect(EXPORT_TOOLS.has(tool)).toBe(false);
+    }
+    expect(EXPORT_TOOLS.has("fab_package")).toBe(true);
   });
 
   it("include the discovery tools, so every mode can find its tools", () => {
