@@ -25,7 +25,17 @@ from commands.finishing_geom import (  # noqa: E402
     walk_polyline,
     walk_ring_evenly,
 )
-from commands.transplant import Transform, fit_transform, point_in_poly  # noqa: E402
+from commands.transplant import (  # noqa: E402
+    ANCHOR_WEIGHT,
+    Transform,
+    classify_mismatches,
+    derive_net_map,
+    find_reversed_parts,
+    fit_transform,
+    fit_via_size,
+    point_in_poly,
+    select_copy_nets,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -98,6 +108,97 @@ def test_point_in_poly_and_segment_helpers():
     assert point_seg_dist(-3, 4, 0, 0, 10, 0) == pytest.approx(5)
     assert seg_intersection_t((0, 0), (10, 0), (4, -1), (4, 1)) == pytest.approx(0.4)
     assert seg_intersection_t((0, 0), (10, 0), (0, 1), (10, 1)) is None
+
+
+# --------------------------------------------------------------------------- #
+# transplant net-map logic (R4, from the RP2350B transplant)
+# --------------------------------------------------------------------------- #
+
+
+def _rp2350_votes():
+    """The XOUT corner of the real transplant: the target's R21 is fitted reversed
+    relative to the reference's R2 (U1.31 -> R2.1 -> R2.2 -> C4)."""
+    return [
+        ("/XOUT", "/MCU/XOUT", ANCHOR_WEIGHT),  # U1.31 <-> U7.31
+        ("/XOUT", "/MCU/XTAL_OUT", 1),  # R2.1 <-> R21.1 (reversed)
+        ("Net-(C4-Pad1)", "/MCU/XOUT", 1),  # R2.2 <-> R21.2 (reversed)
+        ("Net-(C4-Pad1)", "/MCU/XTAL_OUT", 1),  # C4.1 <-> C47.1
+        ("GND", "GND", ANCHOR_WEIGHT),
+        ("GND", "GND", 1),
+    ]
+
+
+def test_derive_net_map_anchor_outvotes_reversed_passive():
+    derived, ambiguous = derive_net_map(_rp2350_votes(), {})
+    # without anchor weighting /XOUT was a 1:1 tie and both source nets folded
+    # onto /MCU/XTAL_OUT (reported as a netMerge, hiding the reversed R21)
+    assert derived["/XOUT"] == "/MCU/XOUT"
+    # the tie is broken towards the net no other source net has claimed
+    assert derived["Net-(C4-Pad1)"] == "/MCU/XTAL_OUT"
+    assert derived["GND"] == "GND"
+    assert [a["sourceNet"] for a in ambiguous] == ["Net-(C4-Pad1)"]
+
+
+def test_derive_net_map_respects_given_and_majority():
+    votes = [("A", "X", 3), ("A", "Y", 1), ("B", "Y", 1), ("C", "", 2)]
+    derived, ambiguous = derive_net_map(votes, {"B": "Z"})
+    assert derived == {"A": "X"}  # B is given; C only meets unconnected pads
+    assert not ambiguous
+
+
+def _pair(src_ref, src_net, tgt_ref, tgt_net, count=2):
+    return {
+        "srcRef": src_ref,
+        "srcNet": src_net,
+        "tgtRef": tgt_ref,
+        "tgtNet": tgt_net,
+        "tgtPadCount": count,
+    }
+
+
+def test_find_reversed_parts():
+    net_map = {"/XOUT": "/MCU/XOUT", "Net-(C4-Pad1)": "/MCU/XTAL_OUT", "GND": "GND"}
+    pairs = [
+        _pair("R2", "/XOUT", "R21", "/MCU/XTAL_OUT"),
+        _pair("R2", "Net-(C4-Pad1)", "R21", "/MCU/XOUT"),
+        _pair("C4", "Net-(C4-Pad1)", "C47", "/MCU/XTAL_OUT"),
+        _pair("C4", "GND", "C47", "GND"),
+    ]
+    rev = find_reversed_parts(pairs, net_map)
+    assert [(r["targetRef"], r["sourceRef"]) for r in rev] == [("R21", "R2")]
+    assert "180" in rev[0]["hint"]
+    # a part with more pads whose two pads are swapped is not called "reversed"
+    for p in pairs[:2]:
+        p["tgtPadCount"] = 3
+    assert find_reversed_parts(pairs, net_map) == []
+
+
+def test_select_copy_nets_and_blocking():
+    net_map = {"+1V1": "/MCU/+1V1", "GND": "GND", "/GPIO0": "IDE_D0", "/XOUT": "/MCU/XOUT"}
+    assert select_copy_nets(net_map, None) == set(net_map)
+    # names may be given in either board's terms
+    assert select_copy_nets(net_map, ["/MCU/+1V1", "GND"]) == {"+1V1", "GND"}
+    found = [
+        {"type": "netMismatch", "sourceNet": "/XOUT"},
+        {"type": "padOffset", "sourceNet": "+1V1"},
+        {"type": "missingTargetPad", "sourceNet": "/GPIO0"},
+        {"type": "netMerge", "sourceNets": ["/GPIO0", "GND"]},
+        {"type": "anchorPadMissing"},
+    ]
+    n = classify_mismatches(found, {"+1V1", "GND"})
+    assert [m["blocking"] for m in found] == [False, True, False, True, True]
+    assert n == 3
+
+
+def test_fit_via_size_grows_to_board_minimums():
+    def nm(v):
+        return int(round(v * MM))
+
+    # the RP2350B reference's 0.6/0.25 vias on a board with a 0.3 mm minimum drill
+    assert fit_via_size(nm(0.6), nm(0.25), nm(0.5), nm(0.3), nm(0.1)) == (nm(0.6), nm(0.3))
+    # the annular ring can force a larger diameter
+    assert fit_via_size(nm(0.45), nm(0.2), 0, nm(0.3), nm(0.1)) == (nm(0.5), nm(0.3))
+    assert fit_via_size(800, 400, 0, 0, 0) == (800, 400)
 
 
 def test_disk_hits_numeric_obstacles():

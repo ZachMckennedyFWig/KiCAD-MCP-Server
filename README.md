@@ -23,8 +23,8 @@ The [Model Context Protocol](https://modelcontextprotocol.io/) is an open standa
 
 **Key Capabilities:**
 
-- 289 tools registered, every one of them indexed for keyword discovery
-- 289 tools across 25 categories with JSON Schema validation
+- 291 tools registered, every one of them indexed for keyword discovery
+- 291 tools across 25 categories with JSON Schema validation
 - Keyword tool discovery via `search_tools` / `get_category_tools`
 - Optional toolboxes: start with a 37-tool core and open the rest by category,
   to save context and stay under client tool limits
@@ -797,10 +797,10 @@ Access project state without executing tools:
 
 ## Available Tools
 
-The server exposes every tool directly, so your assistant can call any of them without a discovery step -- just ask for what you want to accomplish. All **289 tools** are also indexed into 25 functional categories, so `search_tools` and `get_category_tools` can find one by keyword, and each category doubles as a [toolbox](#toolboxes).
+The server exposes every tool directly, so your assistant can call any of them without a discovery step -- just ask for what you want to accomplish. All **291 tools** are also indexed into 25 functional categories, so `search_tools` and `get_category_tools` can find one by keyword, and each category doubles as a [toolbox](#toolboxes).
 
 The lists below are a curated tour of the most useful tools, not the full set.
-For the complete, generated reference of all 289 tools -- including how each one
+For the complete, generated reference of all 291 tools -- including how each one
 is discovered -- see [Tool Inventory](docs/TOOL_INVENTORY.md).
 
 ### Project Management (12 tools)
@@ -854,7 +854,7 @@ is discovered -- see [Tool Inventory](docs/TOOL_INVENTORY.md).
 - `get_component_geometry` / `check_placement_clearance` - Body sizes and overlap checks
 - `get_ratsnest` / `estimate_airwire_lengths` - Unrouted connection analysis
 
-### Routing (17 tools)
+### Routing (20 tools)
 
 - `add_net` - Create electrical net
 - `route_trace` - Route copper traces between XY points
@@ -866,13 +866,16 @@ is discovered -- see [Tool Inventory](docs/TOOL_INVENTORY.md).
 - `modify_trace` - Change trace width, layer, or net
 - `create_netclass` - Define net class with rules
 - `add_copper_pour` - Create copper zones/pours
-- `route_differential_pair` - Route differential signals
+- `route_differential_pair` - Route differential signals; `targetImpedance` solves width/gap from the stackup
+- `calculate_impedance` - Single-ended or differential impedance for a layer from the board stackup, or the width/gap for a target
 - `refill_zones` - Refill all copper zones
 - `copy_routing_pattern` - Replicate routing between component groups
 - `set_net_color` - Set or clear a net's display color override
 - `route_arc_trace` - Route a curved trace
 - `add_gnd_stitching_vias` - Stitch a ground plane with vias
 - `query_zones` - Inspect copper zones
+- `summarize_vias` - Summarize the vias on the board (counts, not coordinates)
+- `summarize_net_copper` - Count the tracks, vias and zones on a net
 
 ### Schematic (46 tools)
 
@@ -1127,6 +1130,32 @@ The default configuration path is
 `--claude-config PATH` for a client using the same JSON format or a nonstandard location, and set
 `KICAD_PYTHON=/path/to/python3` if KiCad's Python cannot be detected automatically.
 
+**Using a uv virtual environment (optional):** instead of `pip3 install`, let
+[uv](https://docs.astral.sh/uv/) install the locked dependencies into a
+project-local `.venv`:
+
+```bash
+./setup-linux.sh --apply --use-uv
+```
+
+or by hand:
+
+```bash
+uv venv .venv --python /usr/bin/python3 --system-site-packages
+uv sync --no-dev
+.venv/bin/python -c "import pcbnew; print(pcbnew.GetBuildVersion())"
+```
+
+KiCad on Linux installs `pcbnew` into the system Python's `dist-packages`, so
+build the venv from the interpreter that imports it (`/usr/bin/python3` on
+Ubuntu/Debian) with `--system-site-packages`. Pass `--python` explicitly: uv
+otherwise prefers a Python it manages itself when one is installed, and that
+interpreter cannot see `pcbnew`. If `pcbnew` lives outside the system
+site-packages (for example under `/usr/lib/kicad/lib/python3/dist-packages`),
+`--use-uv` adds that directory to `.venv` through a `.pth` file; by hand, write
+the directory into `.venv/lib/python3.X/site-packages/kicad_pcbnew.pth`. See
+[Windows](#windows-1011) below for why the MCP config then needs no `PYTHONPATH`.
+
 ### Windows 10/11
 
 **Automated Setup (Recommended):**
@@ -1170,6 +1199,9 @@ that interpreter. The server uses `.venv` automatically when it exists, so do
 not set `PYTHONPATH` or `KICAD_PYTHON` in your MCP config. A `PYTHONPATH` would
 put KiCAD's bundled Pillow/requests ahead of the versions pinned in `uv.lock`.
 Re-run the setup script (it recreates `.venv`) after upgrading KiCAD.
+The same workflow is available on [Linux](#linux-ubuntudebian)
+(`./setup-linux.sh --apply --use-uv`) and [macOS](#macos)
+(`./setup-macos.sh --apply --use-uv`).
 
 **Manual Setup:**
 See [Platform Guide](docs/PLATFORM_GUIDE.md) for detailed instructions, and
@@ -1204,6 +1236,26 @@ npm run build
 ```
 
 **Note:** The `--system-site-packages` flag is required to access KiCAD's `pcbnew` module from the virtual environment.
+
+**Using a uv virtual environment (optional):** uv can build the venv instead
+and install the versions pinned in `uv.lock` (uv venvs have no `pip`):
+
+```bash
+./setup-macos.sh --apply --use-uv
+```
+
+or by hand:
+
+```bash
+uv venv .venv --python /Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3 --system-site-packages
+uv sync --no-dev
+```
+
+As on the other platforms, pass KiCad's Python with `--python` (uv would
+otherwise pick its own or Homebrew's Python, which cannot load `pcbnew`), and
+leave `PYTHONPATH` and `KICAD_PYTHON` out of the MCP config: the server finds
+`.venv` on its own. If an older `venv/` directory is also present, the server
+uses that one, so remove it.
 
 **Note:** If you skip the virtual environment, install the requirements with KiCAD's bundled interpreter — a plain `pip3 install -r requirements.txt` goes to system Python, which the server never uses, and the server then fails to start (the MCP client times out after 30s with no visible error):
 

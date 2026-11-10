@@ -283,6 +283,85 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
   );
 
   server.tool(
+    "calculate_impedance",
+    "Estimate controlled impedance on a copper layer from the board stackup, or solve the trace width (or pair gap) for a target. Outer layers are surface microstrip (Hammerstad-Jensen; edge-coupled pairs Kirschning-Jansen), inner layers stripline between the adjacent copper layers (Wheeler; pairs Cohn), offset when the two dielectric heights differ. Returns Z0, or Zdiff/Zodd/Zeven/Zcommon, with the stackup geometry used, the model, and an accuracy note (about +/-5% of a field solver; solder mask, etch and dispersion not modelled). A board without a stackup falls back to a JLC-like 1.6 mm default and says so. Read-only.",
+    {
+      layer: z.string().describe("Copper layer of the trace, e.g. F.Cu or In2.Cu"),
+      mode: z
+        .enum(["single", "differential"])
+        .optional()
+        .describe(
+          "single-ended trace or edge-coupled pair. Defaults to differential when gap or targetDiffImpedance is given",
+        ),
+      width: z
+        .number()
+        .positive()
+        .optional()
+        .describe("Trace width in mm. Kept fixed when solving a pair's gap"),
+      gap: z
+        .number()
+        .positive()
+        .optional()
+        .describe(
+          "Edge-to-edge gap of the pair in mm. Kept fixed when solving the width (default 0.2)",
+        ),
+      targetImpedance: z
+        .number()
+        .positive()
+        .optional()
+        .describe("Single-ended Z0 target in ohms (mode single); solves the width"),
+      targetDiffImpedance: z
+        .number()
+        .positive()
+        .optional()
+        .describe(
+          "Differential target in ohms (mode differential), e.g. 90 USB, 100 Ethernet/LVDS. Solves the gap when only width is given, otherwise the width",
+        ),
+      minWidth: z
+        .number()
+        .positive()
+        .optional()
+        .describe(
+          "Smallest width the solver may return, mm (default: the board's minimum track width, else 0.05)",
+        ),
+      maxWidth: z
+        .number()
+        .positive()
+        .optional()
+        .describe("Largest width the solver may return, mm (default 5)"),
+      minGap: z
+        .number()
+        .positive()
+        .optional()
+        .describe(
+          "Smallest gap the solver may return, mm (default: the board's minimum clearance, else 0.05)",
+        ),
+      maxGap: z
+        .number()
+        .positive()
+        .optional()
+        .describe("Largest gap the solver may return, mm (default 5)"),
+      referenceLayers: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Copper layers that are solid reference planes. Default: the copper layers directly above and below the trace layer",
+        ),
+    },
+    async (args) => {
+      const result = await callKicadScript("calculate_impedance", args);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
     "summarize_net_copper",
     "Summarize one net's copper without listing every track, via, and zone. Returns the three counts, the layers involved, the bounding box, and a shape: vias_only, tracks_only, zones_only, empty, or mixed. vias_only means the net has vias and neither tracks nor zones. An unknown net is an error, not an empty shape.",
     {
@@ -544,7 +623,7 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
   // Route differential pair tool
   server.tool(
     "route_differential_pair",
-    "Route a differential pair as two parallel straight segments. startPos and endPos are the pair's centreline; looking from start to end on the board (y down), the positive trace runs on the right and the negative on the left, each offset by (gap + width) / 2.",
+    "Route a differential pair as two parallel straight segments. startPos and endPos are the pair's centreline; looking from start to end on the board (y down), the positive trace runs on the right and the negative on the left, each offset by (gap + width) / 2. Pass targetImpedance (differential ohms) to size width or gap from the layer's stackup. The result always reports impedance: the estimated Zdiff, Zodd and Zeven for the width and gap actually used (closed-form, about +/-5% of a field solver; solder mask not modelled).",
     {
       startPos: z
         .object({
@@ -561,8 +640,25 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
         })
         .describe("End of the pair's centreline"),
       layer: z.string().describe("PCB layer"),
-      width: z.number().describe("Trace width in mm"),
-      gap: z.number().describe("Edge-to-edge gap between the two traces in mm"),
+      width: z
+        .number()
+        .optional()
+        .describe(
+          "Trace width in mm. Optional with targetImpedance (solved from the stackup); otherwise defaults to the board's current track width",
+        ),
+      gap: z
+        .number()
+        .optional()
+        .describe(
+          "Edge-to-edge gap between the two traces in mm. Defaults to the net class diff-pair gap with targetImpedance, else 0.2",
+        ),
+      targetImpedance: z
+        .number()
+        .positive()
+        .optional()
+        .describe(
+          "Differential impedance target in ohms, e.g. 90 for USB or 100 for Ethernet/LVDS. When width and gap are not both given, the missing one is solved from the layer's stackup: a given width is kept and the gap solved, otherwise the gap is kept and the width solved",
+        ),
       positiveNet: z.string().describe("Positive net name"),
       negativeNet: z.string().describe("Negative net name"),
     },

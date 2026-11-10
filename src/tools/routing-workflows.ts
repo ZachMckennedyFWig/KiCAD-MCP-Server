@@ -1,7 +1,8 @@
 /**
  * Routing workflow tools (MCP_ISSUES R1, R3, R5): plane fan-out, a grid A*
- * single-connection router, bus routing on top of it, and a length report.
- * Python side: python/commands/fanout.py and python/commands/astar_router.py.
+ * single-connection router, bus routing on top of it, a length report and
+ * serpentine length tuning. Python side: python/commands/fanout.py,
+ * python/commands/astar_router.py and python/commands/length_tuning.py.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -154,7 +155,7 @@ export function registerRoutingWorkflowTools(server: McpServer, callKicadScript:
 
   server.tool(
     "route_bus",
-    "Route several connections (e.g. an I2S/MCLK bundle) one after another with route_connection; each later connection treats the earlier ones as obstacles, and pitch (centre-to-centre, mm) sets the minimum spacing between bus members (their mutual clearance becomes pitch - width). It does not force parallel geometry. All connections are written together or none. Units mm. Returns {results:[route_connection results], written}.",
+    "Route several connections as a bus (e.g. an I2S/MCLK bundle). mode 'parallel' (default) routes a true parallel bundle: one guide corridor wide enough for every member is found with the A* router (on `layer`; layer changes only with allowVias and pitch >= via + clearance), each member's trunk is the guide offset by its lane x pitch with miter joins (octilinear, spacing = pitch measured perpendicular; outer traces are longer on bends), members are ordered across the bundle by their start pads (or `order`), and short A* fan-in/fan-out legs join the pads to the trunk ends. Everything is re-checked with exact clearance before an all-or-nothing write. If no corridor/legs/clearance work it falls back to mode 'sequential' and says why (modeUsed, fallbackReason). mode 'sequential' routes the connections one after another, later ones treating earlier ones as obstacles with mutual clearance pitch - width (no parallel geometry). Typical time: 1-5 s for 3-4 nets over 40 mm on a dense 4-layer board. Units mm. Returns {modeUsed, fallbackReason?, results:[per member: net, from, to, offsetMm, lengthMm, trunkLengthMm, legLengthsMm, segments, vias], lengths, lengthSpreadMm, segments, vias, order, pitch, layer, guide, parallelism:[{nets, trunkAtPitch, routeAtPitch}], notes, written}.",
     {
       connections: z
         .array(
@@ -165,8 +166,53 @@ export function registerRoutingWorkflowTools(server: McpServer, callKicadScript:
             width: z.number().optional(),
           }),
         )
-        .describe("Connections in routing order"),
-      pitch: z.number().optional().describe("Centre-to-centre spacing between bus members in mm"),
+        .describe(
+          "Bus members (sequential mode: routing order). Omit from/to to route each net's closest missing connection",
+        ),
+      pitch: z
+        .number()
+        .optional()
+        .describe(
+          "Centre-to-centre spacing between bus members in mm (parallel default: width + clearance rounded up to 0.05; raised to that minimum if smaller)",
+        ),
+      mode: z
+        .enum(["parallel", "sequential"])
+        .optional()
+        .describe("'parallel' (default): side-by-side bundle; 'sequential': one after another"),
+      order: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Parallel: nets from left to right looking from the 'from' end along the bundle (default: by start pad position)",
+        ),
+      layer: z
+        .string()
+        .optional()
+        .describe(
+          "Parallel: layer of the bundle trunk (default: preferLayer or the first allowed layer)",
+        ),
+      allowVias: z
+        .boolean()
+        .optional()
+        .describe(
+          "Parallel: let the trunk change layers (needs pitch >= via size + clearance) and the legs use vias (default false)",
+        ),
+      breakoutRadius: z
+        .number()
+        .optional()
+        .describe(
+          "Parallel: fixed distance in mm from each end's pad centroid where the trunk may start/end (default: adaptive)",
+        ),
+      legRoom: z
+        .number()
+        .optional()
+        .describe(
+          "Parallel: extra room in mm kept between the pads and the trunk ends for the fan-in legs (default 0.8, + via size with allowVias)",
+        ),
+      timeBudget: z
+        .number()
+        .optional()
+        .describe("Parallel: seconds to spend before falling back to sequential (default 60)"),
       ...routeParams,
     },
     async (args: any) => formatKicadResult(await callKicadScript("route_bus", args)),
@@ -174,7 +220,7 @@ export function registerRoutingWorkflowTools(server: McpServer, callKicadScript:
 
   server.tool(
     "length_match",
-    "Report the routed length of nets and differential pairs against a target (R5). Length = sum of the net's track/arc lengths (vias and pad internals excluded). target defaults to the longest net in the set. Report only: it does not add serpentine tuning. Units mm. Returns {targetMm, toleranceMm, allWithinTolerance, nets:[{net,lengthMm,deltaMm,withinTolerance,addMm,segments,vias,routed}], pairs:[{positive,negative,skewMm,withinTolerance,shorter}]}.",
+    "Report the routed length of nets and differential pairs against a target (R5). Length = sum of the net's track/arc lengths (vias and pad internals excluded). target defaults to the longest net in the set. Report only (read-only tool): use tune_length to add serpentine meanders. Units mm. Returns {targetMm, toleranceMm, allWithinTolerance, nets:[{net,lengthMm,deltaMm,withinTolerance,addMm,segments,vias,routed}], pairs:[{positive,negative,skewMm,withinTolerance,shorter}]}.",
     {
       nets: z.array(z.string()).optional().describe("Nets to compare"),
       pairs: z
@@ -186,5 +232,74 @@ export function registerRoutingWorkflowTools(server: McpServer, callKicadScript:
       pairTolerance: z.number().optional().describe("Allowed pair skew in mm (default: tolerance)"),
     },
     async (args: any) => formatKicadResult(await callKicadScript("length_match", args)),
+  );
+
+  server.tool(
+    "tune_length",
+    "Serpentine (meander) length tuning: replace part of straight track segments of a net with a meander that adds exactly the missing length (KiCad-style 45-degree chamfered corners by default). Target: targetLength (mm), or matchTo (a net, or a list of nets = their longest), or nets:[...] alone (tune all up to the longest). pairs:[[P,N]] tunes each pair's shorter member up to its partner with small, tight bumps. Segments are used longest first (or the given segments uuids / region); the missing length is spread over several segments if one is not enough, and the amplitude shrinks next to obstacles. Every meander is checked against other-net copper, pads, holes, keepouts, the board edge and the net's own copper (project net-class clearances) on both sides and at smaller amplitudes; segments that do not fit are skipped with a reason. Only adds length (a net longer than the target is reported, not shortened). All meanders are written in one transaction or none. Zone fills are not obstacles: refill zones and run DRC after. Units mm. Returns {allWithinTolerance, nets:[{net,targetMm,beforeMm,plannedMm,afterMm?,addedMm,remainingMm,status:'tuned'|'partial'|'notTuned'|'withinTolerance'|'tooLong',meanders,segments:[{uuid,layer,segmentLengthMm,meanders,addedMm,amplitudeMm,side}],skipped:[{uuid,reason}]}], segmentsReplaced, meanders, written}. Nothing is written with dryRun.",
+    {
+      net: z.string().optional().describe("Net to tune"),
+      nets: z
+        .array(z.string())
+        .optional()
+        .describe("Several nets to tune to the same target (default target: the longest of them)"),
+      targetLength: z.number().optional().describe("Target routed length in mm"),
+      matchTo: z
+        .union([z.string(), z.array(z.string())])
+        .optional()
+        .describe("Match the length of this net, or of the longest of these nets"),
+      pairs: z
+        .array(z.array(z.string()))
+        .optional()
+        .describe("Differential pairs [positiveNet, negativeNet]: the shorter member is tuned"),
+      tolerance: z
+        .number()
+        .optional()
+        .describe("Nets this close to the target (mm) are left alone (default 0.1)"),
+      pairTolerance: z.number().optional().describe("Allowed pair skew in mm (default: tolerance)"),
+      amplitude: z
+        .number()
+        .optional()
+        .describe(
+          "Largest meander height from the track centre line in mm (default 1.0; pairs max(2 x width, 0.3))",
+        ),
+      spacing: z
+        .number()
+        .optional()
+        .describe(
+          "Meander pitch (centre-to-centre of adjacent legs) in mm (default max(3 x width, width + clearance); pairs max(2 x width, width + clearance))",
+        ),
+      style: z
+        .enum(["trombone", "accordion", "rounded"])
+        .optional()
+        .describe(
+          "trombone: single-sided bumps (default); accordion: alternating sides, more length per mm; rounded: trombone with arc corners",
+        ),
+      corner: z
+        .enum(["chamfer", "round", "square"])
+        .optional()
+        .describe("Corner shape: 45-degree chamfer (default), tangent arc, or square"),
+      segments: z
+        .array(z.string())
+        .optional()
+        .describe("Only these track segments (KiCad UUIDs, e.g. from query_traces), in this order"),
+      region: region
+        .optional()
+        .describe("Only place meanders whose base lies inside this rectangle/polygon (mm)"),
+      layers: z.array(z.string()).optional().describe("Only tune segments on these copper layers"),
+      clearance: z
+        .number()
+        .optional()
+        .describe(
+          "Clearance to other-net copper in mm (default: the net-class clearances; .kicad_dru custom rules are not applied, run DRC after)",
+        ),
+      allowLocked: z
+        .boolean()
+        .optional()
+        .describe("Also tune locked segments (default false: they are skipped)"),
+      locked: z.boolean().optional().describe("Lock the new meander pieces (default false)"),
+      dryRun: z.boolean().optional().describe("Plan and check only; write nothing"),
+    },
+    async (args: any) => formatKicadResult(await callKicadScript("tune_length", args)),
   );
 }

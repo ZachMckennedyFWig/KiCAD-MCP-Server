@@ -5,8 +5,8 @@
      in this file are preserved, so improving the wording here is safe. -->
 
 **Version:** 2.8.3
-**Tools registered on the server:** 289
-**Tools indexed for keyword discovery:** 289 in 25 categories
+**Tools registered on the server:** 291
+**Tools indexed for keyword discovery:** 291 in 25 categories
 **Last updated:** 2026-11-10
 
 ## How to read this document
@@ -119,7 +119,7 @@ _Source: `src/tools/component.ts`_
 
 ---
 
-## Routing (19 tools)
+## Routing (20 tools)
 
 _Source: `src/tools/routing.ts`_
 
@@ -133,6 +133,7 @@ _Source: `src/tools/routing.ts`_
 | `delete_trace`            | Delete traces by UUID, position, or bulk by net                                                                                                 | `routing` |
 | `query_traces`            | Query/filter traces by net, layer, or bounding box                                                                                              | `routing` |
 | `summarize_vias`          | Count vias on the board without listing them.                                                                                                   | `routing` |
+| `calculate_impedance`     | Estimate controlled impedance on a copper layer from the board stackup, or solve the trace width (or pair gap) for a target.                    | `routing` |
 | `summarize_net_copper`    | Summarize one net's copper without listing every track, via, and zone.                                                                          | `routing` |
 | `query_zones`             | Query copper zones (filled pours) on the board with optional filters by net, layer, or bounding box.                                            | `routing` |
 | `add_gnd_stitching_vias`  | Drop GND stitching vias across the board with collision checking against every non-GND segment, via, and pad on every copper layer (PTH vias... | `routing` |
@@ -583,7 +584,7 @@ _Source: `src/tools/jobs.ts`_
 
 ---
 
-## routing-workflows.ts (4 tools)
+## routing-workflows.ts (5 tools)
 
 _Source: `src/tools/routing-workflows.ts`_
 
@@ -593,6 +594,7 @@ _Source: `src/tools/routing-workflows.ts`_
 | `route_connection` | Route one connection of a net with a grid A\* router (R3): 45-degree moves on the allowed copper layers, layer changes through vias, obstacles =... | `routing_workflows` |
 | `route_bus`        | Route several connections (e.g.                                                                                                                     | `routing_workflows` |
 | `length_match`     | Report the routed length of nets and differential pairs against a target (R5).                                                                      | `routing_workflows` |
+| `tune_length`      | Serpentine (meander) length tuning: replace part of straight track segments of a net with a meander that adds exactly the missing length...         | `routing_workflows` |
 
 ---
 
@@ -615,7 +617,7 @@ _Source: `src/tools/toolboxes.ts`_
 | `project.ts`             | Project and Board Files                | 13      |
 | `board.ts`               | Board Management                       | 21      |
 | `component.ts`           | Component Management                   | 27      |
-| `routing.ts`             | Routing                                | 19      |
+| `routing.ts`             | Routing                                | 20      |
 | `design-rules.ts`        | Design Rules and DRC                   | 7       |
 | `export.ts`              | Export and Fabrication Output          | 25      |
 | `schematic.ts`           | Schematic                              | 48      |
@@ -642,13 +644,13 @@ _Source: `src/tools/toolboxes.ts`_
 | `finishing.ts`           | finishing.ts                           | 5       |
 | `gui-driver.ts`          | gui-driver.ts                          | 11      |
 | `jobs.ts`                | jobs.ts                                | 4       |
-| `routing-workflows.ts`   | routing-workflows.ts                   | 4       |
+| `routing-workflows.ts`   | routing-workflows.ts                   | 5       |
 | `toolboxes.ts`           | toolboxes.ts                           | 3       |
-| **Total**                |                                        | **289** |
+| **Total**                |                                        | **291** |
 
 ## Summary by discovery category
 
-These are the categories `search_tools` searches. They cover 289 of the 289 registered tools.
+These are the categories `search_tools` searches. They cover 291 of the 291 registered tools.
 
 | Category                   | Tools indexed |
 | -------------------------- | ------------- |
@@ -663,11 +665,11 @@ These are the categories `search_tools` searches. They cover 289 of the 289 regi
 | `schematic_hierarchy`      | 7             |
 | `schematic_layout`         | 12            |
 | `schematic_batch`          | 7             |
-| `routing`                  | 19            |
+| `routing`                  | 20            |
 | `inspection`               | 4             |
 | `finishing`                | 5             |
 | `autoroute`                | 4             |
-| `routing_workflows`        | 4             |
+| `routing_workflows`        | 5             |
 | `jobs`                     | 4             |
 | `validation`               | 2             |
 | `footprint`                | 5             |
@@ -677,6 +679,6 @@ These are the categories `search_tools` searches. They cover 289 of the 289 regi
 | `digikey`                  | 3             |
 | `gui-driver`               | 11            |
 | `snapshots`                | 4             |
-| **Indexed total**          | **289**       |
+| **Indexed total**          | **291**       |
 | Registered but not indexed | 0             |
-| **Registered total**       | **289**       |
+| **Registered total**       | **291**       |

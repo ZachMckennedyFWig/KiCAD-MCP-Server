@@ -10,6 +10,8 @@ Each tool includes:
 - outputSchema: Optional JSON Schema for return values (structured content)
 """
 
+import json
+from pathlib import Path
 from typing import Any, Dict
 
 from utils.duplicate_strategies import DEFAULT_DUPLICATE_STRATEGIES, DUPLICATE_STRATEGIES
@@ -4243,4 +4245,13 @@ for tool in (
 ):
     TOOL_SCHEMAS[tool["name"]] = tool
 
-# Total: 46 tools with comprehensive schemas
+# Every tool without a hand-written entry above takes the schema the TypeScript
+# server advertises (its zod definitions, which MCP clients validate against).
+# generated_tool_schemas.json is refreshed by `npm run schemas:python`.
+_GENERATED_PATH = Path(__file__).with_name("generated_tool_schemas.json")
+try:
+    GENERATED_TOOL_SCHEMAS: Dict[str, Any] = json.loads(_GENERATED_PATH.read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    GENERATED_TOOL_SCHEMAS = {}
+for _name, _schema in GENERATED_TOOL_SCHEMAS.items():
+    TOOL_SCHEMAS.setdefault(_name, _schema)

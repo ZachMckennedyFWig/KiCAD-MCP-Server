@@ -251,11 +251,17 @@ export function registerFinishingTools(server: McpServer, callKicadScript: Funct
     "transplant_layout",
     "Copy routing (tracks, arcs, vias, zones, rule areas) from a reference .kicad_pcb around a source anchor footprint onto the loaded board around a target anchor, " +
       "using the anchor-to-anchor transform (rotation + translation, mirrored when the anchors are on opposite sides; fitted to the anchor pads). " +
-      "First verifies every source pad in the region: a target pad must be at the transformed position (+/- tolerance) with the mapped net. The net map is derived from that " +
-      "pad correspondence unless netMap is given. Mismatches abort unless force. After copying it refills zones and reports pour-island splits, orphaned items, " +
-      "rule areas that routers treat as obstacles, and shorts to existing copper (shorts roll the copy back unless force). " +
-      "Units mm. Returns {transform:{rotationDeg,mirrored,...}, verification:{padsChecked,padsMatched,mismatchCount,mismatches}, netMap:{count,derived,renamed}, " +
-      "copied:{tracks,arcs,vias,zones,ruleAreas}, skipped, report:{pourIslands,orphaned,ruleAreas,shorts,connectivity}, saved}.",
+      "First verifies every source pad in the region: a target pad must be at the transformed position (+/- tolerance) with the mapped net. A source pad lying wholly on a " +
+      "same-numbered target pad (an exposed pad split differently) is accepted and listed under offsetPads; a displaced pad is a padOffset mismatch. The net map is derived " +
+      "from the pad correspondence (anchor pins outvote passives) unless netMap is given; two-pad parts with swapped nets are reported as reversedParts. " +
+      "Mismatches on nets being copied abort unless force; mismatches on other nets are reported with blocking=false. `nets` restricts the copy (e.g. only the power nets). " +
+      "Plated holes in source pads whose target pad has none (exposed-pad via arrays) become board vias (include pad_vias). Copied vias are grown to the board's minimum via size/drill (fitVias). " +
+      "Items already present on the target are not duplicated. After copying it refills zones and reports pour-island splits, orphaned items (with the reason, e.g. it ended in a " +
+      "reference pour that was not copied), rule areas that routers treat as obstacles, net-class clearance violations and shorts to existing copper " +
+      "(shorts roll the copy back unless force; skipConflicting drops the offending items instead). " +
+      "Units mm. Returns {transform:{rotationDeg,mirrored,...}, verification:{padsChecked,padsMatched,mismatchCount,blockingCount,mismatches,offsetPads,reversedParts}, " +
+      "netMap:{count,derived,copied,renamed}, copied:{tracks,arcs,vias,zones,ruleAreas,padVias}, skipped:{unmappedNet,notSelected,crossingRegion,partialZones,alreadyPresent,...}, " +
+      "report:{pourIslands,orphaned,ruleAreas,shorts,clearance,clearanceToMatchedPads,viasResized,droppedConflicting,connectivity}, saved}.",
     {
       sourceBoard: z.string().describe("Path to the reference .kicad_pcb"),
       sourceAnchorRef: z
@@ -282,17 +288,40 @@ export function registerFinishingTools(server: McpServer, callKicadScript: Funct
         .optional()
         .describe("Margin around the anchor courtyard for the default region, mm (default 3)"),
       include: z
-        .array(z.enum(["tracks", "vias", "zones", "rule_areas"]))
+        .array(z.enum(["tracks", "vias", "zones", "rule_areas", "pad_vias"]))
         .optional()
-        .describe("Item kinds to copy (default all)"),
+        .describe(
+          "Item kinds to copy (default all). pad_vias: board vias where a source pad has a plated hole and the target pad has none",
+        ),
+      nets: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Copy only these nets (source or target names); default every mapped net. Pad mismatches on other nets do not block",
+        ),
       verify: z.boolean().optional().describe("Abort on pad mismatches (default true)"),
-      force: z.boolean().optional().describe("Copy despite mismatches or shorts (default false)"),
+      force: z
+        .boolean()
+        .optional()
+        .describe("Copy despite blocking mismatches or shorts (default false)"),
       tolerance: z.number().optional().describe("Pad position tolerance in mm (default 0.05)"),
       replaceExisting: z
         .boolean()
         .optional()
         .describe(
-          "First remove the target's tracks/vias of mapped nets inside the region (vias in pads are kept)",
+          "First remove the target's tracks/vias, zones and rule areas of the copied nets lying wholly inside the region (vias in same-net pads are kept)",
+        ),
+      fitVias: z
+        .boolean()
+        .optional()
+        .describe(
+          "Grow copied vias to the board's minimum via diameter/drill/annular ring (default true)",
+        ),
+      skipConflicting: z
+        .boolean()
+        .optional()
+        .describe(
+          "Drop copied tracks/vias that short or violate net-class clearance against existing copper instead of rolling back (default false)",
         ),
       refill: z.boolean().optional().describe("Refill zones after copying (default true)"),
       fullNetMap: z

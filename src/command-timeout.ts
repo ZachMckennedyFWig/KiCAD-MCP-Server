@@ -180,6 +180,8 @@ export const MEDIUM_COMMANDS = [
   // fan-out, and job_apply's board reload can each pass 30 s on a big board.
   "route_connection",
   "fanout_to_planes",
+  // Per-slot clearance searches over several segments and nets.
+  "tune_length",
   "job_apply",
   "job_cancel",
 ] as const;
@@ -269,6 +271,14 @@ export function computeCommandTimeout(
     // The Python side kills the script at `timeout` seconds (default 60).
     const scriptSec = Math.min(toPositiveNumber(p.timeout) ?? 60, 1800);
     return Math.max(scriptSec * 1000 + SCRIPT_OVERHEAD_MS, MEDIUM_COMMAND_TIMEOUT_MS);
+  }
+
+  if (command === "route_bus") {
+    // Parallel mode searches for up to `timeBudget` seconds (default 60), then
+    // may fall back to routing each member in turn, which takes about as long
+    // again on a dense board.
+    const budgetSec = Math.min(toPositiveNumber(p.timeBudget) ?? 60, 1800);
+    return Math.max(2 * budgetSec * 1000 + SCRIPT_OVERHEAD_MS, LONG_COMMAND_TIMEOUT_MS);
   }
 
   // Board edits with `drcDelta` save and run a full DRC (two when the last

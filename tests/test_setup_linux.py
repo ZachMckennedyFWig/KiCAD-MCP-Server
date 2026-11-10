@@ -156,3 +156,146 @@ def test_apply_rejects_invalid_config_without_writing(setup_repo, original):
     assert result.returncode == 1
     assert config.read_text() == original
     assert not list(repo.glob("client.json.*"))
+
+
+# --- --use-uv ------------------------------------------------------------- #
+#
+# A fake uv stands in for the real one: "uv venv" builds a stdlib venv marked
+# the way uv marks its own (a "uv = ..." line in pyvenv.cfg), and "uv sync"
+# drops the runtime modules into it. The base interpreter is itself a venv
+# whose pcbnew comes from a .pth, so --system-site-packages does not reach it
+# and the script must add pcbnew's directory to .venv on its own.
+
+FAKE_UV = r"""#!/usr/bin/env bash
+set -euo pipefail
+echo "uv $*" >> "$FAKE_UV_LOG"
+cmd="$1"; shift
+case "$cmd" in
+  venv)
+    target="$1"; shift
+    python=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in --python) python="$2"; shift 2 ;; *) shift ;; esac
+    done
+    rm -rf "$target"
+    "$python" -m venv --without-pip --system-site-packages "$target"
+    echo "uv = 0.0.0-test" >> "$target/pyvenv.cfg"
+    ;;
+  sync)
+    site="$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+    for m in kipy sexpdata skip PIL fitz colorlog pydantic requests dotenv cairosvg; do
+      : > "$site/$m.py"
+    done
+    ;;
+esac
+"""
+
+
+@pytest.fixture
+def uv_repo(tmp_path):
+    repo = tmp_path / "uv repo"
+    repo.mkdir()
+    shutil.copy2(ROOT / "setup-linux.sh", repo)
+    (repo / "package.json").write_text("{}")
+    (repo / "dist").mkdir()
+    (repo / "dist/index.js").touch()
+    base = tmp_path / "kicad python"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(base)],
+        check=True,
+        capture_output=True,
+    )
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    env.pop("PYTHONPATH", None)
+    base_site = Path(
+        subprocess.check_output(
+            [
+                str(base / "bin/python"),
+                "-c",
+                "import sysconfig; print(sysconfig.get_path('purelib'))",
+            ],
+            env=env,
+            text=True,
+        ).strip()
+    )
+    pcbnew_dir = tmp_path / "kicad dist-packages"
+    pcbnew_dir.mkdir()
+    (pcbnew_dir / "pcbnew.py").write_text("def GetBuildVersion(): return '10.0-uv'\n")
+    (base_site / "kicad.pth").write_text(str(pcbnew_dir) + "\n")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    uv = bindir / "uv"
+    uv.write_text(FAKE_UV)
+    uv.chmod(0o755)
+    log = tmp_path / "uv.log"
+    env.update(
+        KICAD_PYTHON=str(base / "bin/python"),
+        PATH=f"{bindir}{os.pathsep}{env['PATH']}",
+        FAKE_UV_LOG=str(log),
+    )
+    return repo, env, pcbnew_dir, log
+
+
+def run_uv_setup(uv_repo, *args):
+    repo, env, _, _ = uv_repo
+    return subprocess.run(
+        ["bash", str(repo / "setup-linux.sh"), *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_use_uv_requires_apply(uv_repo):
+    repo, _, _, log = uv_repo
+    for mode in ("--verify", "--dry-run"):
+        result = run_uv_setup(uv_repo, mode, "--use-uv")
+        assert result.returncode == 1
+        assert "needs --apply" in result.stderr
+    assert not (repo / ".venv").exists()
+    assert not log.exists()
+
+
+def test_use_uv_builds_venv_and_writes_minimal_config(uv_repo):
+    repo, env, pcbnew_dir, log = uv_repo
+    config = repo / "client.json"
+    result = run_uv_setup(uv_repo, "--apply", "--use-uv", "--yes", "--claude-config", str(config))
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = log.read_text().splitlines()
+    assert calls[0].startswith("uv venv .venv --clear --python ")
+    assert "--system-site-packages" in calls[0]
+    assert calls[1] == "uv sync --no-dev"
+    # pcbnew was outside the base's system site-packages: reached via a .pth.
+    pth = list((repo / ".venv").rglob("kicad_pcbnew.pth"))
+    assert len(pth) == 1 and pth[0].read_text().strip() == str(pcbnew_dir)
+    entry = json.loads(config.read_text())["mcpServers"]["kicad"]
+    # The server finds .venv itself; PYTHONPATH would shadow the locked packages.
+    assert entry["env"] == {"LOG_LEVEL": "info"}
+    assert entry["args"] == [str(repo / "dist/index.js")]
+    clean = {k: v for k, v in env.items() if k not in ("PYTHONPATH", "KICAD_PYTHON")}
+    subprocess.run(
+        [str(repo / ".venv/bin/python"), "-c", "import pcbnew, cairosvg, fitz"],
+        env=clean,
+        check=True,
+        capture_output=True,
+    )
+    # Re-verifying the uv venv keeps the minimal config and suggests uv sync.
+    result = run_uv_setup(uv_repo, "--verify")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "KICAD_PYTHON=" not in result.stdout
+    site = pth[0].parent
+    (site / "fitz.py").unlink()
+    result = run_uv_setup(uv_repo, "--verify")
+    assert result.returncode == 1
+    assert "uv sync --no-dev" in result.stdout
+    assert "-m pip install" not in result.stdout
+
+
+def test_use_uv_refuses_when_plain_venv_would_win(uv_repo):
+    repo, _, _, log = uv_repo
+    (repo / "venv").mkdir()
+    result = run_uv_setup(uv_repo, "--apply", "--use-uv", "--yes")
+    assert result.returncode == 1
+    assert "server prefers it over .venv" in result.stderr
+    assert not log.exists()

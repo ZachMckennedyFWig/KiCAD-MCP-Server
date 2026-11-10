@@ -409,15 +409,48 @@ def test_zod_parameters_are_read_by_their_handlers(tools, routes, vocabulary) ->
 
 
 def test_jsonrpc_schema_parameters_are_read_by_their_handlers(routes, vocabulary) -> None:
-    from schemas.tool_schemas import TOOL_SCHEMAS
+    from schemas.tool_schemas import GENERATED_TOOL_SCHEMAS, TOOL_SCHEMAS
 
     assert len(TOOL_SCHEMAS) >= 100
     found: Dict[str, Set[str]] = {}
     for name, schema in sorted(TOOL_SCHEMAS.items()):
         if name not in routes:
             continue
+        # Copied from the zod definitions: test_zod_parameters_... covers them.
+        if schema is GENERATED_TOOL_SCHEMAS.get(name):
+            continue
         props = schema.get("inputSchema", {}).get("properties", {})
         missing = {p for p in props if p not in vocabulary(name)}
         if missing:
             found[name] = missing
     _ratchet(found, KNOWN_JSONRPC_UNREAD, "JSON-RPC schema parameters never read")
+
+
+# --- generated_tool_schemas.json ---------------------------------------------
+#
+# The Python server's tools/list falls back to schemas copied from the
+# TypeScript server (npm run schemas:python). These keep that copy in step
+# with the tools the TypeScript side registers.
+
+
+def test_generated_schemas_match_the_typescript_tools(tools) -> None:
+    from schemas.tool_schemas import GENERATED_TOOL_SCHEMAS
+
+    # Tools answered by TypeScript alone have no Python command to describe.
+    expected = {name for name, info in tools.items() if info["calls_python"]}
+    generated = set(GENERATED_TOOL_SCHEMAS)
+    assert generated == expected, (
+        "python/schemas/generated_tool_schemas.json is stale; run "
+        "npm run build && npm run schemas:python. "
+        f"Missing: {sorted(expected - generated)}; extra: {sorted(generated - expected)}"
+    )
+    for name, entry in GENERATED_TOOL_SCHEMAS.items():
+        assert entry["name"] == name
+        assert entry["inputSchema"].get("type") == "object", name
+
+
+def test_every_tool_python_serves_has_a_schema(tools, routes) -> None:
+    from schemas.tool_schemas import TOOL_SCHEMAS
+
+    missing = sorted(n for n in tools if n in routes and n not in TOOL_SCHEMAS)
+    assert not missing, f"tools/list would advertise these with an empty schema: {missing}"

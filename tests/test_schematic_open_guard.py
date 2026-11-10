@@ -411,6 +411,7 @@ _NOT_SCHEMATIC_WRITERS = {
             "fanout_to_planes",
             "route_connection",
             "route_bus",
+            "tune_length",
             "job_apply",
             "job_cancel",
         ],

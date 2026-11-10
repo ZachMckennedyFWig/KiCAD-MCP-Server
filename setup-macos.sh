@@ -3,6 +3,7 @@ set -euo pipefail
 
 MODE=""
 ASSUME_YES=0
+USE_UV=0
 SERVER_NAME="kicad"
 CLAUDE_CONFIG_PATH=""
 
@@ -13,7 +14,7 @@ usage() {
 Usage:
   $SCRIPT_NAME --verify [--name NAME] [--claude-config PATH]
   $SCRIPT_NAME --dry-run [--name NAME] [--claude-config PATH]
-  $SCRIPT_NAME --apply [--name NAME] [--claude-config PATH] [--yes]
+  $SCRIPT_NAME --apply [--use-uv] [--name NAME] [--claude-config PATH] [--yes]
 
 Options:
   --verify               Check prerequisites and print detected paths
@@ -22,6 +23,15 @@ Options:
                          missing Python dependencies first
   --yes                  Do not prompt before writing or installing dependencies
                          (only with --apply)
+  --use-uv               (with --apply) Build a project-local .venv with uv from
+                         KiCad's bundled Python (--system-site-packages, so
+                         pcbnew stays importable) and install the locked
+                         dependencies with 'uv sync'. The server finds .venv on
+                         its own, so the config needs no KICAD_PYTHON or PYTHONPATH.
+
+Environment:
+  KICAD_PYTHON           Override the Python executable used for KiCad
+                         (with --use-uv: the interpreter .venv is built from)
   --name NAME            MCP server name (default: kicad)
   --claude-config PATH   Path to Claude Desktop config file
                          (default: ~/Library/Application Support/Claude/claude_desktop_config.json)
@@ -74,6 +84,10 @@ while [[ $# -gt 0 ]]; do
       ASSUME_YES=1
       shift
       ;;
+    --use-uv)
+      USE_UV=1
+      shift
+      ;;
     --name)
       [[ $# -ge 2 ]] || fail "--name requires a value"
       SERVER_NAME="$2"
@@ -96,6 +110,9 @@ done
 
 [[ -n "$MODE" ]] || { usage; exit 1; }
 [[ -n "$SERVER_NAME" ]] || fail "Server name must not be empty"
+if [[ $USE_UV -eq 1 && "$MODE" != "apply" ]]; then
+  fail "--use-uv creates .venv, so it needs --apply. Use --verify without it to check an existing .venv."
+fi
 
 if [[ -z "$CLAUDE_CONFIG_PATH" ]]; then
   CLAUDE_CONFIG_PATH="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
@@ -120,20 +137,72 @@ DIST_JS="$REPO_ROOT/dist/index.js"
 
 DEFAULT_KICAD_PYTHON="/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3"
 
-# Prefer a repo-local venv (created per the README's manual macOS setup) so the
-# generated config points at the interpreter that has the requirements
-# installed. An explicit KICAD_PYTHON env var still wins.
-if [[ -z "${KICAD_PYTHON:-}" && -x "$REPO_ROOT/venv/bin/python3" ]]; then
-  KICAD_PYTHON="$REPO_ROOT/venv/bin/python3"
-fi
-KICAD_PYTHON="${KICAD_PYTHON:-$DEFAULT_KICAD_PYTHON}"
-
 command -v python3 >/dev/null 2>&1 || fail "python3 not found"
 NODE_PATH="$(command -v node || true)"
 [[ -n "$NODE_PATH" ]] || fail "node not found in PATH"
 
 [[ -f "$DIST_JS" ]] || fail "Missing build artifact: $DIST_JS. Run 'npm install && npm run build' first."
+
+# --use-uv: build .venv from KiCad's Python. uv venvs have no pip, so the
+# dependencies come from uv.lock through 'uv sync'.
+if [[ $USE_UV -eq 1 ]]; then
+  BASE_PYTHON="${KICAD_PYTHON:-$DEFAULT_KICAD_PYTHON}"
+  [[ -x "$BASE_PYTHON" ]] || fail "KiCad Python not found or not executable: $BASE_PYTHON"
+  command -v uv >/dev/null 2>&1 || fail "uv not found in PATH. Install it (brew install uv, or https://docs.astral.sh/uv/getting-started/installation/) or rerun without --use-uv"
+  if [[ -e "$REPO_ROOT/venv" ]]; then
+    fail "$REPO_ROOT/venv exists and the server prefers it over .venv. Remove or rename it, then rerun with --use-uv."
+  fi
+  BASE_PCBNEW_PATH="$("$BASE_PYTHON" - <<'PY'
+import importlib.util, os
+spec = importlib.util.find_spec("pcbnew")
+if spec is None:
+    raise SystemExit(1)
+if spec.submodule_search_locations:
+    print(os.path.dirname(os.path.abspath(next(iter(spec.submodule_search_locations)))))
+else:
+    print(os.path.dirname(os.path.abspath(spec.origin)))
+PY
+)" || fail "KiCad Python could not import pcbnew: $BASE_PYTHON"
+  section "uv virtual environment"
+  info "Creating $REPO_ROOT/.venv from $BASE_PYTHON (system site-packages for pcbnew)"
+  (cd "$REPO_ROOT" && uv venv .venv --clear --python "$BASE_PYTHON" --system-site-packages) || fail "uv venv failed"
+  info "Installing the locked Python dependencies (uv sync --no-dev)"
+  (cd "$REPO_ROOT" && UV_PROJECT_ENVIRONMENT=.venv uv sync --no-dev) || fail "uv sync failed"
+  if ! "$REPO_ROOT/.venv/bin/python3" -c 'import pcbnew' >/dev/null 2>&1; then
+    # A .pth file appends pcbnew's directory after the venv's own packages;
+    # PYTHONPATH would put KiCad's bundled copies ahead of them.
+    VENV_SITE="$("$REPO_ROOT/.venv/bin/python3" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+    printf '%s\n' "$BASE_PCBNEW_PATH" > "$VENV_SITE/kicad_pcbnew.pth"
+    "$REPO_ROOT/.venv/bin/python3" -c 'import pcbnew' >/dev/null 2>&1 || fail ".venv still cannot import pcbnew (added $BASE_PCBNEW_PATH)"
+    info "Added $BASE_PCBNEW_PATH to .venv through kicad_pcbnew.pth"
+  fi
+  info ".venv is ready"
+  KICAD_PYTHON="$REPO_ROOT/.venv/bin/python3"
+fi
+
+# Prefer a repo-local venv (venv/ from the README's manual macOS setup, or the
+# uv-managed .venv; the server checks them in that order) so the generated
+# config points at the interpreter that has the requirements installed. An
+# explicit KICAD_PYTHON env var still wins.
+if [[ -z "${KICAD_PYTHON:-}" ]]; then
+  for venv_python in "$REPO_ROOT/venv/bin/python3" "$REPO_ROOT/.venv/bin/python3"; do
+    if [[ -x "$venv_python" ]]; then
+      KICAD_PYTHON="$venv_python"
+      break
+    fi
+  done
+fi
+KICAD_PYTHON="${KICAD_PYTHON:-$DEFAULT_KICAD_PYTHON}"
 [[ -x "$KICAD_PYTHON" ]] || fail "KiCad Python not found or not executable: $KICAD_PYTHON"
+
+# A uv-managed project .venv needs nothing in the client config: the server
+# finds it and injects no PYTHONPATH, which would otherwise put KiCad's bundled
+# packages ahead of the versions pinned in uv.lock.
+UV_MANAGED=0
+if [[ "$KICAD_PYTHON" == "$REPO_ROOT/.venv/bin/"* ]] \
+  && grep -qE '^uv[[:space:]]*=' "$REPO_ROOT/.venv/pyvenv.cfg" 2>/dev/null; then
+  UV_MANAGED=1
+fi
 
 DETECT_JSON="$("$KICAD_PYTHON" - <<'PY'
 import json, sys, sysconfig
@@ -174,7 +243,7 @@ IN_VENV="$(python3 -c 'import json,sys; print("true" if json.loads(sys.argv[1])[
 # imports several of these at startup; if one is missing the server dies
 # before answering the MCP handshake and the client just times out after 30s
 # with no visible error (issue #350).
-REQUIRED_PY_MODULES="sexpdata:sexpdata skip:kicad-skip PIL:Pillow colorlog:colorlog pydantic:pydantic requests:requests dotenv:python-dotenv cairosvg:cairosvg kipy:kicad-python"
+REQUIRED_PY_MODULES="sexpdata:sexpdata skip:kicad-skip PIL:Pillow fitz:pymupdf colorlog:colorlog pydantic:pydantic requests:requests dotenv:python-dotenv cairosvg:cairosvg kipy:kicad-python"
 
 check_missing_packages() {
   "$KICAD_PYTHON" - "$REQUIRED_PY_MODULES" <<'PY'
@@ -193,7 +262,9 @@ PY
 MISSING_PACKAGES="$(check_missing_packages)"
 
 REQUIREMENTS_FILE="$REPO_ROOT/requirements.txt"
-if [[ "$IN_VENV" == "true" ]]; then
+if [[ $UV_MANAGED -eq 1 ]]; then
+  PIP_INSTALL_CMD=(uv sync --no-dev --project "$REPO_ROOT")
+elif [[ "$IN_VENV" == "true" ]]; then
   PIP_INSTALL_CMD=("$KICAD_PYTHON" -m pip install -r "$REQUIREMENTS_FILE")
 else
   PIP_INSTALL_CMD=("$KICAD_PYTHON" -m pip install --user -r "$REQUIREMENTS_FILE")
@@ -205,16 +276,15 @@ missing_deps_message() {
   echo "  ${DIM}Without them the MCP client times out after 30s with no visible error.${RESET}"
 }
 
-CONFIG_FRAGMENT_JSON="$(python3 - "$NODE_PATH" "$DIST_JS" "$KICAD_PYTHON" "$PYTHONPATH_VALUE" <<'PY'
+CONFIG_FRAGMENT_JSON="$(python3 - "$NODE_PATH" "$DIST_JS" "$KICAD_PYTHON" "$PYTHONPATH_VALUE" "$UV_MANAGED" <<'PY'
 import json, sys
+env = {"LOG_LEVEL": "info"}
+if sys.argv[5] != "1":
+    env = {"KICAD_PYTHON": sys.argv[3], "PYTHONPATH": sys.argv[4], **env}
 fragment = {
     "command": sys.argv[1],
     "args": [sys.argv[2]],
-    "env": {
-        "KICAD_PYTHON": sys.argv[3],
-        "PYTHONPATH": sys.argv[4],
-        "LOG_LEVEL": "info"
-    }
+    "env": env,
 }
 print(json.dumps(fragment, indent=2))
 PY
@@ -238,7 +308,11 @@ show_detected() {
   echo "  Repo root:         $REPO_ROOT"
   echo "  Python executable: $PYTHON_EXE"
   echo "  Python version:    $PYTHON_VERSION"
-  echo "  PYTHONPATH:        $PYTHONPATH_VALUE"
+  if [[ $UV_MANAGED -eq 1 ]]; then
+    echo "  PYTHONPATH:        (none: uv-managed .venv, found by the server)"
+  else
+    echo "  PYTHONPATH:        $PYTHONPATH_VALUE"
+  fi
   echo "  Claude config:     $CLAUDE_CONFIG_PATH"
 }
 
@@ -294,8 +368,10 @@ show_claude_code_hint() {
   echo "  To register the server there as well, run:"
   echo
   echo "  claude mcp add --scope user $SERVER_NAME \\"
-  echo "    --env KICAD_PYTHON=\"$KICAD_PYTHON\" \\"
-  echo "    --env PYTHONPATH=\"$PYTHONPATH_VALUE\" \\"
+  if [[ $UV_MANAGED -ne 1 ]]; then
+    echo "    --env KICAD_PYTHON=\"$KICAD_PYTHON\" \\"
+    echo "    --env PYTHONPATH=\"$PYTHONPATH_VALUE\" \\"
+  fi
   echo "    --env LOG_LEVEL=info \\"
   echo "    -- \"$NODE_PATH\" \"$DIST_JS\""
 }

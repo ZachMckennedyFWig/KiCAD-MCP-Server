@@ -501,21 +501,36 @@ def test_cleanup_dangling_rolls_back_when_connectivity_worsens(pcbnew, stub_boar
 # --------------------------------------------------------------------------- #
 
 
-def _make_pair(pcbnew, tmp_path, angle=90.0, back=False, swap_cap=False):
-    """Source board saved to disk + target board in memory with the same parts moved."""
+def _make_pair(
+    pcbnew,
+    tmp_path,
+    angle=90.0,
+    back=False,
+    swap_cap=False,
+    src_anchor="SOIC-8_3.9x4.9mm_P1.27mm",
+    tgt_anchor="SOIC-8_3.9x4.9mm_P1.27mm",
+    cap_shift=0.0,
+    sig_pour=False,
+):
+    """Source board saved to disk + target board in memory with the same parts moved.
 
-    def populate(board, ox, oy, ang, flip, swap):
+    ``cap_shift`` displaces the target's C1 along the anchor's local x (mm);
+    ``sig_pour`` adds a SIG stub ending in a SIG pour that straddles the
+    region's left edge (x = 10) in the source.
+    """
+
+    def populate(board, ox, oy, ang, flip, swap, fp_name, shift=0.0):
         n = nets(pcbnew, board, ["VCC", "GND", "SIG"])
         u = footprint(
             pcbnew,
             board,
             "Package_SO",
-            "SOIC-8_3.9x4.9mm_P1.27mm",
+            fp_name,
             "U1",
             ox,
             oy,
             angle=ang,
-            pad_nets={"1": n["SIG"], "4": n["GND"], "8": n["VCC"]},
+            pad_nets={"1": n["SIG"], "4": n["GND"], "8": n["VCC"], "9": n["GND"]},
             back=flip,
         )
         # Place the cap in the anchor's own frame, read from its pads (local x:
@@ -532,8 +547,8 @@ def _make_pair(pcbnew, tmp_path, angle=90.0, back=False, swap_cap=False):
                 org.y + (lx * ex[1] + ly * ey[1]) * 1e6,
             )
 
-        cx, cy = local(7.0, 0.0)
-        want1 = local(7.0, 0.775)  # C1 pad 1 sits at local +y in the source
+        cx, cy = local(7.0 + shift, 0.0)
+        want1 = local(7.0 + shift, 0.775)  # C1 pad 1 sits at local +y in the source
         pads = {"1": n["GND"], "2": n["VCC"]} if swap else {"1": n["VCC"], "2": n["GND"]}
         cap = footprint(
             pcbnew,
@@ -557,7 +572,7 @@ def _make_pair(pcbnew, tmp_path, angle=90.0, back=False, swap_cap=False):
 
     src = pcbnew.BOARD()
     outline(pcbnew, src, 60, 60)
-    n, u = populate(src, 20, 20, 0.0, False, False)
+    n, u = populate(src, 20, 20, 0.0, False, False, src_anchor)
     c1 = src.FindFootprintByReference("C1")
     pad = {(f.GetReference(), str(p.GetNumber())): p for f in (u, c1) for p in f.Pads()}
 
@@ -579,12 +594,16 @@ def _make_pair(pcbnew, tmp_path, angle=90.0, back=False, swap_cap=False):
     track(pcbnew, src, n["GND"], (28.5, cy2), (cx2, cy2))
     zone(pcbnew, src, n["GND"], pcbnew.F_Cu, [(27.6, 22.6), (30, 22.6), (30, 25.5), (27.6, 25.5)])
     zone(pcbnew, src, None, pcbnew.F_Cu, [(18, 15), (19, 15), (19, 16), (18, 16)], rule=True)
+    if sig_pour:
+        sx, sy = xy(("U1", "1"))
+        track(pcbnew, src, n["SIG"], (sx, sy), (14.0, sy))
+        zone(pcbnew, src, n["SIG"], pcbnew.F_Cu, [(8, 17.8), (15, 17.8), (15, 18.4), (8, 18.4)])
     path = tmp_path / "source.kicad_pcb"
     pcbnew.SaveBoard(str(path), src)
 
     tgt = pcbnew.BOARD()
     outline(pcbnew, tgt, 80, 80)
-    populate(tgt, 50, 45, angle, back, swap_cap)
+    populate(tgt, 50, 45, angle, back, swap_cap, tgt_anchor, cap_shift)
     tgt.BuildConnectivity()
     return str(path), tgt
 
@@ -656,7 +675,292 @@ def test_transplant_layout_reports_mismatch_and_copies_nothing(pcbnew, tmp_path)
     assert "netMismatch" in kinds
     bad = {m["targetPad"] for m in res["verification"]["mismatches"] if m["type"] == "netMismatch"}
     assert bad == {"C1.1", "C1.2"}
+    # the anchor's pins fix the net map, so the swapped cap is named as
+    # reversed rather than reported as two nets folded together
+    assert [r["targetRef"] for r in res["verification"]["reversedParts"]] == ["C1"]
+    assert "netMerge" not in kinds
+    assert res["verification"]["blockingCount"] == 2
     assert not tracks_of(pcbnew, tgt) and not vias_of(pcbnew, tgt)
+
+
+def test_transplant_layout_nets_filter_makes_other_mismatches_non_blocking(pcbnew, tmp_path):
+    """Only the selected nets are copied; mismatches on the others are reported, not fatal."""
+    from commands.transplant import TransplantCommands
+
+    src_path, tgt = _make_pair(pcbnew, tmp_path, angle=0.0, swap_cap=True)
+    base = {
+        "sourceBoard": src_path,
+        "sourceAnchorRef": "U1",
+        "targetAnchorRef": "U1",
+        "region": {"x1": 10, "y1": 12, "x2": 32, "y2": 28},
+    }
+    res = TransplantCommands(Iface(tgt)).transplant_layout(dict(base, nets=["SIG"]))
+    assert res["success"] is True, res
+    v = res["verification"]
+    assert v["mismatchCount"] >= 2 and v["blockingCount"] == 0
+    assert all(m["blocking"] is False for m in v["mismatches"])
+    assert res["netMap"]["copied"] == ["SIG"]
+    assert res["copied"]["tracks"] == 0 and res["copied"]["vias"] == 0
+    assert res["copied"]["zones"] == 0 and res["copied"]["ruleAreas"] == 1
+    assert res["skipped"]["notSelected"] == 7 + 2 + 1  # VCC/GND tracks, vias, GND zone
+    # a name that is on neither board is a caller error, not a silent no-op
+    bad = TransplantCommands(Iface(tgt)).transplant_layout(dict(base, nets=["NOPE"]))
+    assert bad["success"] is False and "NOPE" in bad["errorDetails"]
+
+
+def test_transplant_layout_split_exposed_pad_becomes_board_vias(pcbnew, tmp_path):
+    """The RP2350 case: the reference anchor's exposed pad carries plated via pads, the
+    target's library footprint has a plain exposed pad. The via pads match by
+    containment, become board vias grown to the board's minimum drill, and a
+    second run adds nothing."""
+    from commands.transplant import TransplantCommands
+
+    src_path, tgt = _make_pair(
+        pcbnew,
+        tmp_path,
+        angle=90.0,
+        src_anchor="SOIC-8-1EP_3.9x4.9mm_P1.27mm_EP2.29x3mm_ThermalVias",
+        tgt_anchor="SOIC-8-1EP_3.9x4.9mm_P1.27mm_EP2.29x3mm",
+    )
+    ds = tgt.GetDesignSettings()
+    ds.m_MinThroughDrill = pcbnew.FromMM(0.35)
+    src = pcbnew.LoadBoard(src_path)
+    holes = [
+        p
+        for p in src.FindFootprintByReference("U1").Pads()
+        if str(p.GetNumber()) == "9" and p.GetDrillSize().x > 0
+    ]
+    assert holes, "fixture footprint should have thermal via pads"
+    params = {
+        "sourceBoard": src_path,
+        "sourceAnchorRef": "U1",
+        "targetAnchorRef": "U1",
+        "region": {"x1": 10, "y1": 12, "x2": 32, "y2": 28},
+    }
+    tc = TransplantCommands(Iface(tgt))
+    res = tc.transplant_layout(params)
+    assert res["success"] is True, res
+    v = res["verification"]
+    assert v["blockingCount"] == 0, v["mismatches"]
+    assert not [m for m in v["mismatches"] if m["type"] == "anchorPadMissing"]
+    assert v["offsetPadCount"] >= len(holes) - 1  # the centre one may match exactly
+    assert res["copied"]["padVias"] == len(holes)
+    assert res["copied"]["vias"] == 2 and res["copied"]["tracks"] == 7
+    drills = {round(pcbnew.ToMM(x.GetDrillValue()), 3) for x in vias_of(pcbnew, tgt)}
+    assert drills == {0.35}
+    assert res["report"]["viasResized"]
+    # every new pad via sits on the target's exposed pad
+    ep = [p for p in tgt.FindFootprintByReference("U1").Pads() if str(p.GetNumber()) == "9"][0]
+    on_ep = [x for x in vias_of(pcbnew, tgt) if ep.HitTest(x.GetPosition())]
+    assert len(on_ep) == len(holes)
+    assert all(x.GetNetname() == "GND" for x in on_ep)
+
+    # idempotent: everything is already there
+    n_tracks, n_vias, n_zones = (
+        len(tracks_of(pcbnew, tgt)),
+        len(vias_of(pcbnew, tgt)),
+        len(list(tgt.Zones())),
+    )
+    again = tc.transplant_layout(params)
+    assert again["success"] is True, again
+    assert sum(again["copied"].values()) == 0
+    assert again["skipped"]["alreadyPresent"] == sum(res["copied"].values())
+    assert (len(tracks_of(pcbnew, tgt)), len(vias_of(pcbnew, tgt)), len(list(tgt.Zones()))) == (
+        n_tracks,
+        n_vias,
+        n_zones,
+    )
+
+    # replaceExisting swaps the copied zones/rule areas instead of stacking them,
+    # and keeps the vias in the exposed pad
+    rep = tc.transplant_layout(dict(params, replaceExisting=True))
+    assert rep["success"] is True, rep
+    assert rep["removedExisting"] > 0
+    assert len(list(tgt.Zones())) == n_zones
+    assert len(vias_of(pcbnew, tgt)) == n_vias
+    assert rep["copied"]["zones"] == 1 and rep["copied"]["ruleAreas"] == 1
+
+
+def test_transplant_layout_displaced_part_is_a_pad_offset(pcbnew, tmp_path):
+    from commands.transplant import TransplantCommands
+
+    src_path, tgt = _make_pair(pcbnew, tmp_path, angle=0.0, cap_shift=0.2)
+    params = {
+        "sourceBoard": src_path,
+        "sourceAnchorRef": "U1",
+        "targetAnchorRef": "U1",
+        "region": {"x1": 10, "y1": 12, "x2": 32, "y2": 28},
+        "dryRun": True,
+    }
+    tc = TransplantCommands(Iface(tgt))
+    res = tc.transplant_layout(params)
+    assert res["success"] is False
+    offs = [m for m in res["verification"]["mismatches"] if m["type"] == "padOffset"]
+    assert {m["targetPad"] for m in offs} == {"C1.1", "C1.2"}
+    assert all(m["blocking"] and abs(m["offset"] - 0.2) < 0.01 for m in offs)
+    ok = tc.transplant_layout(dict(params, tolerance=0.25))
+    assert ok["success"] is True and ok["verification"]["mismatchCount"] == 0, ok
+
+
+def test_transplant_layout_clearance_and_skip_conflicting(pcbnew, tmp_path):
+    """Existing target copper near/over the copied path: a clearance hit is reported,
+    a short rolls back, and skipConflicting drops just the offending items."""
+    from commands.transplant import TransplantCommands
+
+    src_path, tgt = _make_pair(pcbnew, tmp_path, angle=0.0)
+    u1 = tgt.FindFootprintByReference("U1")
+    sig = [p for p in u1.Pads() if str(p.GetNumber()) == "1"][0].GetNet()
+    assert sig.GetNetname() == "SIG"
+    # translation is (+30, +25): the copied VCC run is (52.475,43.095)->(55.5,43.095)
+    # ->(55.5,45.775)->(57,45.775), 0.25 mm wide
+    track(pcbnew, tgt, sig, (54.0, 42.82), (55.0, 42.82), width=0.2)  # 0.05 mm gap
+    params = {
+        "sourceBoard": src_path,
+        "sourceAnchorRef": "U1",
+        "targetAnchorRef": "U1",
+        "region": {"x1": 10, "y1": 12, "x2": 32, "y2": 28},
+        "dryRun": True,
+    }
+    tc = TransplantCommands(Iface(tgt))
+    res = tc.transplant_layout(params)
+    assert res["success"] is True, res
+    rep = res["report"]
+    assert rep["shortCount"] == 0 and rep["clearanceCount"] == 1
+    assert rep["clearance"][0]["otherNet"] == "SIG" and rep["clearance"][0]["net"] == "VCC"
+
+    track(pcbnew, tgt, sig, (55.0, 44.5), (56.0, 44.5), width=0.2)  # crosses x = 55.5
+    before = len(tracks_of(pcbnew, tgt))
+    res = tc.transplant_layout(params)
+    assert res["success"] is False and res["rolledBack"] is True
+    assert len(tracks_of(pcbnew, tgt)) == before
+
+    res = tc.transplant_layout(dict(params, skipConflicting=True))
+    assert res["success"] is True, res
+    dropped = res["report"]["droppedConflicting"]
+    assert len(dropped) == 2 and {d["net"] for d in dropped} == {"VCC"}
+    assert res["report"]["shortCount"] == 0 and res["report"]["clearanceCount"] == 0
+    assert res["copied"]["tracks"] == 5
+    assert len(tracks_of(pcbnew, tgt)) == before  # dry run
+
+
+def test_transplant_layout_short_to_single_pad_is_not_renetted_away(pcbnew, tmp_path):
+    """A copied stub landing on one pad of another net: BuildConnectivity() would
+    give the stub that pad's net, hiding the short. It must still be reported."""
+    from commands.transplant import TransplantCommands
+
+    src_path, tgt = _make_pair(pcbnew, tmp_path, angle=0.0, sig_pour=True)
+    u1 = tgt.FindFootprintByReference("U1")
+    pads = {str(p.GetNumber()): p for p in u1.Pads()}
+    pads["1"].SetNet(pads["8"].GetNet())  # target pin 1 is VCC, the source's is SIG
+    params = {
+        "sourceBoard": src_path,
+        "sourceAnchorRef": "U1",
+        "targetAnchorRef": "U1",
+        "region": {"x1": 10, "y1": 12, "x2": 32, "y2": 28},
+        "netMap": {"SIG": "SIG"},
+        "nets": ["SIG"],
+        "dryRun": True,
+    }
+    tc = TransplantCommands(Iface(tgt))
+    res = tc.transplant_layout(params)
+    assert res["success"] is False and res["verification"]["blockingCount"] == 1
+    forced = tc.transplant_layout(dict(params, force=True))
+    assert forced["success"] is True and forced["copied"]["tracks"] == 1, forced
+    shorts = forced["report"]["shorts"]
+    assert [(s["net"], s["otherNet"]) for s in shorts] == [("SIG", "VCC")]
+    res = tc.transplant_layout(dict(params, verify=False))
+    assert res["success"] is False and res.get("rolledBack") is True
+    assert not tracks_of(pcbnew, tgt)
+
+
+def test_transplant_layout_explains_track_ending_in_uncopied_pour(pcbnew, tmp_path):
+    from commands.transplant import TransplantCommands
+
+    src_path, tgt = _make_pair(pcbnew, tmp_path, angle=90.0, sig_pour=True)
+    res = TransplantCommands(Iface(tgt)).transplant_layout(
+        {
+            "sourceBoard": src_path,
+            "sourceAnchorRef": "U1",
+            "targetAnchorRef": "U1",
+            "region": {"x1": 10, "y1": 12, "x2": 32, "y2": 28},
+            "dryRun": True,
+        }
+    )
+    assert res["success"] is True, res
+    partial = res["skipped"]["partialZones"]
+    assert [z["net"] for z in partial] == ["SIG"]
+    sig = [o for o in res["report"]["orphaned"] if o["net"] == "SIG"]
+    assert len(sig) == 1 and "SIG pour" in sig[0]["reason"]
+
+
+def test_transplant_layout_rp2350_reference(pcbnew, tmp_path):
+    """Opt-in: Raspberry Pi's RP2350B minimal design (MIT) onto a copy of itself with
+    the core rotated 90 deg and U1 swapped for KiCad's stock QFN-80 footprint, as
+    on a real board. Set KICAD_RP2350_REFERENCE to the RPI-RP2350B-MINIMAL
+    .kicad_pcb (from https://pip.raspberrypi.com/documents/RP-010329-CA)."""
+    ref = os.environ.get("KICAD_RP2350_REFERENCE")
+    if not ref or not os.path.isfile(ref):
+        pytest.skip("set KICAD_RP2350_REFERENCE to the RP2350B minimal .kicad_pcb")
+    from commands.transplant import TransplantCommands
+    from utils.board_items import delete_board_item
+    from utils.footprint_swap import load_library_footprint
+
+    board = pcbnew.LoadBoard(ref)
+    for t in list(board.GetTracks()):
+        delete_board_item(board, t)
+    for z in list(board.Zones()):
+        delete_board_item(board, z)
+    old = board.FindFootprintByReference("U1")
+    assert old is not None and pcbnew.ToMM(old.GetPosition().x) == pytest.approx(100.0)
+    pad_nets = {str(p.GetNumber()): p.GetNet() for p in old.Pads() if str(p.GetNumber())}
+    stock = load_library_footprint(
+        str(_lib("Package_DFN_QFN")), "QFN-80-1EP_10x10mm_P0.4mm_EP3.4x3.4mm"
+    )
+    stock.SetReference("U1")
+    stock.SetPosition(pt(pcbnew, 100, 100))
+    delete_board_item(board, old)
+    board.Add(stock)
+    for p in stock.Pads():
+        if str(p.GetNumber()) in pad_nets:
+            p.SetNet(pad_nets[str(p.GetNumber())])
+    centre = pt(pcbnew, 100, 100)
+    for fp in board.GetFootprints():
+        q = fp.GetPosition()
+        if abs(q.x - centre.x) <= mm(pcbnew, 12) and abs(q.y - centre.y) <= mm(pcbnew, 12):
+            fp.Rotate(centre, pcbnew.EDA_ANGLE(90.0, pcbnew.DEGREES_T))
+            fp.Move(pt(pcbnew, -40, -30))
+    target = tmp_path / "rp2350_target.kicad_pcb"
+    pcbnew.SaveBoard(str(target), board)
+    tgt = pcbnew.LoadBoard(str(target))
+
+    power = ["+3V3", "+1V1", "GND", "/VREG_AVDD", "/VREG_LX"]
+    params = {
+        "sourceBoard": ref,
+        "sourceAnchorRef": "U1",
+        "targetAnchorRef": "U1",
+        "region": {"x1": 89.4, "y1": 89.4, "x2": 110.6, "y2": 110.6},
+        "nets": power,
+        "tolerance": 0.06,  # RPi's QFN pins sit 0.05 mm inside KiCad's
+        "limit": 500,
+    }
+    tc = TransplantCommands(Iface(tgt))
+    res = tc.transplant_layout(params)
+    assert res["success"] is True, {k: res.get(k) for k in ("message", "verification")}
+    assert res["transform"]["rotationDeg"] == 90.0
+    v = res["verification"]
+    assert v["blockingCount"] == 0 and v["padsMatched"] == v["padsChecked"]
+    assert v["offsetPadCount"] >= 8  # the reference's via pads inside the stock EP
+    assert res["copied"]["padVias"] == 9
+    assert res["copied"]["tracks"] > 50 and res["copied"]["vias"] > 10
+    assert res["copied"]["zones"] >= 3 and res["copied"]["ruleAreas"] >= 1
+    assert res["report"]["shortCount"] == 0
+    conn = res["report"]["connectivity"]
+    assert conn["unconnectedAfter"] < conn["unconnectedBefore"]
+    # +3V3 stubs that ended in the reference's large +3V3 pour are explained
+    stubs = [o for o in res["report"]["orphaned"] if o["net"] == "+3V3" and "reason" in o]
+    assert stubs and all("pour" in o["reason"] for o in stubs)
+    again = tc.transplant_layout(params)
+    assert sum(again["copied"].values()) == 0
 
 
 def test_transplant_layout_param_errors(pcbnew, tmp_path):

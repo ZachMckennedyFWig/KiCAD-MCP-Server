@@ -11,6 +11,7 @@ import {
   MEDIUM_COMMANDS,
   MEDIUM_COMMAND_TIMEOUT_MS,
   GUI_WAIT_OVERHEAD_MS,
+  SCRIPT_OVERHEAD_MS,
   DEFAULT_TIMEOUT_GRACE_MS,
   computeTimeoutGrace,
   defaultTimeout,
@@ -138,6 +139,14 @@ describe("per-tool timeouts (MCP_ISSUES #4 / #5m)", () => {
   it("keeps the tiers disjoint", () => {
     const all = [...LONG_RUNNING_COMMANDS, ...CHECK_COMMANDS, ...MEDIUM_COMMANDS];
     expect(new Set(all).size).toBe(all.length);
+  });
+
+  it("scales route_bus with its parallel-search timeBudget", () => {
+    // Default 60 s search plus a sequential fallback fits the long allowance.
+    expect(computeCommandTimeout("route_bus", {}, env)).toBe(LONG_COMMAND_TIMEOUT_MS);
+    expect(computeCommandTimeout("route_bus", { timeBudget: 600 }, env)).toBe(
+      2 * 600 * 1000 + SCRIPT_OVERHEAD_MS,
+    );
   });
 
   it("extends GUI waits by their own seconds parameters", () => {

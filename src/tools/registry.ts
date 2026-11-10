@@ -280,11 +280,12 @@ export const toolCategories: ToolCategory[] = [
   {
     name: "routing",
     description:
-      "Tracks, vias, zones and nets: route arcs, pad-to-pad and differential pairs; modify, delete, query and copy routing; vias, stitching vias, copper pours and zone refill; net list and net colors",
+      "Tracks, vias, zones and nets: route arcs, pad-to-pad and impedance-controlled differential pairs; impedance calculator (microstrip/stripline, width/gap solver from the stackup); modify, delete, query and copy routing; vias, stitching vias, copper pours and zone refill; net list and net colors",
     tools: [
       "route_arc_trace",
       "route_pad_to_pad",
       "route_differential_pair",
+      "calculate_impedance",
       "modify_trace",
       "delete_trace",
       "query_traces",
@@ -329,8 +330,8 @@ export const toolCategories: ToolCategory[] = [
   {
     name: "routing_workflows",
     description:
-      "Routing workflows: plane fan-out (stub + via per plane pad), grid A* single-connection and bus router, length report",
-    tools: ["fanout_to_planes", "route_connection", "route_bus", "length_match"],
+      "Routing workflows: plane fan-out (stub + via per plane pad), grid A* single-connection and bus router, length report, serpentine length tuning",
+    tools: ["fanout_to_planes", "route_connection", "route_bus", "length_match", "tune_length"],
   },
   {
     name: "jobs",

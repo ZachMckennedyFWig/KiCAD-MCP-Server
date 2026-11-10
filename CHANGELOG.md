@@ -102,6 +102,53 @@ All notable changes to the KiCAD MCP Server project are documented here.
 - **`run_pcbnew_script`** runs Python against a fresh load of the board in a
   separate process, with helpers for KiCad 10's SWIG pitfalls. It is hidden
   in the readonly and manufacturing modes.
+- **`calculate_impedance`** (read-only) gives single-ended or differential
+  impedance for a copper layer from the board's stackup, or solves the width
+  (or gap) for a target. It uses Hammerstad–Jensen for microstrip, Wheeler for
+  stripline, Kirschning–Jansen for coupled microstrip and Cohn for coupled
+  stripline. Against a 2D field solver they agree within about 2%. Two cases
+  are worse: very asymmetric stripline (up to about 7%, flagged in the
+  result) and coupled-microstrip Zeven. Boards without a stackup use a
+  stated default. **`route_differential_pair` takes `targetImpedance`**
+  (differential ohms). It solves the width, or the gap when only the width is
+  given, starting from the net class's diff-pair gap. Every result reports the
+  impedance of the width and gap actually used.
+- **`tune_length`** adds serpentine meanders to reach a target length, match
+  another net, or remove diff-pair skew:
+  - styles: trombone, accordion or rounded; corners chamfered by default;
+  - the amplitude is solved so the added length is exact;
+  - each bump is checked for clearance against other copper, pads, the board
+    edge and keepouts, and shrinks near obstacles;
+  - the write is all-or-nothing;
+  - nets that run out of room are reported as partial.
+
+  `length_match` stays read-only and points to it.
+- **`route_bus` routes true parallel bundles** (`mode: "parallel"`, the new
+  default):
+  - it routes a guide path through a corridor wide enough for the whole bus;
+  - it offsets the guide by lane × pitch with exact miter joins;
+  - it connects the pads with short A* legs and checks everything before
+    writing.
+
+  It falls back to the old one-at-a-time routing (`mode: "sequential"`) and
+  says why. Results report per-member lengths, the length spread, and how much
+  of each route runs at the pitch. Its timeout grows with `timeBudget`.
+- **`transplant_layout` was tested on Raspberry Pi's RP2350B minimal design**
+  and fixed where it fell short:
+  - pads split differently by different footprint libraries now match;
+  - reversed parts are named (with a rotate-180° hint) instead of reported as
+    net merges;
+  - `nets` limits the copy;
+  - `include: pad_vias` recreates exposed-pad vias;
+  - `fitVias` grows copied vias to the board minimum;
+  - re-runs skip items already present, and `replaceExisting` also replaces
+    zones and rule areas;
+  - shorts are no longer hidden by connectivity re-netting;
+  - copied copper is clearance-checked, and `skipConflicting` drops offenders;
+  - orphans say why they dangle.
+
+  On CD_Mainboard the scoped transplant matched all 134 pads and finished
+  with 0 DRC errors.
 - **`group_components`** is implemented with `PCB_GROUP`.
 - **`sync_schematic_to_board` is a full update from the schematic:**
   `dryRun`, `removeExtra`, pad nets from the netlist, and Value, Datasheet,
@@ -297,6 +344,25 @@ All notable changes to the KiCAD MCP Server project are documented here.
   sends nothing for 60 seconds and retries the file, and each apt command is
   retried up to 3 times. A timed-out job counts as failed, so `CI passed`
   fails with it.
+- **uv virtual environments on Linux and macOS.** `setup-linux.sh` and
+  `setup-macos.sh` take `--apply --use-uv`, like `setup-windows.ps1 -UseUv`.
+  It builds `.venv` from the Python that imports `pcbnew`, with
+  `--system-site-packages`, and runs `uv sync --no-dev`. If `pcbnew` is
+  outside that interpreter's site-packages, its directory is added through a
+  `.pth` file, which (unlike `PYTHONPATH`) keeps it behind the locked
+  packages. For a uv-managed `.venv` both scripts write an MCP entry without
+  `KICAD_PYTHON` or `PYTHONPATH` (the server finds `.venv` itself), suggest
+  `uv sync` instead of `pip` (uv venvs have no pip), and print the
+  `claude mcp add` command. The macOS script now also finds `.venv` (not only
+  `venv/`) and checks for PyMuPDF. The README describes doing the same by hand
+  on each platform, including why `--python` must be given explicitly.
+- **Every tool has a schema in the Python server's `tools/list`.** 149
+  commands had no entry in `python/schemas/tool_schemas.py` and were listed
+  with an empty input schema. `npm run schemas:python` now saves the TypeScript
+  server's own tool schemas to `python/schemas/generated_tool_schemas.json`,
+  and `tool_schemas.py` uses them for every tool it does not describe itself.
+  A test fails when that file's tool list differs from `src/tools/*.ts`.
+  Internal commands such as `_warmup` are no longer listed as tools.
 
 ## [2.8.3] - 2026-10-25
 

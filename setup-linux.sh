@@ -3,6 +3,7 @@ set -euo pipefail
 
 MODE=""
 ASSUME_YES=0
+USE_UV=0
 SERVER_NAME="kicad"
 CLAUDE_CONFIG_PATH=""
 
@@ -13,13 +14,18 @@ usage() {
 Usage:
   $SCRIPT_NAME --verify [--name NAME] [--claude-config PATH]
   $SCRIPT_NAME --dry-run [--name NAME] [--claude-config PATH]
-  $SCRIPT_NAME --apply [--name NAME] [--claude-config PATH] [--yes]
+  $SCRIPT_NAME --apply [--use-uv] [--name NAME] [--claude-config PATH] [--yes]
 
 Options:
   --verify               Check prerequisites and print detected paths
   --dry-run              Show config and merged Claude Desktop config without writing
   --apply                Write/update Claude Desktop config
   --yes                  Do not prompt before writing (only with --apply)
+  --use-uv               (with --apply) Build a project-local .venv with uv from
+                         the Python that imports pcbnew (--system-site-packages)
+                         and install the locked dependencies with 'uv sync'.
+                         The server then finds .venv on its own, so the client
+                         config needs no KICAD_PYTHON or PYTHONPATH.
   --name NAME            MCP server name (default: kicad)
   --claude-config PATH   Path to Claude Desktop config file
                          (default: ${XDG_CONFIG_HOME:-$HOME/.config}/Claude/claude_desktop_config.json)
@@ -75,6 +81,10 @@ while [[ $# -gt 0 ]]; do
       ASSUME_YES=1
       shift
       ;;
+    --use-uv)
+      USE_UV=1
+      shift
+      ;;
     --name)
       [[ $# -ge 2 ]] || fail "--name requires a value"
       SERVER_NAME="$2"
@@ -98,6 +108,9 @@ done
 [[ -n "$MODE" ]] || { usage; exit 1; }
 [[ -n "$SERVER_NAME" ]] || fail "Server name must not be empty"
 [[ "$(uname -s)" == "Linux" ]] || fail "This setup script only supports Linux"
+if [[ $USE_UV -eq 1 && "$MODE" != "apply" ]]; then
+  fail "--use-uv creates .venv, so it needs --apply. Use --verify without it to check an existing .venv."
+fi
 
 if [[ -z "$CLAUDE_CONFIG_PATH" ]]; then
   CLAUDE_CONFIG_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/Claude/claude_desktop_config.json"
@@ -128,39 +141,8 @@ NODE_PATH="$(command -v node || true)"
 
 [[ -f "$DIST_JS" ]] || fail "Missing build artifact: $DIST_JS. Run 'npm install && npm run build' first."
 
+# Read before find_pcbnew_python reuses KICAD_PYTHON for its result.
 KICAD_PYTHON_OVERRIDE="${KICAD_PYTHON:-}"
-PYTHON_CANDIDATES=()
-
-# The server gives a repository virtual environment precedence over
-# KICAD_PYTHON, so verify that same interpreter when one is present.
-PROJECT_VENV_PYTHON=""
-for venv_python in "$REPO_ROOT/venv/bin/python" "$REPO_ROOT/.venv/bin/python"; do
-  if [[ -e "$venv_python" ]]; then
-    [[ -x "$venv_python" ]] || fail "Virtual environment Python is not executable: $venv_python"
-    PROJECT_VENV_PYTHON="$venv_python"
-    break
-  fi
-done
-
-if [[ -n "$PROJECT_VENV_PYTHON" ]]; then
-  if [[ -n "$KICAD_PYTHON_OVERRIDE" && "$KICAD_PYTHON_OVERRIDE" != "$PROJECT_VENV_PYTHON" ]]; then
-    warn "A project virtual environment takes precedence over KICAD_PYTHON: $PROJECT_VENV_PYTHON"
-  fi
-  PYTHON_CANDIDATES+=("$PROJECT_VENV_PYTHON")
-elif [[ -n "$KICAD_PYTHON_OVERRIDE" ]]; then
-  [[ -x "$KICAD_PYTHON_OVERRIDE" ]] || fail "KICAD_PYTHON is not executable: $KICAD_PYTHON_OVERRIDE"
-  PYTHON_CANDIDATES+=("$KICAD_PYTHON_OVERRIDE")
-else
-  # Keep this order aligned with the server's Linux Python discovery.
-  PYTHON_CANDIDATES+=(
-    "/usr/lib/kicad/bin/python3"
-    "/usr/local/lib/kicad/bin/python3"
-    "/opt/kicad/bin/python3"
-    "$HELPER_PYTHON"
-    "/usr/bin/python3"
-    "/bin/python3"
-  )
-fi
 
 BASE_PYTHONPATH_CANDIDATES=(
   "/usr/lib/kicad/lib/python3/dist-packages"
@@ -225,49 +207,139 @@ print(json.dumps(result))
 PY
 }
 
+# Try each interpreter in turn, with no extra path first and then the usual
+# pcbnew locations. Sets KICAD_PYTHON, DETECT_JSON and PCBNEW_EXTRA_PATH.
 KICAD_PYTHON=""
 DETECT_JSON=""
+PCBNEW_EXTRA_PATH=""
+find_pcbnew_python() {
+  local candidate candidate_version candidate_pythonpath attempt_json
+  local -a candidate_pythonpaths
+  for candidate in "$@"; do
+    [[ -x "$candidate" ]] || continue
 
-for candidate in "${PYTHON_CANDIDATES[@]}"; do
-  [[ -x "$candidate" ]] || continue
-
-  candidate_version="$("$candidate" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
-  candidate_pythonpaths=("" "${BASE_PYTHONPATH_CANDIDATES[@]}")
-  if [[ -n "$candidate_version" ]]; then
-    candidate_pythonpaths+=(
-      "/usr/lib/python${candidate_version}/dist-packages"
-      "/usr/local/lib/python${candidate_version}/dist-packages"
-      "/usr/lib/python${candidate_version}/site-packages"
-      "/usr/local/lib/python${candidate_version}/site-packages"
-      "/usr/lib64/python${candidate_version}/site-packages"
-      "$HOME/.local/lib/python${candidate_version}/dist-packages"
-      "$HOME/.local/lib/python${candidate_version}/site-packages"
-    )
-  fi
-
-  for candidate_pythonpath in "${candidate_pythonpaths[@]}"; do
-    if [[ -n "$candidate_pythonpath" && ! -d "$candidate_pythonpath" ]]; then
-      continue
+    candidate_version="$("$candidate" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
+    candidate_pythonpaths=("" "${BASE_PYTHONPATH_CANDIDATES[@]}")
+    if [[ -n "$candidate_version" ]]; then
+      candidate_pythonpaths+=(
+        "/usr/lib/python${candidate_version}/dist-packages"
+        "/usr/local/lib/python${candidate_version}/dist-packages"
+        "/usr/lib/python${candidate_version}/site-packages"
+        "/usr/local/lib/python${candidate_version}/site-packages"
+        "/usr/lib64/python${candidate_version}/site-packages"
+        "$HOME/.local/lib/python${candidate_version}/dist-packages"
+        "$HOME/.local/lib/python${candidate_version}/site-packages"
+      )
     fi
 
-    attempt_json="$(detect_pcbnew "$candidate" "$candidate_pythonpath" 2>/dev/null || true)"
-    if [[ -n "$attempt_json" ]] && "$HELPER_PYTHON" -c \
-      'import json,sys; value=json.loads(sys.argv[1]); assert value["python_executable"]' \
-      "$attempt_json" 2>/dev/null; then
-      KICAD_PYTHON="$candidate"
-      DETECT_JSON="$attempt_json"
-      break 2
-    fi
+    for candidate_pythonpath in "${candidate_pythonpaths[@]}"; do
+      if [[ -n "$candidate_pythonpath" && ! -d "$candidate_pythonpath" ]]; then
+        continue
+      fi
+
+      attempt_json="$(detect_pcbnew "$candidate" "$candidate_pythonpath" 2>/dev/null || true)"
+      if [[ -n "$attempt_json" ]] && "$HELPER_PYTHON" -c \
+        'import json,sys; value=json.loads(sys.argv[1]); assert value["python_executable"]' \
+        "$attempt_json" 2>/dev/null; then
+        KICAD_PYTHON="$candidate"
+        DETECT_JSON="$attempt_json"
+        PCBNEW_EXTRA_PATH="$candidate_pythonpath"
+        return 0
+      fi
+    done
   done
+  return 1
+}
+
+# Interpreters that may carry pcbnew, in the server's Linux discovery order.
+SYSTEM_PYTHON_CANDIDATES=(
+  "/usr/lib/kicad/bin/python3"
+  "/usr/local/lib/kicad/bin/python3"
+  "/opt/kicad/bin/python3"
+  "$HELPER_PYTHON"
+  "/usr/bin/python3"
+  "/bin/python3"
+)
+
+
+# --use-uv: build .venv from the interpreter that imports pcbnew, then verify
+# it below like any other project venv.
+if [[ $USE_UV -eq 1 ]]; then
+  command -v uv >/dev/null 2>&1 || fail "uv not found in PATH. Install it from https://docs.astral.sh/uv/getting-started/installation/ or rerun without --use-uv"
+  if [[ -e "$REPO_ROOT/venv" ]]; then
+    fail "$REPO_ROOT/venv exists and the server prefers it over .venv. Remove or rename it, then rerun with --use-uv."
+  fi
+  if [[ -n "$KICAD_PYTHON_OVERRIDE" ]]; then
+    find_pcbnew_python "$KICAD_PYTHON_OVERRIDE" || fail "KICAD_PYTHON could not import pcbnew: $KICAD_PYTHON_OVERRIDE"
+  else
+    find_pcbnew_python "${SYSTEM_PYTHON_CANDIDATES[@]}" || fail "Could not find a Python executable that imports pcbnew. Install KiCad's Python bindings or set KICAD_PYTHON."
+  fi
+  BASE_PYTHON="$KICAD_PYTHON"
+  # The last entry of the detected path is pcbnew's own directory.
+  BASE_PCBNEW_PATH="$($HELPER_PYTHON -c 'import json,os,sys; print(json.loads(sys.argv[1])["pythonpath"].split(os.pathsep)[-1])' "$DETECT_JSON")"
+  section "uv virtual environment"
+  info "Creating $REPO_ROOT/.venv from $BASE_PYTHON (system site-packages for pcbnew)"
+  (cd "$REPO_ROOT" && uv venv .venv --clear --python "$BASE_PYTHON" --system-site-packages) || fail "uv venv failed"
+  info "Installing the locked Python dependencies (uv sync --no-dev)"
+  (cd "$REPO_ROOT" && UV_PROJECT_ENVIRONMENT=.venv uv sync --no-dev) || fail "uv sync failed"
+  UV_VENV_PYTHON="$REPO_ROOT/.venv/bin/python"
+  if ! "$UV_VENV_PYTHON" -c 'import pcbnew' >/dev/null 2>&1; then
+    # pcbnew lives outside the base interpreter's site-packages (KiCad's own
+    # dist-packages, for example). A .pth file appends it after the venv's
+    # packages; PYTHONPATH would put it, and its neighbours, ahead of them.
+    VENV_SITE="$("$UV_VENV_PYTHON" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+    printf '%s\n' "$BASE_PCBNEW_PATH" > "$VENV_SITE/kicad_pcbnew.pth"
+    "$UV_VENV_PYTHON" -c 'import pcbnew' >/dev/null 2>&1 || fail ".venv still cannot import pcbnew (added $BASE_PCBNEW_PATH)"
+    info "Added $BASE_PCBNEW_PATH to .venv through kicad_pcbnew.pth"
+  fi
+  info ".venv is ready"
+  KICAD_PYTHON=""
+  DETECT_JSON=""
+  PCBNEW_EXTRA_PATH=""
+fi
+
+PYTHON_CANDIDATES=()
+
+# The server gives a repository virtual environment precedence over
+# KICAD_PYTHON, so verify that same interpreter when one is present.
+PROJECT_VENV_PYTHON=""
+for venv_python in "$REPO_ROOT/venv/bin/python" "$REPO_ROOT/.venv/bin/python"; do
+  if [[ -e "$venv_python" ]]; then
+    [[ -x "$venv_python" ]] || fail "Virtual environment Python is not executable: $venv_python"
+    PROJECT_VENV_PYTHON="$venv_python"
+    break
+  fi
 done
 
-if [[ -z "$DETECT_JSON" ]]; then
+if [[ -n "$PROJECT_VENV_PYTHON" ]]; then
+  if [[ -n "$KICAD_PYTHON_OVERRIDE" && "$KICAD_PYTHON_OVERRIDE" != "$PROJECT_VENV_PYTHON" && $USE_UV -eq 0 ]]; then
+    warn "A project virtual environment takes precedence over KICAD_PYTHON: $PROJECT_VENV_PYTHON"
+  fi
+  PYTHON_CANDIDATES+=("$PROJECT_VENV_PYTHON")
+elif [[ -n "$KICAD_PYTHON_OVERRIDE" ]]; then
+  [[ -x "$KICAD_PYTHON_OVERRIDE" ]] || fail "KICAD_PYTHON is not executable: $KICAD_PYTHON_OVERRIDE"
+  PYTHON_CANDIDATES+=("$KICAD_PYTHON_OVERRIDE")
+else
+  PYTHON_CANDIDATES+=("${SYSTEM_PYTHON_CANDIDATES[@]}")
+fi
+
+if ! find_pcbnew_python "${PYTHON_CANDIDATES[@]}"; then
   if [[ -n "$PROJECT_VENV_PYTHON" ]]; then
     fail "Project virtual environment could not import pcbnew: $PROJECT_VENV_PYTHON"
   elif [[ -n "$KICAD_PYTHON_OVERRIDE" ]]; then
     fail "KICAD_PYTHON could not import pcbnew: $KICAD_PYTHON_OVERRIDE"
   fi
   fail "Could not find a Python executable that imports pcbnew. Install KiCad's Python bindings or set KICAD_PYTHON."
+fi
+
+# A uv-managed venv that imports pcbnew on its own needs nothing in the client
+# config: the server finds <repo>/.venv itself and injects no PYTHONPATH, so
+# KiCad's system packages cannot shadow the versions pinned in uv.lock. uv
+# venvs also have no pip, so missing packages are installed with uv sync.
+UV_MANAGED=0
+if [[ -n "$PROJECT_VENV_PYTHON" && -z "$PCBNEW_EXTRA_PATH" ]] \
+  && grep -qE '^uv[[:space:]]*=' "$(dirname "$(dirname "$PROJECT_VENV_PYTHON")")/pyvenv.cfg" 2>/dev/null; then
+  UV_MANAGED=1
 fi
 
 PYTHON_EXE="$($HELPER_PYTHON -c 'import json,sys; print(json.loads(sys.argv[1])["python_executable"])' "$DETECT_JSON")"
@@ -278,7 +350,12 @@ PCBNEW_MODULE="$($HELPER_PYTHON -c 'import json,sys; print(json.loads(sys.argv[1
 
 # Import in a fresh process with the exact PYTHONPATH written to the client
 # config: a successful discovery probe alone does not verify this environment.
-DEPENDENCY_ERRORS="$(PYTHONPATH="$PYTHONPATH_VALUE" "$KICAD_PYTHON" - <<'PY'
+if [[ $UV_MANAGED -eq 1 ]]; then
+  CHECK_PYTHONPATH=""
+else
+  CHECK_PYTHONPATH="$PYTHONPATH_VALUE"
+fi
+DEPENDENCY_ERRORS="$(PYTHONPATH="$CHECK_PYTHONPATH" "$KICAD_PYTHON" - <<'PY'
 import contextlib
 import importlib
 import sys
@@ -313,21 +390,24 @@ show_dependency_errors() {
   warn "Missing or broken Python dependencies in the generated environment:"
   printf '%s\n' "$DEPENDENCY_ERRORS"
   echo "Install the requirements into the selected interpreter, then rerun --verify:"
-  printf '  %q -m pip install -r %q\n' "$KICAD_PYTHON" "$REPO_ROOT/requirements.txt"
+  if [[ $UV_MANAGED -eq 1 ]]; then
+    printf '  (cd %q && uv sync --no-dev)\n' "$REPO_ROOT"
+  else
+    printf '  %q -m pip install -r %q\n' "$KICAD_PYTHON" "$REPO_ROOT/requirements.txt"
+  fi
 }
 
-CONFIG_FRAGMENT_JSON="$($HELPER_PYTHON - "$NODE_PATH" "$DIST_JS" "$KICAD_PYTHON" "$PYTHONPATH_VALUE" <<'PY'
+CONFIG_FRAGMENT_JSON="$($HELPER_PYTHON - "$NODE_PATH" "$DIST_JS" "$KICAD_PYTHON" "$PYTHONPATH_VALUE" "$UV_MANAGED" <<'PY'
 import json
 import sys
 
+env = {"LOG_LEVEL": "info"}
+if sys.argv[5] != "1":
+    env = {"KICAD_PYTHON": sys.argv[3], "PYTHONPATH": sys.argv[4], **env}
 fragment = {
     "command": sys.argv[1],
     "args": [sys.argv[2]],
-    "env": {
-        "KICAD_PYTHON": sys.argv[3],
-        "PYTHONPATH": sys.argv[4],
-        "LOG_LEVEL": "info",
-    },
+    "env": env,
 }
 print(json.dumps(fragment, indent=2))
 PY
@@ -352,8 +432,26 @@ show_detected() {
   echo "  Python executable: $PYTHON_EXE"
   echo "  Python version:    $PYTHON_VERSION"
   echo "  pcbnew module:     $PCBNEW_MODULE"
-  echo "  PYTHONPATH:        $PYTHONPATH_VALUE"
+  if [[ $UV_MANAGED -eq 1 ]]; then
+    echo "  PYTHONPATH:        (none: uv-managed .venv, found by the server)"
+  else
+    echo "  PYTHONPATH:        $PYTHONPATH_VALUE"
+  fi
   echo "  Claude config:     $CLAUDE_CONFIG_PATH"
+}
+
+show_claude_code_hint() {
+  section "Claude Code (optional)"
+  echo "  Claude Code (the CLI) does not read the Claude Desktop config."
+  echo "  To register the server there as well, run:"
+  echo
+  echo "  claude mcp add --scope user $SERVER_NAME \\"
+  if [[ $UV_MANAGED -ne 1 ]]; then
+    echo "    --env KICAD_PYTHON=\"$KICAD_PYTHON\" \\"
+    echo "    --env PYTHONPATH=\"$PYTHONPATH_VALUE\" \\"
+  fi
+  echo "    --env LOG_LEVEL=info \\"
+  echo "    -- \"$NODE_PATH\" \"$DIST_JS\""
 }
 
 merge_config() {
@@ -408,6 +506,7 @@ if [[ "$MODE" == "verify" ]]; then
   show_detected
   section "Proposed Claude Desktop entry ('$SERVER_NAME')"
   echo "$CONFIG_FRAGMENT_JSON"
+  show_claude_code_hint
   if [[ -n "$DEPENDENCY_ERRORS" ]]; then
     show_dependency_errors
     exit 1
@@ -494,4 +593,6 @@ echo "  2. Reopen Claude Desktop"
 echo "  3. In a new chat, check: + → Connectors"
 echo "  4. Verify with:"
 echo "     Use the ${BOLD}$SERVER_NAME${RESET} MCP server to run ${BOLD}check_kicad_ui${RESET}."
+
+show_claude_code_hint
 echo

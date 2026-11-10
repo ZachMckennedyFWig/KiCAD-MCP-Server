@@ -407,27 +407,31 @@ try:
     from commands.backannotate_footprints import backannotate_footprints
     from commands.board import BoardCommands
     from commands.board.origin import BoardOriginCommands
-    from commands.board_query import BoardQueryCommands
     from commands.board_edit import BoardEditCommands
+    from commands.board_query import BoardQueryCommands
+    from commands.bom_tools import apply_property_map
     from commands.component import ComponentCommands
     from commands.component_groups import group_components
     from commands.connection_schematic import ConnectionManager
     from commands.datasheet_manager import DatasheetManager
     from commands.design_rules import DesignRuleCommands
-    from commands.drc_rules import DrcRuleCommands
     from commands.digikey import (
         digikey_check_library_availability,
         digikey_search_parts,
         digikey_test_connection,
     )
+    from commands.drc_rules import DrcRuleCommands
     from commands.eagle import EagleCommands
     from commands.export import ExportCommands
-    from commands.finishing import FinishingCommands
+    from commands.fab_package import fab_package
     from commands.find_duplicate_symbols import find_duplicate_symbols
+    from commands.finishing import FinishingCommands
     from commands.footprint import FootprintCreator
     from commands.freerouting import FreeroutingCommands
     from commands.gui_driver import GuiDriverCommands
     from commands.hierarchical_place import HierarchicalPlaceCommands
+    from commands.impedance import ImpedanceCommands
+    from commands.jlc_sourcing import jlc_bom_report, jlc_find_alternative
     from commands.jlcpcb import JLCPCBClient, test_jlcpcb_connection
     from commands.jlcpcb_parts import JLCPCBPartsManager
     from commands.library import (
@@ -454,7 +458,13 @@ try:
     from commands.schematic_field_layout import SchematicFieldLayoutCommands
     from commands.schematic_hierarchy import SchematicHierarchyCommands
     from commands.schematic_lint import SchematicLintCommands
+    from commands.script_runner import ScriptRunnerCommands
     from commands.set_symbol_pin_type import set_symbol_pin_type
+    from commands.snapshots import (
+        SnapshotCommands,
+        maybe_auto_snapshot,
+        restore_schematic_targets,
+    )
     from commands.stackup import StackupCommands
     from commands.standards import StandardsCommands
     from commands.symbol_creator import SymbolCreator
@@ -465,18 +475,6 @@ try:
     from commands.update_symbol_from_library import update_symbol_from_library
     from commands.validate_kicad_files import validate_schematic, validate_symbol_library
     from commands.via_summary import ViaSummaryCommands
-
-    # BOM/sourcing, fab package, snapshots/undo, script escape hatch
-    # (MCP_ISSUES S4, S5, F3, I1, I3)
-    from commands.bom_tools import apply_property_map
-    from commands.fab_package import fab_package
-    from commands.jlc_sourcing import jlc_bom_report, jlc_find_alternative
-    from commands.script_runner import ScriptRunnerCommands
-    from commands.snapshots import (
-        SnapshotCommands,
-        maybe_auto_snapshot,
-        restore_schematic_targets,
-    )
 
     logger.info("Successfully imported all command handlers")
 except ImportError as e:
@@ -540,6 +538,7 @@ class KiCADInterface(SchematicHandlersMixin):
         self.via_summary_commands = ViaSummaryCommands(self.board)
         # Reads self.board on every call, so open/reload need not update it.
         self.board_query_commands = BoardQueryCommands(lambda: self.board)
+        self.impedance_commands = ImpedanceCommands(lambda: self.board)
         self.freerouting_commands = FreeroutingCommands(self.board)
         self.eagle_commands = EagleCommands()
         self.symbol_schematic_commands = SymbolSchematicCommands()
@@ -687,6 +686,7 @@ class KiCADInterface(SchematicHandlersMixin):
             "query_zones": self.routing_commands.query_zones,
             "get_stackup": self.stackup_commands.get_stackup,
             "summarize_vias": self.via_summary_commands.summarize_vias,
+            "calculate_impedance": self.impedance_commands.calculate_impedance,
             "set_stackup_layer": self.stackup_commands.set_stackup_layer,
             "add_gnd_stitching_vias": self.routing_commands.add_gnd_stitching_vias,
             "modify_trace": self.routing_commands.modify_trace,
@@ -914,7 +914,7 @@ class KiCADInterface(SchematicHandlersMixin):
             "import_ses": self.freerouting_commands.import_ses,
             "check_freerouting": self.freerouting_commands.check_freerouting,
             # Routing workflows (MCP_ISSUES R1, R3, R5: fanout_to_planes, route_connection,
-            # route_bus, length_match) and background jobs (principle 6: job_status,
+            # route_bus, length_match, tune_length) and background jobs (principle 6: job_status,
             # job_list, job_cancel, job_apply). Handlers read the live board through
             # the provider, so reloads need no _update_command_handlers entry.
             **routing_workflow_routes(lambda: self.board),
@@ -1515,6 +1515,8 @@ class KiCADInterface(SchematicHandlersMixin):
         "fanout_to_planes",
         "route_connection",
         "route_bus",
+        # tune_length returns dryRun / _skipAutoSave when it wrote nothing.
+        "tune_length",
     }
 
     # Commands that write a .kicad_sch file. They are refused while the target
@@ -7153,6 +7155,9 @@ def main() -> None:
                         # Return list of available tools with proper schemas
                         tools = []
                         for cmd_name in interface.command_routes.keys():
+                            if cmd_name.startswith("_"):
+                                # Internal commands (e.g. _warmup) are not tools.
+                                continue
                             if cmd_name in TOOL_SCHEMAS:
                                 # Enrich the existing schema with IPC annotation data
                                 # (adds description/blocking hints where the schema lacks them)

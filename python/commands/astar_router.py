@@ -734,10 +734,19 @@ class RouterCommands:
         return out
 
     def route_bus(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Route several connections in order; each later one treats earlier ones as obstacles.
+        """Route several connections as a bus.
 
-        ``pitch`` (centre-to-centre, mm) sets the spacing between bus members:
-        their mutual clearance becomes ``pitch - width`` (never below the rule
+        ``mode="parallel"`` (default) routes a true parallel bundle: one guide
+        corridor wide enough for every member, member trunks offset from it
+        at ``pitch`` with miter joins, A* fan-in/fan-out legs to the pads, an
+        exact clearance check, then all-or-nothing write (see
+        ``commands.bus_router``). If no corridor is found or the geometry
+        fails clearance it falls back to ``mode="sequential"`` and says why
+        (``modeUsed``, ``fallbackReason``).
+
+        ``mode="sequential"`` routes the connections in order; each later one
+        treats earlier ones as obstacles and ``pitch`` (centre-to-centre, mm)
+        makes their mutual clearance ``pitch - width`` (never below the rule
         clearance). All connections are written together, or none.
         """
         if not self.board:
@@ -745,7 +754,91 @@ class RouterCommands:
         conns = params.get("connections") or []
         if not isinstance(conns, list) or not conns:
             return _fail("connections must be a non-empty list of {net, from?, to?}")
-        shared = {k: v for k, v in params.items() if k not in ("connections", "dryRun", "pitch")}
+        for i, c in enumerate(conns):
+            net = c.get("net") if isinstance(c, dict) else None
+            if not net or self.board.FindNet(net) is None:
+                return _fail(f"connections[{i}]: unknown or missing net {net!r}")
+        mode = params.get("mode", "parallel")
+        if mode not in ("parallel", "sequential"):
+            return _fail("mode must be 'parallel' or 'sequential'")
+        if mode == "sequential":
+            return self._route_bus_sequential(params, mode)
+        for key in ("breakoutRadius", "legRoom", "timeBudget", "pitch"):
+            val = params.get(key)
+            if val is not None and (not isinstance(val, (int, float)) or val <= 0):
+                return _fail(f"{key} must be a positive number of mm (seconds for timeBudget)")
+        order = params.get("order")
+        if order is not None and not (
+            isinstance(order, list) and all(isinstance(n, str) for n in order)
+        ):
+            return _fail("order must be a list of net names")
+        from commands.bus_router import BundleFallback, BundlePlanner
+
+        t0 = time.time()
+        try:
+            ctx = self._context()
+            bundle = BundlePlanner(self, ctx, params).plan()
+        except BundleFallback as exc:
+            out = self._route_bus_sequential(params, mode)
+            out.setdefault("mode", mode)
+            out.setdefault("modeUsed", "sequential")
+            out["fallbackReason"] = str(exc)
+            if out.get("success"):
+                out["message"] += f" (sequential fallback: {exc})"
+            return out
+        except ValueError as exc:
+            return _fail("Invalid route_bus request", str(exc))
+        except Exception as exc:
+            logger.exception("route_bus failed")
+            return _fail("route_bus failed", f"{type(exc).__name__}: {exc}")
+        planned = bundle.pop("planned")
+        dry = bool(params.get("dryRun", False))
+        locked = bool(params.get("locked", False))
+        if not dry:
+            written: List[Any] = []
+            try:
+                for net, plan, opts in planned:
+                    written += self._write(net, plan, opts, locked)
+            except Exception as exc:
+                for item in written:
+                    try:
+                        delete_board_item(self.board, item)
+                    except Exception:
+                        pass
+                return _fail("Writing the bus failed; the board is unchanged", str(exc))
+        members = bundle.pop("members")
+        lengths = {m["net"]: m["lengthMm"] for m in members}
+        spread = max(lengths.values()) - min(lengths.values())
+        out = {
+            "success": True,
+            "message": (
+                f"{'Planned' if dry else 'Routed'} a parallel bundle of {len(members)} nets "
+                f"at {bundle['pitch']} mm pitch on {bundle['layer']}; "
+                f"length spread {spread:.3f} mm"
+            ),
+            "mode": mode,
+            "modeUsed": "parallel",
+            "dryRun": dry,
+            "written": not dry,
+            "locked": locked,
+            "results": members + bundle.pop("skipped"),
+            "lengths": lengths,
+            "lengthSpreadMm": round(spread, 3),
+            "segments": sum(m["segments"] for m in members),
+            "vias": sum(m["vias"] for m in members),
+            "seconds": round(time.time() - t0, 3),
+        }
+        out.update(bundle)
+        return out
+
+    def _route_bus_sequential(self, params: Dict[str, Any], mode: str) -> Dict[str, Any]:
+        """route_bus mode="sequential" (also the parallel-mode fallback)."""
+        conns = params.get("connections") or []
+        shared = {
+            k: v
+            for k, v in params.items()
+            if k not in ("connections", "dryRun", "pitch", "mode", "order", "layer", "allowVias")
+        }
         pitch = params.get("pitch")
         t0 = time.time()
         try:
@@ -801,17 +894,31 @@ class RouterCommands:
                     except Exception:
                         pass
                 return _fail("Writing the bus failed; the board is unchanged", str(exc))
+        lengths = {r["net"]: r["lengthMm"] for r in results if "lengthMm" in r}
         return {
             "success": True,
             "message": f"{'Planned' if dry else 'Routed'} {len(planned)} of {len(conns)} connections",
+            "mode": mode,
+            "modeUsed": "sequential",
             "dryRun": dry,
             "written": not dry,
             "results": results,
+            "lengths": lengths,
+            "lengthSpreadMm": (
+                round(max(lengths.values()) - min(lengths.values()), 3) if lengths else 0.0
+            ),
+            "segments": sum(r.get("segments", 0) for r in results),
+            "vias": sum(r.get("vias", 0) for r in results),
             "seconds": round(time.time() - t0, 3),
         }
 
     def length_match(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Report routed lengths of nets / pairs against a target and tolerance (no tuning)."""
+        """Report routed lengths of nets / pairs against a target and tolerance.
+
+        Report only: length_match is a read-only tool (it is allowed in the
+        readonly operating mode). ``tune_length`` (commands/length_tuning.py)
+        adds the serpentine meanders.
+        """
         if not self.board:
             return _fail("No board is loaded", "Load or create a board first")
         nets = list(params.get("nets") or [])
@@ -880,7 +987,8 @@ class RouterCommands:
             "pairs": pair_rows,
             "note": (
                 "Lengths are the sum of routed track/arc lengths per net (vias and pad "
-                "internals excluded). This tool reports only; it does not add tuning meanders."
+                "internals excluded). This report adds no meanders: use tune_length to add "
+                "serpentine tuning (it takes the same nets/pairs/tolerance)."
             ),
         }
 

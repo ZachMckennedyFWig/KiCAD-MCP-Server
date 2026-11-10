@@ -12,7 +12,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pcbnew
+from commands.impedance import (
+    board_minimums,
+    format_pair_impedance,
+    net_class_diff_pair_gap,
+    pair_impedance,
+    public_geometry,
+    read_layer_geometry,
+    solve_pair,
+)
 from utils.board_items import delete_board_item
+from utils.impedance import ACCURACY_NOTE as IMPEDANCE_ACCURACY_NOTE
+from utils.impedance import ImpedanceError
 
 logger = logging.getLogger("kicad_interface")
 
@@ -599,6 +610,11 @@ def persist_net_color_to_project(
             "persisted": False,
             "warning": f"could not persist net color to {pro_path}: {exc}",
         }
+
+
+# Pair gap when neither the caller nor (with targetImpedance) the net class
+# gives one, mm.
+DIFF_PAIR_DEFAULT_GAP_MM = 0.2
 
 
 class RoutingCommands:
@@ -2587,12 +2603,25 @@ class RoutingCommands:
             layer = params.get("layer", "F.Cu")
             width = params.get("width")
             gap = params.get("gap")
+            # Differential impedance target in ohms (90 USB, 100 Ethernet/LVDS).
+            target_impedance = params.get("targetImpedance")
 
             if not start_pos or not end_pos or not net_pos or not net_neg:
                 return {
                     "success": False,
                     "message": "Missing parameters",
                     "errorDetails": "startPos, endPos, positiveNet, and negativeNet are required",
+                }
+            if target_impedance is not None and (
+                isinstance(target_impedance, bool)
+                or not isinstance(target_impedance, (int, float))
+                or not math.isfinite(target_impedance)
+                or target_impedance <= 0
+            ):
+                return {
+                    "success": False,
+                    "message": "Invalid targetImpedance",
+                    "errorDetails": "targetImpedance must be a positive number of ohms",
                 }
 
             # Get layer ID
@@ -2643,9 +2672,53 @@ class RoutingCommands:
             px = -dy
             py = dx
 
+            # Read the layer's stackup geometry once: it sizes the pair for
+            # targetImpedance and reports the impedance of what is routed.
+            geometry = None
+            geometry_error = None
+            try:
+                geometry = read_layer_geometry(self.board, layer)
+            except Exception as exc:
+                geometry_error = str(exc)
+
+            solved_for = None
+            if target_impedance is not None and not (width and gap):
+                if geometry is None:
+                    return {
+                        "success": False,
+                        "message": "Cannot size the pair for targetImpedance",
+                        "errorDetails": geometry_error or "No stackup geometry for the layer",
+                    }
+                bounds = board_minimums(self.board)
+                try:
+                    if width:
+                        width, gap, solved_for = solve_pair(
+                            geometry, float(target_impedance), float(width), None, bounds
+                        )
+                    else:
+                        fixed_gap = gap
+                        if fixed_gap is None:
+                            fixed_gap = (
+                                net_class_diff_pair_gap(self.board, net_pos, net_pos_obj)
+                                or DIFF_PAIR_DEFAULT_GAP_MM
+                            )
+                        width, gap, solved_for = solve_pair(
+                            geometry, float(target_impedance), None, float(fixed_gap), bounds
+                        )
+                except ImpedanceError as exc:
+                    return {
+                        "success": False,
+                        "message": "Target impedance is out of reach",
+                        "errorDetails": str(exc),
+                        "geometry": public_geometry(geometry),
+                    }
+                # Whole micrometres; the impedance below is for these values.
+                width = round(width, 3)
+                gap = round(gap, 3)
+
             # Set default gap if not provided
             if gap is None:
-                gap = 0.2  # mm
+                gap = DIFF_PAIR_DEFAULT_GAP_MM
 
             # Convert to nm
             gap_nm = int(gap * 1000000)
@@ -2695,18 +2768,44 @@ class RoutingCommands:
             self.board.Add(pos_track)
             self.board.Add(neg_track)
 
-            return {
+            used_width = pos_track.GetWidth() / 1000000
+            impedance: Optional[Dict[str, Any]] = None
+            if geometry is not None:
+                try:
+                    impedance = format_pair_impedance(pair_impedance(geometry, used_width, gap))
+                    impedance["stackupSource"] = geometry.get("stackupSource")
+                    impedance["structure"] = geometry.get("structure")
+                    impedance["referencePlanes"] = geometry.get("referencePlanes")
+                    if geometry.get("stackupNote"):
+                        impedance["stackupNote"] = geometry["stackupNote"]
+                    impedance["accuracyNote"] = IMPEDANCE_ACCURACY_NOTE
+                except Exception as exc:
+                    geometry_error = str(exc)
+                    impedance = None
+
+            diff_pair: Dict[str, Any] = {
+                "posNet": net_pos,
+                "negNet": net_neg,
+                "layer": layer,
+                "width": used_width,
+                "gap": gap,
+                "length": length / 1000000,
+            }
+            if target_impedance is not None:
+                diff_pair["targetImpedance"] = target_impedance
+            if solved_for:
+                diff_pair["solvedFor"] = solved_for
+            result: Dict[str, Any] = {
                 "success": True,
                 "message": "Added differential pair traces",
-                "diffPair": {
-                    "posNet": net_pos,
-                    "negNet": net_neg,
-                    "layer": layer,
-                    "width": pos_track.GetWidth() / 1000000,
-                    "gap": gap,
-                    "length": length / 1000000,
-                },
+                "diffPair": diff_pair,
+                "impedance": impedance,
             }
+            if impedance is not None:
+                result["message"] += f" (Zdiff {impedance['zDiff']} ohm)"
+            elif geometry_error:
+                result["impedanceError"] = geometry_error
+            return result
 
         except Exception as e:
             logger.error(f"Error routing differential pair: {str(e)}")
