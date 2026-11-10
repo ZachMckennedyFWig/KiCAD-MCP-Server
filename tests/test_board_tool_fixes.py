@@ -530,4 +530,7 @@ def test_autoroute_and_ses_import_flag_their_board_write():
     import inspect
 
     src = inspect.getsource(FreeroutingCommands)
-    assert src.count('"_boardFileWritten"') == 2
+    # legacy autoroute + import_ses set it; the orchestrated autoroute forwards
+    # the apply step's flag (one line, two literals)
+    assert src.count('"_boardFileWritten"') == 4
+    assert 'result["_boardFileWritten"] = applied["_boardFileWritten"]' in src

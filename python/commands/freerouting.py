@@ -781,6 +781,11 @@ class FreeroutingCommands:
                 "errorDetails": ("Provide boardPath or open a project first"),
             }
 
+        from commands.autoroute_pipeline import wants_orchestration
+
+        if wants_orchestration(params):
+            return self._autoroute_orchestrated(params, board_path)
+
         jar_path = params.get("freeroutingJar", DEFAULT_FREEROUTING_JAR)
         timeout = params.get("timeout", 300)
         passes = params.get("maxPasses", 20)
@@ -878,6 +883,192 @@ class FreeroutingCommands:
                         logger.warning(f"Could not keep artifact {src}: {copy_err}")
             shutil.rmtree(staging_dir, ignore_errors=True)
             _trim_shared_freerouting_log()
+
+    def _autoroute_orchestrated(self, params: Dict[str, Any], board_path: str) -> Dict[str, Any]:
+        """Orchestrated autoroute (R2): see ``commands/autoroute_pipeline.py``.
+
+        Validates options and stages the board on this (main) thread, then runs
+        the routing as a background job. ``async: true`` returns the jobId at
+        once; otherwise this waits for the job and applies an accepted result.
+        """
+        from commands import autoroute_pipeline as ap
+        from utils.jobs import JOBS
+        from utils.kicad_cli import resolve_kicad_cli
+
+        def bad(msg: str) -> Dict[str, Any]:
+            return {"success": False, "message": "Invalid autoroute option", "errorDetails": msg}
+
+        board_path = os.path.abspath(board_path)
+        if not os.path.isfile(board_path):
+            return bad(f"board file not found: {board_path} (save the board first)")
+        loaded = self.board.GetFileName()
+        if loaded and os.path.normcase(os.path.abspath(loaded)) != os.path.normcase(board_path):
+            return bad(
+                f"boardPath {board_path} is not the loaded board ({loaded}); the orchestrated "
+                "autoroute routes the loaded board, so open that board first"
+            )
+        jar_path = params.get("freeroutingJar", DEFAULT_FREEROUTING_JAR)
+        if not os.path.isfile(jar_path):
+            return {
+                "success": False,
+                "message": "Freerouting JAR not found",
+                "errorDetails": (
+                    f"Expected at: {jar_path}. Download from "
+                    "https://github.com/freerouting/freerouting/releases or set FREEROUTING_JAR."
+                ),
+            }
+        strip = params.get("stripRuleAreas") or "pour_only"
+        if strip not in ap.STRIP_POLICIES:
+            return bad(f"stripRuleAreas must be one of {ap.STRIP_POLICIES}")
+        import_mode = params.get("importMode") or "if_better"
+        if import_mode not in ap.IMPORT_MODES:
+            return bad(f"importMode must be one of {ap.IMPORT_MODES}")
+        try:
+            attempts = int(params.get("attempts") or 1)
+            max_passes = int(params.get("passes") or params.get("maxPasses") or 20)
+            timeout = float(params.get("timeout") or 300)
+            stall = params.get("stallTimeout")
+            stall = float(stall) if stall not in (None, "", 0) else None
+        except (TypeError, ValueError) as exc:
+            return bad(str(exc))
+        if attempts < 1 or max_passes < 1 or timeout <= 0 or (stall is not None and stall <= 0):
+            return bad("attempts, passes, timeout and stallTimeout must be positive")
+        nets = params.get("nets")
+        if nets is not None and (
+            not isinstance(nets, list) or not all(isinstance(n, str) for n in nets) or not nets
+        ):
+            return bad("nets must be a non-empty list of net names")
+        board_nets = set(self._board_net_names())
+        unknown = sorted(set(nets or []) - board_nets)
+        if unknown:
+            return bad(f"unknown nets: {unknown[:20]}")
+        copper_layers = [
+            self.board.GetLayerName(lid) for lid in self.board.GetEnabledLayers().CuStack()
+        ]
+        forbid = []
+        for i, entry in enumerate(params.get("forbidRegionsForNets") or []):
+            try:
+                polygon = ap.normalize_region(entry.get("region") or entry.get("polygon"))
+            except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                return bad(f"forbidRegionsForNets[{i}]: {exc}")
+            e_nets = entry.get("nets") or []
+            if not e_nets:
+                return bad(f"forbidRegionsForNets[{i}]: nets is required")
+            layers = entry.get("layers")
+            if layers and set(layers) - set(copper_layers):
+                return bad(f"forbidRegionsForNets[{i}]: unknown layers {layers}")
+            forbid.append({"nets": list(e_nets), "polygon": polygon, "layers": layers})
+
+        exec_mode = self._resolve_execution_mode(jar_path)
+        if exec_mode["mode"] == "error":
+            return {
+                "success": False,
+                "message": "No suitable Java runtime",
+                "errorDetails": exec_mode["error"],
+            }
+
+        stage_dir = tempfile.mkdtemp(prefix="kicad-mcp-autoroute-")
+        try:
+            staged = ap.stage_project(self.board, board_path, stage_dir)
+        except Exception as exc:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            return {
+                "success": False,
+                "message": "Could not stage a copy of the board",
+                "errorDetails": str(exc),
+            }
+        options = {
+            "nets": nets,
+            "lockExisting": bool(params.get("lockExisting", False)),
+            "stripRuleAreas": strip,
+            "forbidRegionsForNets": len(forbid),
+            "passes": max_passes,
+            "attempts": attempts,
+            "timeout": timeout,
+            "stallTimeout": stall,
+            "importMode": import_mode,
+            "evaluate": bool(params.get("evaluate", True)),
+            "lockRouted": bool(params.get("lockRouted", False)),
+        }
+        warnings = []
+        if staged["source"] == "disk":
+            warnings.append(
+                "The in-memory board could not be serialised; routing used the saved file."
+            )
+        if import_mode == "if_better" and not options["evaluate"]:
+            warnings.append("importMode=if_better needs evaluate=true; it was enabled")
+            options["evaluate"] = True
+        cfg = {
+            "boardPath": board_path,
+            "stageDir": stage_dir,
+            "stem": staged["stem"],
+            "staged": staged["staged"],
+            "baselineSource": staged["source"],
+            "baselineHash": staged["baselineHash"],
+            "diskHash": staged["diskHash"],
+            "jar": jar_path,
+            "useDocker": exec_mode["use_docker"],
+            "kicadCli": resolve_kicad_cli(),
+            "copperLayers": copper_layers,
+            "forbid": forbid,
+            "targetNets": list(params.get("targetNets") or []),
+            "passSchedule": list(params.get("passSchedule") or DEFAULT_PASS_SCHEDULE),
+            "maxPasses": max_passes,
+            "keepArtifacts": bool(params.get("keepArtifacts", False)),
+            "warnings": warnings,
+            "options": options,
+            **{k: options[k] for k in ("lockExisting", "stripRuleAreas", "attempts")},
+            **{k: options[k] for k in ("timeout", "importMode", "evaluate", "lockRouted")},
+            "nets": nets,
+            "stallTimeout": stall,
+        }
+        job = JOBS.start(
+            "autoroute",
+            lambda ctx: ap.autoroute_job(ctx, cfg),
+            params={"boardPath": board_path, **options},
+            stall_timeout=stall,
+            apply_fn=ap.make_apply_fn(self, cfg),
+            cleanup_fn=ap.cleanup_fn(cfg),
+        )
+        if params.get("async"):
+            return {
+                "success": True,
+                "async": True,
+                "jobId": job.id,
+                "state": job.state,
+                "message": (
+                    "Autoroute started in the background. Poll job_status(jobId); when it has "
+                    "succeeded and result.decision.import is true, call job_apply(jobId) to "
+                    "write the routed board. The board is not changed until then."
+                ),
+                "options": options,
+                **({"warnings": warnings} if warnings else {}),
+            }
+
+        JOBS.wait(job.id)
+        snap = job.snapshot(log_lines=0)
+        result = dict(snap.get("result") or {})
+        if not result:
+            result = {"success": False, "message": snap.get("error") or "autoroute job failed"}
+        result["jobId"] = job.id
+        if job.state != "succeeded" or not result.get("success"):
+            result["success"] = False
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            return result
+        if not (result.get("decision") or {}).get("import"):
+            result["applied"] = False
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            return result
+        applied = JOBS.apply(job.id, {})
+        result["applied"] = bool(applied.get("success"))
+        if applied.get("success"):
+            result["_boardFileWritten"] = applied["_boardFileWritten"]
+            result["message"] = (result.get("message") or "") + "; applied to the board"
+        else:
+            result["success"] = False
+            result["message"] = applied.get("message")
+            shutil.rmtree(stage_dir, ignore_errors=True)
+        return result
 
     def _autoroute_staged(
         self,

@@ -99,6 +99,10 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set<string>([
   "check_clearance",
   "check_courtyard_overlaps",
   "check_freerouting",
+  // Background jobs and routing reports (never change the design)
+  "job_status",
+  "job_list",
+  "length_match",
   "check_placement_clearance",
   "estimate_airwire_lengths",
   "find_component",

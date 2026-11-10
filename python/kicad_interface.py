@@ -441,6 +441,7 @@ try:
     from commands.pcb_import import PcbImportCommands
     from commands.project import ProjectCommands
     from commands.routing import RoutingCommands
+    from commands.routing_workflows import routing_workflow_routes
     from commands.schematic import SchematicLoadError, SchematicManager
     from commands.schematic_batch import SchematicBatchCommands
     from commands.schematic_connectivity import assert_connectivity, relabel_net
@@ -842,6 +843,11 @@ class KiCADInterface(SchematicHandlersMixin):
             "export_dsn": self.freerouting_commands.export_dsn,
             "import_ses": self.freerouting_commands.import_ses,
             "check_freerouting": self.freerouting_commands.check_freerouting,
+            # Routing workflows (MCP_ISSUES R1, R3, R5: fanout_to_planes, route_connection,
+            # route_bus, length_match) and background jobs (principle 6: job_status,
+            # job_list, job_cancel, job_apply). Handlers read the live board through
+            # the provider, so reloads need no _update_command_handlers entry.
+            **routing_workflow_routes(lambda: self.board),
             # Eagle import commands
             "import_eagle_project": self.eagle_commands.import_eagle_project,
             # Schematic migration
@@ -1387,6 +1393,10 @@ class KiCADInterface(SchematicHandlersMixin):
         "connect_passthrough",
         "connect_to_net",
         "set_footprint_type",
+        # routing workflows (commands/routing_workflows.py)
+        "fanout_to_planes",
+        "route_connection",
+        "route_bus",
     }
 
     # Commands that write a .kicad_sch file. They are refused while the target

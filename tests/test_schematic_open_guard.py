@@ -401,6 +401,12 @@ _NOT_SCHEMATIC_WRITERS = {
             "export_dsn",
             "import_ses",
             "import_pcb",
+            # routing-workflows.ts, jobs.ts
+            "fanout_to_planes",
+            "route_connection",
+            "route_bus",
+            "job_apply",
+            "job_cancel",
         ],
         "writes the board",
     ),
