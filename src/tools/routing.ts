@@ -140,7 +140,9 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
   // Add copper pour tool
   server.tool(
     "add_copper_pour",
-    "Add a copper pour (ground/power plane) to the PCB",
+    "Add a copper pour (ground/power plane) to the PCB. Coordinates and sizes are mm. " +
+      "For several layers or a named zone use add_zone. Returns {success, message, pour: " +
+      "{layer, net, clearance, minWidth, priority, fillType, pointCount, padConnection?, ...}}.",
     {
       layer: z.string().describe("PCB layer"),
       net: z.string().describe("Net name"),
@@ -149,8 +151,21 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
         .array(z.object({ x: z.number(), y: z.number() }))
         .optional()
         .describe(
-          "Array of {x, y} points defining the pour boundary. If omitted, the board outline is used.",
+          "Array of {x, y} points in mm defining the pour boundary. If omitted, the board outline is used.",
         ),
+      priority: z
+        .number()
+        .int()
+        .optional()
+        .describe("Zone priority; higher fills first (default 0)"),
+      minWidth: z.number().optional().describe("Minimum copper width in mm (default 0.2)"),
+      padConnection: z
+        .enum(["thermal", "solid", "none", "thermal_tht"])
+        .optional()
+        .describe("How pads connect to the pour"),
+      thermalGap: z.number().optional().describe("Thermal relief gap in mm"),
+      thermalSpokeWidth: z.number().optional().describe("Thermal relief spoke width in mm"),
+      islandRemoval: z.enum(["always", "never", "area"]).optional().describe("Island removal mode"),
     },
     async (args: any) => {
       const result = await callKicadScript("add_copper_pour", args);
@@ -459,7 +474,12 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
   // Create netclass tool
   server.tool(
     "create_netclass",
-    "Create a new net class with custom design rules, optionally assigning nets to it immediately.",
+    "Create or update a net class (sizes in mm) and assign nets to it. Each entry of nets/patterns " +
+      "is written to the project's net_settings.netclass_patterns and checked against the board: " +
+      "nets on a sub-sheet carry the sheet path (e.g. '/Power/+5V', not '+5V'). Returns " +
+      "{success, netClass: {name, nets, trackWidth, clearance, ..., unit: 'mm'}, assignments: " +
+      "[{pattern, matchedNets, matchCount, suggestions?}], persisted, patternsPersisted, " +
+      "appliedInMemory, warnings?}; a pattern that matches no net is reported in warnings.",
     {
       name: z.string().describe("Net class name"),
       traceWidth: z.number().optional().describe("Default trace width in mm"),
@@ -473,7 +493,11 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
       nets: z
         .array(z.string())
         .optional()
-        .describe("Net names to assign to this class immediately"),
+        .describe("Exact board net names to assign to this class, e.g. ['/Power/+5V','GND']"),
+      patterns: z
+        .array(z.string())
+        .optional()
+        .describe("KiCad netclass patterns with * and ? wildcards, e.g. ['/Power/*', 'VBUS*']"),
     },
     async (args: any) => {
       const result = await callKicadScript("create_netclass", args);

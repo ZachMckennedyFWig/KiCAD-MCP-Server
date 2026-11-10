@@ -95,6 +95,9 @@ class BoardOriginCommands:
                     f"this file-based edit."
                 ),
                 "origin": {"type": origin_type, "x": x_mm, "y": y_mm, "unit": "mm"},
+                # Written from a separately loaded board: the dispatcher reloads
+                # the in-memory board if it is this file (#5n).
+                "_boardFileWritten": {"mode": "disk", "path": board_path},
             }
         except Exception as e:
             import traceback

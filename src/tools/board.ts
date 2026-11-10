@@ -523,10 +523,24 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
   // ------------------------------------------------------
   server.tool(
     "add_zone",
-    "Create a copper fill zone (pour) on a PCB layer for a specified net.",
+    "Create a copper zone (pour) from an explicit polygon on one or more copper layers, with " +
+      "priority, clearance, minimum width, pad connection (solid/thermal/none), thermal relief " +
+      "and island removal. Outline points use `unit` (default mm); clearance, minWidth, " +
+      "thermalGap and thermalSpokeWidth are mm, minIslandArea is mm². The zone is not filled " +
+      "until refill_zones runs. Returns {success, message, zone: {uuid, net, layers, " +
+      "pointCount, priority, clearance, minWidth, padConnection, ...}}.",
     {
-      layer: z.string().describe("Layer for the zone"),
-      net: z.string().describe("Net name for the zone"),
+      layer: z.string().optional().describe("Copper layer for the zone, e.g. 'F.Cu'"),
+      layers: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Several copper layers for one zone (use instead of layer), e.g. ['F.Cu','B.Cu']",
+        ),
+      net: z
+        .string()
+        .optional()
+        .describe("Net name, exactly as on the board (hierarchical nets look like '/Power/+5V')"),
       points: z
         .array(
           z.object({
@@ -534,26 +548,38 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
             y: z.number().describe("Y coordinate"),
           }),
         )
-        .describe("Points defining the zone outline"),
-      unit: z.enum(["mm", "mil", "inch"]).describe("Unit of measurement"),
-      clearance: z.number().optional().describe("Clearance value"),
-      minWidth: z.number().optional().describe("Minimum width"),
-      padConnection: z
-        .enum(["thermal", "solid", "none"])
+        .describe("Zone outline vertices (at least 3), in `unit`"),
+      unit: z
+        .enum(["mm", "mil", "inch"])
         .optional()
-        .describe("Pad connection type"),
+        .describe("Unit of the outline points (default: mm)"),
+      priority: z
+        .number()
+        .int()
+        .optional()
+        .describe("Zone priority; higher fills first (default 0)"),
+      clearance: z.number().optional().describe("Zone clearance in mm"),
+      minWidth: z.number().optional().describe("Minimum copper width in mm (default 0.25)"),
+      padConnection: z
+        .enum(["thermal", "solid", "none", "thermal_tht"])
+        .optional()
+        .describe("How pads connect: thermal relief, solid, none, or thermal for THT only"),
+      thermalGap: z.number().optional().describe("Thermal relief gap in mm"),
+      thermalSpokeWidth: z.number().optional().describe("Thermal relief spoke width in mm"),
+      islandRemoval: z
+        .enum(["always", "never", "area"])
+        .optional()
+        .describe("Island removal mode; 'area' removes islands smaller than minIslandArea"),
+      minIslandArea: z
+        .number()
+        .optional()
+        .describe("Minimum island area in mm² (islandRemoval 'area')"),
+      fillType: z.enum(["solid", "hatched"]).optional().describe("Fill style (default solid)"),
+      name: z.string().optional().describe("Optional zone name"),
     },
-    async ({ layer, net, points, unit, clearance, minWidth, padConnection }) => {
-      logger.debug(`Adding zone on layer ${layer} for net ${net}`);
-      const result = await callKicadScript("add_zone", {
-        layer,
-        net,
-        points,
-        unit,
-        clearance,
-        minWidth,
-        padConnection,
-      });
+    async (args: any) => {
+      logger.debug(`Adding zone on ${args.layers ?? args.layer} for net ${args.net}`);
+      const result = await callKicadScript("add_zone", args);
 
       return {
         content: [

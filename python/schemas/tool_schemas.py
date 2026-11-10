@@ -1904,6 +1904,19 @@ ROUTING_TOOLS = [
                     "type": "number",
                     "description": "Via drill diameter in millimeters",
                 },
+                "nets": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Board net names to put in the class (hierarchical nets carry the "
+                        "sheet path, e.g. /Power/+5V). Written to netclass_patterns."
+                    ),
+                },
+                "patterns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Netclass patterns with * and ? wildcards, e.g. /Power/*",
+                },
             },
             "required": ["name", "traceWidth", "clearance"],
         },
@@ -2834,6 +2847,13 @@ SCHEMATIC_TOOLS = [
                 "boardPath": {
                     "type": "string",
                     "description": "Path to .kicad_pcb file. If omitted, uses currently loaded board.",
+                },
+                "updateFootprints": {
+                    "type": "boolean",
+                    "description": (
+                        "Replace board footprints whose schematic Footprint field changed, "
+                        "keeping position, rotation, side and nets (default true)"
+                    ),
                 },
             },
         },

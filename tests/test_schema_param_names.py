@@ -87,11 +87,9 @@ KNOWN_JSONRPC_UNREAD: Dict[str, Set[str]] = {
 # every call answers "unknown command".
 KNOWN_UNROUTED: Set[str] = {
     "add_component_annotation",
-    "add_zone",
     "export_position_file",
     "export_vrml",
     "group_components",
-    "replace_component",
 }
 
 # --- TypeScript side ---------------------------------------------------------

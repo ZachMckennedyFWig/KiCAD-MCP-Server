@@ -192,12 +192,19 @@ def apply_netclass_to_project_settings(
 
 
 def persist_netclass_to_project(
-    pro_path: Optional[str], name: str, props: Dict[str, Any]
+    pro_path: Optional[str],
+    name: str,
+    props: Dict[str, Any],
+    patterns: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Read/modify/write ``pro_path`` so the net class definition survives a
     reload (KiCad 7+ keeps it in the project file, not the board).
 
-    Returns ``{"persisted": bool, "projectFile"?: str, "warning"?: str}``. Never
+    ``patterns`` (net names or wildcards) are written to
+    ``net_settings.netclass_patterns`` so the nets join the class (#5k).
+
+    Returns ``{"persisted": bool, "projectFile"?: str, "warning"?: str,
+    "class"?: dict, "patternsPersisted"?: list, "reassigned"?: list}``. Never
     raises: a persistence failure is reported, not fatal, so the in-memory net
     class still stands. The write is atomic (temp file + ``os.replace``) so a
     crash mid-write cannot corrupt the project file.
@@ -212,6 +219,15 @@ def persist_netclass_to_project(
         with open(pro_path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
         apply_netclass_to_project_settings(data, name, props)
+        reassigned = apply_netclass_patterns_to_project_settings(data, name, list(patterns or []))
+        persisted_class = next(
+            (
+                dict(c)
+                for c in data["net_settings"]["classes"]
+                if isinstance(c, dict) and c.get("name") == name
+            ),
+            None,
+        )
 
         directory = os.path.dirname(pro_path) or "."
         fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".netclass-", suffix=".kicad_pro")
@@ -226,7 +242,15 @@ def persist_netclass_to_project(
             except OSError:
                 pass
             raise
-        return {"persisted": True, "projectFile": pro_path}
+        result: Dict[str, Any] = {
+            "persisted": True,
+            "projectFile": pro_path,
+            "class": persisted_class,
+            "patternsPersisted": list(patterns or []),
+        }
+        if reassigned:
+            result["reassigned"] = reassigned
+        return result
     except Exception as exc:  # report, never fail the command on a persistence error
         return {
             "persisted": False,
@@ -305,6 +329,183 @@ def persist_net_assignment_to_project(
             "persisted": False,
             "warning": f"could not persist net class assignment to {pro_path}: {exc}",
         }
+
+
+# --- Net class pattern assignment (KiCad 9/10) ------------------------------
+#
+# Net-to-class membership lives in ``net_settings.netclass_patterns`` as
+# ``{"netclass": name, "pattern": pattern}`` entries. A literal net name is a
+# pattern matching exactly itself; ``*`` and ``?`` are wildcards (#5k / C1).
+
+
+def _wildcard_regex(pattern: str) -> "re.Pattern[str]":
+    parts = []
+    for ch in pattern:
+        if ch == "*":
+            parts.append(".*")
+        elif ch == "?":
+            parts.append(".")
+        else:
+            parts.append(re.escape(ch))
+    return re.compile("".join(parts) + r"\Z", re.DOTALL)
+
+
+def match_netclass_pattern(pattern: str, net_names: List[str]) -> List[str]:
+    """Board nets a KiCad netclass pattern matches (anchored wildcard, like KiCad)."""
+    if pattern in net_names and not any(c in pattern for c in "*?"):
+        return [pattern]
+    rx = _wildcard_regex(pattern)
+    return [n for n in net_names if rx.match(n)]
+
+
+def suggest_net_names(name: str, net_names: List[str], limit: int = 5) -> List[str]:
+    """Closest board nets for a name that matched nothing.
+
+    Hierarchical nets carry the sheet path (``+5V`` on the Power sheet is
+    ``/Power/+5V``), so nets whose last path segment equals ``name`` come
+    first, then case-insensitive and fuzzy matches.
+    """
+    base = name.rsplit("/", 1)[-1]
+    if not base:
+        return []
+    out: List[str] = []
+
+    def add(candidates):
+        for c in candidates:
+            if c not in out and c != name:
+                out.append(c)
+
+    add(sorted(n for n in net_names if n.rsplit("/", 1)[-1] == base))
+    add(sorted(n for n in net_names if n.rsplit("/", 1)[-1].lower() == base.lower()))
+    if len(out) < limit:
+        import difflib
+
+        add(difflib.get_close_matches(name, net_names, n=limit, cutoff=0.75))
+    return out[:limit]
+
+
+def netclass_via_problem(props: Dict[str, Any]) -> Optional[str]:
+    """Error text when a via/microvia drill is not smaller than its diameter.
+
+    A via whose drill is not smaller than its pad has no annular ring and
+    cannot be manufactured, so such a class is refused up front.
+    """
+    for dia_key, drill_key, label in (
+        ("via_diameter", "via_drill", "via"),
+        ("microvia_diameter", "microvia_drill", "microvia"),
+    ):
+        dia, drill = props.get(dia_key), props.get(drill_key)
+        if dia is not None and drill is not None and float(drill) >= float(dia):
+            return (
+                f"{label} drill ({drill} mm) must be smaller than the {label} "
+                f"diameter ({dia} mm)"
+            )
+    return None
+
+
+def assign_net_class_in_memory(
+    board: Any, net: Any, net_name: str, class_name: str, netclass: Any = None
+) -> None:
+    """Put one net in a class on the live board. Raises on failure.
+
+    KiCad 6-8 have ``NETINFO_ITEM.SetClass``; KiCad 9/10 dropped it (#5k) and
+    keep membership in ``NET_SETTINGS`` as pattern assignments, where an exact
+    net name is a pattern matching only itself.
+    """
+    if netclass is not None and hasattr(net, "SetClass"):
+        net.SetClass(netclass)
+        return
+    settings = board.GetDesignSettings().m_NetSettings
+    if not hasattr(settings, "SetNetclassPatternAssignment"):
+        raise RuntimeError("this KiCad build has neither SetClass nor netclass pattern assignment")
+    settings.SetNetclassPatternAssignment(net_name, class_name)
+    if hasattr(settings, "ClearAllCaches"):
+        settings.ClearAllCaches()
+    board.SynchronizeNetsAndNetClasses(False)
+
+
+def apply_netclass_patterns_to_project_settings(
+    data: Dict[str, Any], class_name: str, patterns: List[str]
+) -> List[Dict[str, str]]:
+    """Point each pattern at ``class_name`` in ``net_settings.netclass_patterns``.
+
+    Pure. An existing entry for the same pattern is re-pointed (KiCad's
+    ``SetNetclassPatternAssignment`` replaces too), so a net is not left in
+    two classes. Returns the re-pointed entries as ``{"pattern", "from"}``.
+    """
+    net_settings = data.setdefault("net_settings", {})
+    if not isinstance(net_settings, dict):
+        net_settings = {}
+        data["net_settings"] = net_settings
+    entries = net_settings.get("netclass_patterns")
+    if not isinstance(entries, list):
+        entries = []
+        net_settings["netclass_patterns"] = entries
+    reassigned: List[Dict[str, str]] = []
+    for pattern in patterns:
+        found = False
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("pattern") == pattern:
+                if entry.get("netclass") != class_name:
+                    reassigned.append({"pattern": pattern, "from": str(entry.get("netclass"))})
+                    entry["netclass"] = class_name
+                found = True
+        if not found:
+            entries.append({"netclass": class_name, "pattern": pattern})
+    return reassigned
+
+
+# --- Zone helpers (add_zone / add_copper_pour) -------------------------------
+
+ZONE_PAD_CONNECTIONS = {
+    "solid": "ZONE_CONNECTION_FULL",
+    "full": "ZONE_CONNECTION_FULL",
+    "thermal": "ZONE_CONNECTION_THERMAL",
+    "thermal_tht": "ZONE_CONNECTION_THT_THERMAL",
+    "none": "ZONE_CONNECTION_NONE",
+}
+
+ZONE_ISLAND_MODES = {
+    "always": "ISLAND_REMOVAL_MODE_ALWAYS",
+    "never": "ISLAND_REMOVAL_MODE_NEVER",
+    "area": "ISLAND_REMOVAL_MODE_AREA",
+}
+
+
+def zone_points_nm(
+    points: Any, unit: str = "mm"
+) -> Tuple[List[Tuple[int, int]], Optional[Dict[str, Any]]]:
+    """Polygon vertices in nm from ``[{x, y, unit?}]`` or ``[[x, y]]`` points."""
+    if unit not in LENGTH_UNITS_MM:
+        return [], length_unit_error(unit)
+    if not isinstance(points, (list, tuple)) or len(points) < 3:
+        return [], {
+            "success": False,
+            "message": "Missing outline",
+            "errorDetails": "points must hold at least 3 vertices ({x, y} objects or [x, y] pairs)",
+        }
+    out: List[Tuple[int, int]] = []
+    for point in points:
+        try:
+            if isinstance(point, dict):
+                point_unit = point.get("unit", unit)
+                if point_unit not in LENGTH_UNITS_MM:
+                    return [], length_unit_error(point_unit)
+                scale = LENGTH_UNITS_MM[point_unit] * 1000000
+                x, y = float(point["x"]), float(point["y"])
+            else:
+                scale = LENGTH_UNITS_MM[unit] * 1000000
+                x, y = float(point[0]), float(point[1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return [], {
+                "success": False,
+                "message": "Invalid point",
+                "errorDetails": f"cannot read a vertex from {point!r}",
+            }
+        out.append((int(round(x * scale)), int(round(y * scale))))
+    if len(out) > 3 and out[0] == out[-1]:
+        out.pop()  # closed explicitly; KiCad closes outlines itself
+    return out, None
 
 
 # --- Net color project-file persistence (KiCad 7+) -------------------------
@@ -451,7 +652,7 @@ class RoutingCommands:
                     except Exception:
                         resolved = None
                 if resolved is not None:
-                    net.SetClass(resolved)
+                    assign_net_class_in_memory(self.board, net, name, net_class, resolved)
 
             return {
                 "success": True,
@@ -1735,8 +1936,88 @@ class RoutingCommands:
                 "errorDetails": str(e),
             }
 
+    def _board_net_names(self) -> Optional[List[str]]:
+        """Every net name on the loaded board, or None when they cannot be read."""
+        try:
+            netinfo = self.board.GetNetInfo()
+            count = netinfo.GetNetCount()
+            if not isinstance(count, int):
+                return None
+            names = []
+            for code in range(count):
+                net = netinfo.GetNetItem(code)
+                if net is None:
+                    continue
+                name = net.GetNetname()
+                if isinstance(name, str) and name:
+                    names.append(name)
+            return names
+        except Exception:
+            return None
+
+    def _apply_netclass_in_memory(
+        self, name: str, cls: Dict[str, Any], patterns: List[str], nets: List[str]
+    ) -> None:
+        """Put the class and its pattern assignments on the live board. Raises on failure.
+
+        KiCad 9/10 keep classes and membership in ``NET_SETTINGS``
+        (``SetNetclass`` / ``SetNetclassPatternAssignment``);
+        ``NETINFO_ITEM.SetClass`` no longer exists there (#5k). KiCad 6-8
+        still use ``NETCLASSES`` and ``SetClass``.
+        """
+        net_classes = self.board.GetNetClasses()
+        settings = getattr(self.board.GetDesignSettings(), "m_NetSettings", None)
+        if (
+            settings is not None
+            and hasattr(settings, "SetNetclass")
+            and hasattr(settings, "SetNetclassPatternAssignment")
+        ):
+            from utils.project_netclasses import apply_net_classes_to_board
+
+            apply_net_classes_to_board(
+                self.board,
+                {
+                    "classes": [dict(cls, name=name)],
+                    "patterns": [(p, name) for p in patterns],
+                    "assignments": {},
+                },
+            )
+            return
+
+        # KiCad 6-8: NETCLASSES container plus NETINFO_ITEM.SetClass.
+        existing = net_classes.Find(name) if hasattr(net_classes, "Find") else None
+        netclass = existing or pcbnew.NETCLASS(name)
+        if existing is None:
+            net_classes.Add(netclass)
+        for key, setter in (
+            ("clearance", "SetClearance"),
+            ("track_width", "SetTrackWidth"),
+            ("via_diameter", "SetViaDiameter"),
+            ("via_drill", "SetViaDrill"),
+            ("microvia_diameter", "SetuViaDiameter"),
+            ("microvia_drill", "SetuViaDrill"),
+            ("diff_pair_width", "SetDiffPairWidth"),
+            ("diff_pair_gap", "SetDiffPairGap"),
+        ):
+            value = cls.get(key)
+            if isinstance(value, (int, float)) and hasattr(netclass, setter):
+                getattr(netclass, setter)(int(float(value) * 1000000))
+        nets_map = self.board.GetNetInfo().NetsByName()
+        for net_name in nets:
+            if nets_map.has_key(net_name):
+                nets_map[net_name].SetClass(netclass)
+
     def create_netclass(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Create a new net class with specified properties"""
+        """Create or update a net class and assign nets to it.
+
+        Values are millimetres. ``nets`` (and ``patterns``) are net names or
+        KiCad netclass patterns (``*``/``?`` wildcards). Each is written to
+        ``.kicad_pro`` ``net_settings.netclass_patterns`` -- where KiCad keeps
+        net-to-class membership -- and checked against the board's nets: the
+        response lists the nets each one matched and warns, with hierarchical
+        suggestions (``+5V`` -> ``/Power/+5V``), when one matches nothing
+        (#5k / #5q / C1).
+        """
         try:
             if not self.board:
                 return {
@@ -1755,7 +2036,12 @@ class RoutingCommands:
             uvia_drill = params.get("uviaDrill")
             diff_pair_width = params.get("diffPairWidth")
             diff_pair_gap = params.get("diffPairGap")
-            nets = params.get("nets", [])
+            nets = [n for n in (params.get("nets") or []) if isinstance(n, str) and n]
+            extra_patterns = [p for p in (params.get("patterns") or []) if isinstance(p, str) and p]
+            patterns: List[str] = []
+            for entry in nets + extra_patterns:
+                if entry not in patterns:
+                    patterns.append(entry)
 
             if not name:
                 return {
@@ -1764,10 +2050,10 @@ class RoutingCommands:
                     "errorDetails": "name parameter is required",
                 }
 
-            # Net class DEFINITIONS live in <project>.kicad_pro (net_settings) on
-            # KiCad 7+, not in the .kicad_pcb the SWIG board save writes. Resolve
-            # the project file up front so the durable write below runs even if a
-            # SWIG API (which shifted across KiCad 6->10) throws (issue #185).
+            # Net class DEFINITIONS and pattern assignments live in
+            # <project>.kicad_pro (net_settings) on KiCad 7+, not in the
+            # .kicad_pcb the SWIG board save writes. Persist them first, so the
+            # durable write happens even if a SWIG API throws (issue #185).
             pro_path = None
             try:
                 board_path = self.board.GetFileName()
@@ -1776,93 +2062,6 @@ class RoutingCommands:
             except Exception:
                 pro_path = None
 
-            scale = 1000000  # mm to nm
-            net_class_values: Dict[str, Any] = {}
-            in_memory_warning = None
-
-            # Best-effort in-memory NETCLASS for the live session. A SWIG failure
-            # here is logged but must NOT skip the .kicad_pro persistence below,
-            # which is the deterministic, SWIG-independent part (issue #185).
-            try:
-                # KiCad 6/7 returns NETCLASSES with .Find/.Add; KiCad 9/10 returns
-                # a netclasses_map (SWIG-wrapped std::map) that is dict-like.
-                net_classes = self.board.GetNetClasses()
-
-                existing = None
-                if hasattr(net_classes, "Find"):
-                    existing = net_classes.Find(name)
-                else:
-                    try:
-                        if name in net_classes:
-                            existing = net_classes[name]
-                    except Exception:
-                        existing = None
-
-                if existing is None:
-                    netclass = pcbnew.NETCLASS(name)
-                    if hasattr(net_classes, "Add"):
-                        net_classes.Add(netclass)
-                    else:
-                        net_classes[name] = netclass
-                else:
-                    netclass = existing
-
-                # Defensive setters — KiCad 10's NETCLASS dropped some legacy mutators.
-                def _safe_set(method_name, value):
-                    if value is None:
-                        return
-                    method = getattr(netclass, method_name, None)
-                    if method is None:
-                        return
-                    try:
-                        method(int(value * scale))
-                    except Exception:
-                        pass
-
-                _safe_set("SetClearance", clearance)
-                _safe_set("SetTrackWidth", track_width)
-                _safe_set("SetViaDiameter", via_diameter)
-                _safe_set("SetViaDrill", via_drill)
-                _safe_set("SetMicroViaDiameter", uvia_diameter)
-                _safe_set("SetMicroViaDrill", uvia_drill)
-                _safe_set("SetDiffPairWidth", diff_pair_width)
-                _safe_set("SetDiffPairGap", diff_pair_gap)
-
-                netinfo = self.board.GetNetInfo()
-                nets_map = netinfo.NetsByName()
-                for net_name in nets:
-                    if nets_map.has_key(net_name):
-                        net = nets_map[net_name]
-                        net.SetClass(netclass)
-
-                # Defensive accessors — KiCad 10's NETCLASS dropped some legacy getters.
-                def _safe_get(method_name):
-                    method = getattr(netclass, method_name, None)
-                    if method is None:
-                        return None
-                    try:
-                        return method() / scale
-                    except Exception:
-                        return None
-
-                net_class_values = {
-                    "clearance": _safe_get("GetClearance"),
-                    "trackWidth": _safe_get("GetTrackWidth"),
-                    "viaDiameter": _safe_get("GetViaDiameter"),
-                    "viaDrill": _safe_get("GetViaDrill"),
-                    "uviaDiameter": _safe_get("GetMicroViaDiameter"),
-                    "uviaDrill": _safe_get("GetMicroViaDrill"),
-                    "diffPairWidth": _safe_get("GetDiffPairWidth"),
-                    "diffPairGap": _safe_get("GetDiffPairGap"),
-                }
-            except Exception as exc:
-                in_memory_warning = "in-memory NETCLASS update failed: %s" % exc
-                logger.warning("create_netclass: %s", in_memory_warning)
-
-            # Persist the class DEFINITION (net_settings.classes) using the same
-            # normalized values as the live path, so the persisted class can never
-            # diverge from the request. Membership lives in netclass_patterns and
-            # is out of scope here (create_netclass exposes no `nets` field).
             project_props = {
                 "clearance": clearance,
                 "track_width": track_width,
@@ -1873,9 +2072,60 @@ class RoutingCommands:
                 "diff_pair_width": diff_pair_width,
                 "diff_pair_gap": diff_pair_gap,
             }
-            persist = persist_netclass_to_project(pro_path, name, project_props)
+            warnings: List[str] = []
+            via_problem = netclass_via_problem(project_props)
+            if via_problem:
+                return {
+                    "success": False,
+                    "message": "Invalid via size",
+                    "errorDetails": via_problem,
+                }
 
-            warnings = [w for w in (in_memory_warning, persist.get("warning")) if w]
+            persist = persist_netclass_to_project(pro_path, name, project_props, patterns)
+            if persist.get("warning"):
+                warnings.append(persist["warning"])
+            cls = persist.get("class") or {k: v for k, v in project_props.items() if v is not None}
+            merged_problem = netclass_via_problem(cls)
+            if merged_problem:
+                warnings.append(
+                    f"class '{name}' now has {merged_problem} (no annular ring). "
+                    "Pass both viaDiameter and viaDrill to fix it."
+                )
+
+            # Which board nets each pattern matches (C1).
+            assignments: List[Dict[str, Any]] = []
+            board_nets = self._board_net_names()
+            if board_nets is not None:
+                for pattern in patterns:
+                    matched = match_netclass_pattern(pattern, board_nets)
+                    entry: Dict[str, Any] = {
+                        "pattern": pattern,
+                        "matchedNets": matched,
+                        "matchCount": len(matched),
+                    }
+                    if not matched:
+                        suggestions = suggest_net_names(pattern, board_nets)
+                        if suggestions:
+                            entry["suggestions"] = suggestions
+                        warnings.append(
+                            f"pattern '{pattern}' matches no net on the board"
+                            + (
+                                f"; did you mean {', '.join(repr(s) for s in suggestions)}? "
+                                "Nets on a sub-sheet with local labels carry the sheet path."
+                                if suggestions
+                                else ""
+                            )
+                        )
+                    assignments.append(entry)
+
+            in_memory_warning = None
+            try:
+                self._apply_netclass_in_memory(name, cls, patterns, nets)
+            except Exception as exc:
+                in_memory_warning = "in-memory NETCLASS update failed: %s" % exc
+                logger.warning("create_netclass: %s", in_memory_warning)
+                warnings.insert(0, in_memory_warning)
+
             if in_memory_warning and not persist.get("persisted"):
                 # Neither the live board nor the project file received the class.
                 return {
@@ -1884,16 +2134,34 @@ class RoutingCommands:
                     "errorDetails": "; ".join(warnings),
                 }
 
-            result = {
+            net_class_values = {
+                "clearance": cls.get("clearance"),
+                "trackWidth": cls.get("track_width"),
+                "viaDiameter": cls.get("via_diameter"),
+                "viaDrill": cls.get("via_drill"),
+                "uviaDiameter": cls.get("microvia_diameter"),
+                "uviaDrill": cls.get("microvia_drill"),
+                "diffPairWidth": cls.get("diff_pair_width"),
+                "diffPairGap": cls.get("diff_pair_gap"),
+                "unit": "mm",
+            }
+            result: Dict[str, Any] = {
                 "success": True,
                 "message": f"Created net class: {name}",
                 "netClass": {"name": name, "nets": nets, **net_class_values},
+                "patterns": patterns,
+                "assignments": assignments,
                 "persisted": persist.get("persisted", False),
+                "patternsPersisted": persist.get("patternsPersisted", []),
+                "appliedInMemory": in_memory_warning is None,
             }
+            if persist.get("reassigned"):
+                result["reassigned"] = persist["reassigned"]
             if persist.get("projectFile"):
                 result["projectFile"] = persist["projectFile"]
             if warnings:
                 result["warning"] = "; ".join(warnings)
+                result["warnings"] = warnings
             return result
 
         except Exception as e:
@@ -1903,6 +2171,144 @@ class RoutingCommands:
                 "message": "Failed to create net class",
                 "errorDetails": str(e),
             }
+
+    def _resolve_net(self, net: Optional[str]) -> Tuple[Any, Optional[Dict[str, Any]]]:
+        """NETINFO_ITEM for ``net`` (None for no net), or an error payload."""
+        if not net:
+            return None, None
+        nets_map = self.board.GetNetInfo().NetsByName()
+        if nets_map.has_key(net):
+            return nets_map[net], None
+        names = self._board_net_names() or []
+        suggestions = suggest_net_names(net, names)
+        return None, {
+            "success": False,
+            "message": f"Net not found: {net}",
+            "errorDetails": (
+                f"'{net}' does not exist on the board"
+                + (
+                    f"; did you mean {', '.join(repr(s) for s in suggestions)}?"
+                    if suggestions
+                    else ""
+                )
+            ),
+        }
+
+    def _configure_zone(
+        self, zone: Any, params: Dict[str, Any], defaults: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        """Apply the shared zone options (mm) to ``zone``.
+
+        Returns ``(applied settings, error payload or None)``.
+        """
+        scale = 1000000
+        applied: Dict[str, Any] = {}
+
+        priority = params.get("priority", defaults.get("priority", 0))
+        try:
+            priority = int(priority)
+        except (TypeError, ValueError):
+            return applied, {
+                "success": False,
+                "message": "Invalid priority",
+                "errorDetails": f"priority must be an integer, got {priority!r}",
+            }
+        zone.SetAssignedPriority(priority)
+        applied["priority"] = priority
+
+        clearance = params.get("clearance", defaults.get("clearance"))
+        if clearance is not None:
+            zone.SetLocalClearance(int(float(clearance) * scale))
+            applied["clearance"] = float(clearance)
+
+        min_width = params.get("minWidth", defaults.get("minWidth"))
+        if min_width is not None:
+            zone.SetMinThickness(int(float(min_width) * scale))
+            applied["minWidth"] = float(min_width)
+
+        connection = params.get("padConnection", defaults.get("padConnection"))
+        if connection is not None:
+            key = str(connection).lower()
+            const = ZONE_PAD_CONNECTIONS.get(key)
+            if const is None:
+                return applied, {
+                    "success": False,
+                    "message": "Invalid padConnection",
+                    "errorDetails": (
+                        f"padConnection must be one of {sorted(ZONE_PAD_CONNECTIONS)}, "
+                        f"got {connection!r}"
+                    ),
+                }
+            zone.SetPadConnection(getattr(pcbnew, const))
+            applied["padConnection"] = key
+
+        thermal_gap = params.get("thermalGap", defaults.get("thermalGap"))
+        if thermal_gap is not None:
+            zone.SetThermalReliefGap(int(float(thermal_gap) * scale))
+            applied["thermalGap"] = float(thermal_gap)
+        spoke = params.get("thermalSpokeWidth", defaults.get("thermalSpokeWidth"))
+        if spoke is not None:
+            zone.SetThermalReliefSpokeWidth(int(float(spoke) * scale))
+            applied["thermalSpokeWidth"] = float(spoke)
+
+        island = params.get("islandRemoval", defaults.get("islandRemoval"))
+        if island is not None:
+            key = str(island).lower()
+            const = ZONE_ISLAND_MODES.get(key)
+            if const is None:
+                return applied, {
+                    "success": False,
+                    "message": "Invalid islandRemoval",
+                    "errorDetails": (
+                        f"islandRemoval must be one of {sorted(ZONE_ISLAND_MODES)}, "
+                        f"got {island!r}"
+                    ),
+                }
+            zone.SetIslandRemovalMode(getattr(pcbnew, const))
+            applied["islandRemoval"] = key
+            min_island = params.get("minIslandArea")
+            if key == "area" and min_island is not None:
+                # mm^2 -> nm^2
+                zone.SetMinIslandArea(int(float(min_island) * scale * scale))
+                applied["minIslandArea"] = float(min_island)
+
+        fill_type = params.get("fillType", defaults.get("fillType", "solid"))
+        if fill_type == "hatched":
+            zone.SetFillMode(pcbnew.ZONE_FILL_MODE_HATCH_PATTERN)
+        else:
+            zone.SetFillMode(pcbnew.ZONE_FILL_MODE_POLYGONS)
+        applied["fillType"] = "hatched" if fill_type == "hatched" else "solid"
+
+        zone_name = params.get("name")
+        if zone_name and hasattr(zone, "SetZoneName"):
+            zone.SetZoneName(str(zone_name))
+            applied["name"] = str(zone_name)
+        return applied, None
+
+    def _set_zone_outline(self, zone: Any, points_nm: List[Tuple[int, int]]) -> None:
+        """Give ``zone`` a single closed outline.
+
+        Uses ``ZONE.AppendCorner(pos, -1)``, a ZONE method that creates the
+        main outline itself, so no SHAPE_POLY_SET proxy is handled from
+        Python: ``zone.Outline().NewOutline()`` has been seen to hand back a
+        bare SwigPyObject on KiCad 10 (#5r), and ``SetOutline(poly)`` stores
+        the raw pointer of a Python-owned polygon that is then freed (verified
+        on 10.0.8: the zone ends up with 0 vertices). The Outline() path is
+        the fallback for builds without AppendCorner, with a type check.
+        """
+        if hasattr(zone, "AppendCorner"):
+            for x, y in points_nm:
+                zone.AppendCorner(pcbnew.VECTOR2I(int(x), int(y)), -1)
+            return
+        outline = zone.Outline()
+        if not hasattr(outline, "Append") or not hasattr(outline, "NewOutline"):
+            raise RuntimeError(
+                f"zone.Outline() returned {type(outline).__name__}, not a SHAPE_POLY_SET "
+                "(broken SWIG proxy); restart the MCP server"
+            )
+        outline.NewOutline()
+        for x, y in points_nm:
+            outline.Append(pcbnew.VECTOR2I(int(x), int(y)))
 
     def add_copper_pour(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Add a copper pour (zone) to the PCB"""
@@ -1967,6 +2373,10 @@ class RoutingCommands:
                     "errorDetails": f"Layer '{layer}' does not exist",
                 }
 
+            points_nm, point_error = zone_points_nm(points, params.get("unit", "mm"))
+            if point_error:
+                return point_error
+
             # Create zone
             zone = pcbnew.ZONE(self.board)
             zone.SetLayer(layer_id)
@@ -1979,35 +2389,20 @@ class RoutingCommands:
                     net_obj = nets_map[net]
                     zone.SetNet(net_obj)
 
-            # Set zone properties
-            scale = 1000000  # mm to nm
-            zone.SetAssignedPriority(priority)
+            applied, error = self._configure_zone(
+                zone,
+                params,
+                {
+                    "priority": priority,
+                    "clearance": clearance,
+                    "minWidth": min_width,
+                    "fillType": fill_type,
+                },
+            )
+            if error:
+                return error
 
-            if clearance is not None:
-                zone.SetLocalClearance(int(clearance * scale))
-
-            zone.SetMinThickness(int(min_width * scale))
-
-            # Set fill type
-            if fill_type == "hatched":
-                zone.SetFillMode(pcbnew.ZONE_FILL_MODE_HATCH_PATTERN)
-            else:
-                zone.SetFillMode(pcbnew.ZONE_FILL_MODE_POLYGONS)
-
-            # Create outline
-            outline = zone.Outline()
-            outline.NewOutline()  # Create a new outline contour first
-
-            # Add points to outline
-            for point in points:
-                scale = (
-                    1000000
-                    if point.get("unit", "mm") == "mm"
-                    else (25400 if point.get("unit", "mm") == "mil" else 25400000)
-                )
-                x_nm = int(point["x"] * scale)
-                y_nm = int(point["y"] * scale)
-                outline.Append(pcbnew.VECTOR2I(x_nm, y_nm))  # Add point to outline
+            self._set_zone_outline(zone, points_nm)
 
             # Add zone to board
             self.board.Add(zone)
@@ -2026,9 +2421,14 @@ class RoutingCommands:
                     "net": net,
                     "clearance": clearance,
                     "minWidth": min_width,
-                    "priority": priority,
+                    "priority": applied.get("priority", priority),
                     "fillType": fill_type,
-                    "pointCount": len(points),
+                    "pointCount": len(points_nm),
+                    **{
+                        k: v
+                        for k, v in applied.items()
+                        if k not in ("priority", "clearance", "minWidth", "fillType")
+                    },
                 },
             }
 
@@ -2037,6 +2437,133 @@ class RoutingCommands:
             return {
                 "success": False,
                 "message": "Failed to add copper pour",
+                "errorDetails": str(e),
+            }
+
+    def add_zone(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Add a copper zone with an explicit polygon (SWIG path; MCP_ISSUES #5j / E3).
+
+        Coordinates, clearance, minWidth, thermalGap and thermalSpokeWidth are
+        in ``unit`` (default mm) -- clearance/widths are always mm.
+        ``layers`` (or ``layer``) lists copper layers; ``padConnection`` is
+        solid/thermal/none/thermal_tht; ``islandRemoval`` is
+        always/never/area. Unfilled until refill_zones or KiCad's fill (B).
+        """
+        try:
+            if not self.board:
+                return {
+                    "success": False,
+                    "message": "No board is loaded",
+                    "errorDetails": "Load or create a board first",
+                }
+
+            net = params.get("net")
+            layers = params.get("layers") or params.get("layer")
+            if isinstance(layers, str):
+                layers = [layers]
+            if not layers:
+                return {
+                    "success": False,
+                    "message": "Missing layer",
+                    "errorDetails": "layer (or layers) is required, e.g. 'F.Cu'",
+                }
+            points = params.get("points") or params.get("outline") or []
+            unit = params.get("unit", "mm")
+            points_nm, point_error = zone_points_nm(points, unit)
+            if point_error:
+                return point_error
+
+            layer_ids = []
+            for layer in layers:
+                layer_id = self.board.GetLayerID(layer)
+                if not isinstance(layer_id, int) or layer_id < 0:
+                    return {
+                        "success": False,
+                        "message": "Invalid layer",
+                        "errorDetails": f"Layer '{layer}' does not exist",
+                    }
+                is_copper = getattr(pcbnew, "IsCopperLayer", None)
+                if callable(is_copper) and not is_copper(layer_id):
+                    return {
+                        "success": False,
+                        "message": "Invalid layer",
+                        "errorDetails": f"'{layer}' is not a copper layer; zones need copper",
+                    }
+                layer_ids.append(layer_id)
+
+            net_obj, net_error = self._resolve_net(net)
+            if net_error:
+                return net_error
+
+            zone = pcbnew.ZONE(self.board)
+            if len(layer_ids) == 1:
+                zone.SetLayer(layer_ids[0])
+            else:
+                layer_set = pcbnew.LSET()
+                for layer_id in layer_ids:
+                    layer_set.AddLayer(layer_id)
+                zone.SetLayerSet(layer_set)
+            if net_obj is not None:
+                zone.SetNet(net_obj)
+
+            applied, error = self._configure_zone(
+                zone,
+                params,
+                {"priority": 0, "minWidth": 0.25, "padConnection": None, "fillType": "solid"},
+            )
+            if error:
+                return error
+
+            self._set_zone_outline(zone, points_nm)
+            self.board.Add(zone)
+
+            # Read back what KiCad stored. A fresh zone's GetLayerName() can
+            # report F.Cu whatever its layer (#5r), so the layer set is used.
+            stored_layers = list(layers)
+            try:
+                seq = zone.GetLayerSet().Seq()
+                names = [self.board.GetLayerName(lid) for lid in seq]
+                if names and all(isinstance(n, str) for n in names):
+                    stored_layers = names
+            except Exception:
+                pass
+            vertices = len(points_nm)
+            try:
+                count = zone.Outline().TotalVertices()
+                if isinstance(count, int):
+                    vertices = count
+            except Exception:
+                pass
+            uuid = None
+            try:
+                uuid = zone.m_Uuid.AsString()
+            except Exception:
+                pass
+            if not isinstance(uuid, str):
+                uuid = None
+
+            return {
+                "success": True,
+                "message": (
+                    f"Added zone on {', '.join(stored_layers)}"
+                    + (f" for net {net}" if net else " (no net)")
+                    + "; run refill_zones to fill it"
+                ),
+                "zone": {
+                    "uuid": uuid,
+                    "net": net or "",
+                    "layers": stored_layers,
+                    "pointCount": vertices,
+                    "unit": "mm",
+                    **applied,
+                },
+            }
+
+        except Exception as e:
+            logger.error(f"Error adding zone: {str(e)}")
+            return {
+                "success": False,
+                "message": "Failed to add zone",
                 "errorDetails": str(e),
             }
 

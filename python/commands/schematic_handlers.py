@@ -3224,8 +3224,20 @@ class SchematicHandlersMixin:
             # ("Update PCB from Schematic"), but our previous implementation
             # only mutated nets, leaving newly-added schematic symbols with no
             # PCB footprint at all.
+            components = self._extract_components_from_schematic(schematic_path)
             added_footprints, skipped_footprints = self._add_missing_footprints_from_schematic(
-                board, schematic_path
+                board, schematic_path, components=components
+            )
+
+            # Footprints whose schematic Footprint field no longer matches the
+            # board (#5h / B1). Swapped by default, like KiCad's F8 "Replace
+            # footprints with those specified in the schematic"; with
+            # updateFootprints=false they are only reported.
+            update_footprints = params.get("updateFootprints", True)
+            if isinstance(update_footprints, str):
+                update_footprints = update_footprints.strip().lower() not in ("false", "0", "no")
+            footprint_changes = self._sync_changed_footprints(
+                board, schematic_path, components, apply=bool(update_footprints)
             )
 
             # Add all nets to board
@@ -3266,6 +3278,14 @@ class SchematicHandlersMixin:
                 self.board = board
                 self._update_command_handlers()
 
+            # This tool wrote the .kicad_pcb itself, from the board now held in
+            # memory. Make that write the new on-disk baseline, otherwise the
+            # auto-save that follows sees our own write as an external change,
+            # refuses, and flags memory as unsaved (#5h / #5n).
+            adopt = getattr(self, "_adopt_board_file_write", None)
+            if callable(adopt) and board is self.board:
+                adopt({"mode": "memory", "path": board_path})
+
             logger.info(
                 f"sync_schematic_to_board: {len(added_nets)} nets added, "
                 f"{len(added_footprints)} footprints added, {assigned_pads} pads assigned"
@@ -3288,12 +3308,30 @@ class SchematicHandlersMixin:
                     sheet_names.append(Path(p).relative_to(root_dir).as_posix())
                 except ValueError:
                     sheet_names.append(Path(p).name)
+            replaced = footprint_changes["replaced"]
+            mismatched = footprint_changes["mismatched"]
+            for entry in replaced:
+                if entry.get("warning"):
+                    warnings.append(entry["warning"])
+            if mismatched:
+                warnings.append(
+                    f"{len(mismatched)} footprint(s) differ from the schematic's Footprint field "
+                    "and were NOT replaced: "
+                    + ", ".join(
+                        f"{m['reference']} (board {m['boardFootprint'] or '?'}, schematic "
+                        f"{m['schematicFootprint']}{'; ' + m['reason'] if m.get('reason') else ''})"
+                        for m in mismatched
+                    )
+                )
             return {
                 "success": True,
                 "message": (
                     f"PCB updated from schematic: {len(added_footprints)} footprints added, "
+                    f"{len(replaced)} footprints replaced, "
                     f"{len(added_nets)} nets added, {assigned_pads} pads assigned"
                 ),
+                "footprints_replaced": replaced,
+                "footprints_mismatched": mismatched,
                 "sheets_scanned": sheet_names,
                 "nets_added": added_nets,
                 "nets_total": len(net_names),
@@ -3454,8 +3492,100 @@ class SchematicHandlersMixin:
             return ""
         return path.rstrip("/").rsplit("/", 1)[-1]
 
+    def _sync_changed_footprints(
+        self,
+        board: Any,
+        schematic_path: str,
+        components: List[Dict[str, str]],
+        apply: bool = True,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Find (and with ``apply``, swap) board footprints whose lib id differs
+        from the schematic symbol's Footprint field.
+
+        A swap keeps reference, value, position, rotation, side, schematic
+        link and pad nets by number (``utils.footprint_swap``); the caller then
+        re-nets every pad from the schematic. Returns
+        ``{"replaced": [...], "mismatched": [...]}`` where ``mismatched`` lists
+        the differences left in place, each with a ``reason``.
+        """
+        from pathlib import Path
+
+        from utils.footprint_swap import (
+            FootprintLoadError,
+            footprint_lib_id,
+            load_library_footprint,
+            swap_footprint,
+        )
+
+        replaced: List[Dict[str, Any]] = []
+        mismatched: List[Dict[str, Any]] = []
+        if not components:
+            return {"replaced": replaced, "mismatched": mismatched}
+
+        board_fps: Dict[str, Any] = {}
+        for fp in board.GetFootprints():
+            board_fps.setdefault(fp.GetReference(), fp)
+
+        library_manager = None
+        for comp in components:
+            ref = comp.get("reference") or ""
+            want = (comp.get("footprint") or "").strip()
+            if not ref or ref.startswith("#") or not want or ":" not in want:
+                continue
+            fp = board_fps.get(ref)
+            if fp is None:
+                continue
+            have = footprint_lib_id(fp)
+            if not isinstance(have, str) or have == want:
+                continue
+            entry: Dict[str, Any] = {
+                "reference": ref,
+                "boardFootprint": have,
+                "schematicFootprint": want,
+            }
+            if not apply:
+                entry["reason"] = "updateFootprints=false"
+                mismatched.append(entry)
+                continue
+
+            lib_name, fp_name = want.split(":", 1)
+            if library_manager is None:
+                library_manager = self._get_project_library_manager(Path(schematic_path).parent)
+            library_path = library_manager.libraries.get(lib_name)
+            if not library_path:
+                entry["reason"] = f"library '{lib_name}' not in fp-lib-table"
+                mismatched.append(entry)
+                continue
+            try:
+                new_fp = load_library_footprint(library_path, fp_name)
+                _, report = swap_footprint(board, fp, new_fp, lib_name, fp_name)
+            except FootprintLoadError as e:
+                entry["reason"] = str(e)
+                mismatched.append(entry)
+                continue
+            except Exception as e:
+                entry["reason"] = f"swap failed: {e}"
+                mismatched.append(entry)
+                continue
+            entry["padNetsKept"] = report.get("padNetsKept", 0)
+            if report.get("droppedPadNets"):
+                entry["droppedPadNets"] = report["droppedPadNets"]
+                entry["warning"] = report.get("warning")
+            replaced.append(entry)
+
+        if replaced:
+            logger.info(
+                "sync_schematic_to_board: replaced %d footprint(s): %s",
+                len(replaced),
+                ", ".join(r["reference"] for r in replaced),
+            )
+        return {"replaced": replaced, "mismatched": mismatched}
+
     def _add_missing_footprints_from_schematic(
-        self, board: Any, schematic_path: str
+        self,
+        board: Any,
+        schematic_path: str,
+        components: Optional[List[Dict[str, str]]] = None,
     ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
         """Add footprints to ``board`` for any schematic component not yet present.
 
@@ -3471,7 +3601,8 @@ class SchematicHandlersMixin:
         added: List[Dict[str, str]] = []
         skipped: List[Dict[str, str]] = []
 
-        components = self._extract_components_from_schematic(schematic_path)
+        if components is None:
+            components = self._extract_components_from_schematic(schematic_path)
         if not components:
             return added, skipped
 
