@@ -2786,11 +2786,22 @@ class SchematicHandlersMixin:
             return {"success": False, "message": str(e)}
 
     def _handle_run_erc(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Run Electrical Rules Check on a schematic via kicad-cli"""
+        """Run Electrical Rules Check on a schematic via kicad-cli.
+
+        Compact by default (MCP_ISSUES Q5): ``detail`` = "summary" (counts by
+        type/severity + first ``limit`` items with coordinates), "items" (all
+        matching items) or "full" (adds the legacy ``violations`` list). Filters:
+        ``ignore`` (type globs), ``nets``, ``refs``, ``region`` {x1,y1,x2,y2} mm.
+        ``delta`` reports new/resolved violations against the previous run on
+        the same schematic.
+        """
         logger.info("Running ERC on schematic")
         import subprocess
         import tempfile
 
+        from utils import check_summary
+
+        timeout_sec = 300
         try:
             schematic_path = params.get("schematicPath")
             if not schematic_path or not Path(schematic_path).exists():
@@ -2799,6 +2810,20 @@ class SchematicHandlersMixin:
                     "message": "Schematic file not found",
                     "errorDetails": f"Path does not exist: {schematic_path}",
                 }
+            # Output shaping (MCP_ISSUES Q5): detail level, limit and view filters.
+            check_opts = {
+                key: params.get(key)
+                for key in ("detail", "limit", "ignore", "nets", "refs", "region", "severity")
+            }
+            try:
+                check_summary.parse_detail_params(check_opts)
+                check_summary.parse_region(check_opts["region"])
+            except ValueError as exc:
+                return {"success": False, "message": f"Invalid parameter: {exc}"}
+            try:
+                timeout_sec = max(10, min(int(params.get("timeoutSec", 300)), 1800))
+            except (TypeError, ValueError):
+                timeout_sec = 300
 
             kicad_cli = self.design_rule_commands._find_kicad_cli()
             if not kicad_cli:
@@ -2824,7 +2849,7 @@ class SchematicHandlersMixin:
                 ]
                 logger.info(f"Running ERC command: {' '.join(cmd)}")
 
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
 
                 # kicad-cli returns non-zero when ERC violations are found —
                 # this is normal, not an error.  Only fail when no JSON was
@@ -2847,9 +2872,12 @@ class SchematicHandlersMixin:
                 # KiCad 9 nests violations under sheets[].violations
                 # instead of (or in addition to) the top-level violations
                 # array used by KiCad 8.
-                all_violations = erc_data.get("violations", [])
+                all_violations = list(erc_data.get("violations", []) or [])
+                sheet_of: List[str] = [""] * len(all_violations)
                 for sheet in erc_data.get("sheets", []):
-                    all_violations.extend(sheet.get("violations", []))
+                    sheet_violations = sheet.get("violations", []) or []
+                    all_violations.extend(sheet_violations)
+                    sheet_of.extend([sheet.get("path", "")] * len(sheet_violations))
 
                 for v in all_violations:
                     vseverity = v.get("severity", "error")
@@ -2871,22 +2899,49 @@ class SchematicHandlersMixin:
                     if vseverity in severity_counts:
                         severity_counts[vseverity] += 1
 
-                return {
-                    "success": True,
-                    "message": f"ERC complete: {len(violations)} violation(s)",
-                    "summary": {
-                        "total": len(violations),
-                        "by_severity": severity_counts,
-                    },
-                    "violations": violations,
+                normalized = []
+                for raw, sheet_path in zip(all_violations, sheet_of):
+                    nv = check_summary.normalize_violation(raw)
+                    if sheet_path:
+                        nv["sheet"] = sheet_path
+                    normalized.append(nv)
+                compact = check_summary.build_check_response(
+                    "erc", str(schematic_path), normalized, check_opts
+                )
+                delta = compact["delta"]
+                message = f"ERC complete: {len(violations)} violation(s)"
+                if not delta.get("firstRun"):
+                    message += (
+                        f" ({delta['newCountAll']} new, {delta['resolvedCountAll']} resolved)"
+                    )
+
+                summary: Dict[str, Any] = {
+                    "total": len(violations),
+                    "by_severity": severity_counts,
+                    # Unfiltered, like total; compact["counts"] is the filtered view.
+                    "by_type": check_summary.counts(normalized)["by_type"],
                 }
+                response: Dict[str, Any] = {
+                    "success": True,
+                    "message": message,
+                    "summary": summary,
+                    **compact,
+                }
+                if compact["detail"] == "full":
+                    # Legacy shape: every violation, unfiltered.
+                    response["violations"] = violations
+                return response
 
             finally:
                 if Path(json_output).exists():
                     Path(json_output).unlink()
 
         except subprocess.TimeoutExpired:
-            return {"success": False, "message": "ERC timed out after 120 seconds"}
+            return {
+                "success": False,
+                "message": f"ERC timed out after {timeout_sec} seconds",
+                "errorDetails": "Raise timeoutSec for very large schematics.",
+            }
         except Exception as e:
             logger.error(f"Error running ERC: {str(e)}")
             return {"success": False, "message": str(e)}

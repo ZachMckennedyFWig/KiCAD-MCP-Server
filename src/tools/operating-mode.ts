@@ -74,6 +74,7 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set<string>([
   "get_jlcpcb_database_stats",
   "get_jlcpcb_part",
   "get_project_info",
+  "project_status",
   "get_registry_part",
   "get_symbol_info",
   "is_dirty",

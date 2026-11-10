@@ -4,6 +4,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { checkOutputParams, formatCheckSummary } from "./design-rules.js";
 
 export function registerSchematicTools(server: McpServer, callKicadScript: Function) {
   // Create schematic tool
@@ -1555,35 +1556,18 @@ edit_schematic_component and set its value to an empty string.`,
   // Run Electrical Rules Check (ERC)
   server.tool(
     "run_erc",
-    "Runs the KiCAD Electrical Rules Check (ERC) on a schematic and returns all violations. Use after wiring to verify the schematic before generating a netlist.",
+    "Runs the KiCAD Electrical Rules Check (ERC) on a schematic. Compact by default: counts by type/severity, the first `limit` violations with location (mm), and a delta (new/resolved) against the previous run on this schematic. Narrow with `ignore` (type globs, e.g. 'lib_symbol_*'), `nets`, `refs` or `region`; detail='full' returns every violation as JSON. Use after wiring to verify the schematic before generating a netlist.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch schematic file"),
+      ...checkOutputParams,
     },
-    async (args: { schematicPath: string }) => {
+    async (args: { schematicPath: string; detail?: string }) => {
       const result = await callKicadScript("run_erc", args);
       if (result.success) {
-        const violations: any[] = result.violations || [];
-        const lines: string[] = [`ERC result: ${violations.length} violation(s)`];
-        if (result.summary?.by_severity) {
-          const s = result.summary.by_severity;
-          lines.push(
-            `  Errors: ${s.error ?? 0}  Warnings: ${s.warning ?? 0}  Info: ${s.info ?? 0}`,
-          );
+        if (args.detail === "full") {
+          return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
-        if (violations.length > 0) {
-          lines.push("");
-          violations.slice(0, 30).forEach((v: any, i: number) => {
-            const loc =
-              v.location && v.location.x !== undefined
-                ? ` @ (${v.location.x}, ${v.location.y})`
-                : "";
-            lines.push(`${i + 1}. [${v.severity}] ${v.message}${loc}`);
-          });
-          if (violations.length > 30) {
-            lines.push(`... and ${violations.length - 30} more`);
-          }
-        }
-        return { content: [{ type: "text", text: lines.join("\n") }] };
+        return { content: [{ type: "text", text: formatCheckSummary("ERC", result) }] };
       } else {
         return {
           content: [

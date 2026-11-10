@@ -386,6 +386,7 @@ export const directToolNames = [
   "discard_or_reload",
   "snapshot_project",
   "get_project_info",
+  "project_status",
 
   // Core PCB operations
   "place_component",

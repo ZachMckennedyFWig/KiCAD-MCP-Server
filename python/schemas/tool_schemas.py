@@ -209,7 +209,77 @@ PROJECT_TOOLS = [
         "description": "Retrieves metadata and properties of the currently open project including name, paths, and board status.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "project_status",
+        "title": "Project Status",
+        "description": (
+            "About 10 lines to re-orient: sheet and part counts, board footprints and "
+            "unrouted count, schematic<->board parity (refs missing on either side), the "
+            "last DRC/ERC counts (cached from run_drc/run_erc, not re-run), unsaved state "
+            "and the last snapshot. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "projectPath": {
+                    "type": "string",
+                    "description": (
+                        ".kicad_pro, .kicad_sch, .kicad_pcb or project directory "
+                        "(default: the loaded board's project)"
+                    ),
+                }
+            },
+        },
+    },
 ]
+
+_CHECK_OUTPUT_PROPS = {
+    "detail": {
+        "type": "string",
+        "enum": ["summary", "items", "full"],
+        "description": (
+            "summary (default): counts by type/severity + the first `limit` items with "
+            "coordinates (mm). items: every matching item. full: also the legacy "
+            "`violations` list with item UUIDs."
+        ),
+        "default": "summary",
+    },
+    "limit": {
+        "type": "integer",
+        "description": "Max items listed (default 20 for summary, all for items/full).",
+        "minimum": 0,
+    },
+    "ignore": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Violation-type globs to drop, e.g. ['silk_*', 'lib_symbol_mismatch'].",
+    },
+    "nets": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Only violations naming one of these nets ('+5V' also matches '/Power/+5V').",
+    },
+    "refs": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Only violations naming one of these references (e.g. ['U3', 'C12']).",
+    },
+    "region": {
+        "type": "object",
+        "description": "Only violations with an item inside this box (mm, page/board coordinates).",
+        "properties": {
+            "x1": {"type": "number"},
+            "y1": {"type": "number"},
+            "x2": {"type": "number"},
+            "y2": {"type": "number"},
+        },
+        "required": ["x1", "y1", "x2", "y2"],
+    },
+    "timeoutSec": {
+        "type": "integer",
+        "description": "kicad-cli timeout in seconds (default 600 for DRC, 300 for ERC; max 1800).",
+    },
+}
 
 # =============================================================================
 # BOARD TOOLS
@@ -2275,7 +2345,12 @@ DESIGN_RULE_TOOLS = [
     {
         "name": "run_drc",
         "title": "Run Design Rule Check",
-        "description": "Executes a design rule check (DRC) on the current board and reports violations.",
+        "description": (
+            "Executes a design rule check (DRC) on the saved board with kicad-cli, using the "
+            "project's own .kicad_pro/.kicad_dru. Returns counts plus the first `limit` "
+            "violations with coordinates (mm), and a `delta` (new/resolved) against the "
+            "previous run on the same board."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2283,7 +2358,27 @@ DESIGN_RULE_TOOLS = [
                     "type": "boolean",
                     "description": "Include warnings in addition to errors",
                     "default": True,
-                }
+                },
+                "reportPath": {
+                    "type": "string",
+                    "description": "Optional path to also save kicad-cli's text report",
+                },
+                "refillZones": {
+                    "type": "boolean",
+                    "description": "Refill zones before checking (default true)",
+                },
+                "schematicParity": {
+                    "type": "boolean",
+                    "description": "Also check board vs schematic (default false)",
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": (
+                        ".kicad_pro (or its directory) whose rules to apply; default: the "
+                        "board's own project, else the only .kicad_pro next to it"
+                    ),
+                },
+                **_CHECK_OUTPUT_PROPS,
             },
         },
     },
@@ -2808,14 +2903,15 @@ SCHEMATIC_TOOLS = [
     {
         "name": "run_erc",
         "title": "Run Electrical Rules Check (ERC)",
-        "description": "Runs the KiCAD Electrical Rules Check (ERC) on a schematic via kicad-cli and returns all violations with type, severity, and location. Use this to verify the schematic is electrically correct before generating a netlist or exporting.",
+        "description": "Runs the KiCAD Electrical Rules Check (ERC) on a schematic via kicad-cli. Returns counts by type/severity, the first `limit` violations with location (mm), and a `delta` (new/resolved) against the previous run on the same schematic. Use detail='full' for every violation.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "schematicPath": {
                     "type": "string",
                     "description": "Path to the .kicad_sch schematic file",
-                }
+                },
+                **_CHECK_OUTPUT_PROPS,
             },
             "required": ["schematicPath"],
         },

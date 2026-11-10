@@ -6,6 +6,15 @@ import {
   LONG_RUNNING_COMMANDS,
   AUTOROUTE_OVERHEAD_MS,
   JLCPCB_DOWNLOAD_TIMEOUT_MS,
+  CHECK_COMMANDS,
+  CHECK_COMMAND_TIMEOUT_MS,
+  MEDIUM_COMMANDS,
+  MEDIUM_COMMAND_TIMEOUT_MS,
+  GUI_WAIT_OVERHEAD_MS,
+  DEFAULT_TIMEOUT_GRACE_MS,
+  computeTimeoutGrace,
+  defaultTimeout,
+  parseToolTimeoutOverrides,
 } from "../src/command-timeout.js";
 
 describe("computeCommandTimeout", () => {
@@ -83,5 +92,108 @@ describe("computeCommandTimeout", () => {
     it("tolerates a missing params object", () => {
       expect(computeCommandTimeout("autoroute")).toBe(LONG_COMMAND_TIMEOUT_MS);
     });
+  });
+});
+
+describe("per-tool timeouts (MCP_ISSUES #4 / #5m)", () => {
+  const env = {};
+
+  it("gives batch schematic tools the long allowance, not 30 s", () => {
+    for (const command of [
+      "batch_add_components",
+      "batch_add_and_connect",
+      "batch_connect",
+      "batch_add_no_connects",
+      "batch_edit_schematic_components",
+    ]) {
+      expect(LONG_RUNNING_COMMANDS as readonly string[]).toContain(command);
+      expect(computeCommandTimeout(command, {}, env)).toBe(LONG_COMMAND_TIMEOUT_MS);
+    }
+  });
+
+  it("gives DRC/ERC and zone refill the check allowance", () => {
+    for (const command of CHECK_COMMANDS) {
+      expect(computeCommandTimeout(command, {}, env)).toBe(CHECK_COMMAND_TIMEOUT_MS);
+    }
+    expect(computeCommandTimeout("run_erc", {}, env)).toBeGreaterThan(DEFAULT_COMMAND_TIMEOUT_MS);
+  });
+
+  it("covers exports and sync", () => {
+    for (const command of [
+      "export_gerbers",
+      "export_sch_pdf",
+      "export_odb",
+      "sync_schematic_to_board",
+    ]) {
+      expect(computeCommandTimeout(command, {}, env)).toBe(LONG_COMMAND_TIMEOUT_MS);
+    }
+  });
+
+  it("gives project loading/saving a medium allowance", () => {
+    for (const command of MEDIUM_COMMANDS) {
+      expect(computeCommandTimeout(command, {}, env)).toBe(MEDIUM_COMMAND_TIMEOUT_MS);
+    }
+  });
+
+  it("keeps the tiers disjoint", () => {
+    const all = [...LONG_RUNNING_COMMANDS, ...CHECK_COMMANDS, ...MEDIUM_COMMANDS];
+    expect(new Set(all).size).toBe(all.length);
+  });
+
+  it("extends GUI waits by their own seconds parameters", () => {
+    // kicad_run_drc waits 15 s + 60 s by default: more than the old 30 s cap.
+    expect(computeCommandTimeout("kicad_run_drc", {}, env)).toBeGreaterThanOrEqual(
+      (15 + 60) * 1000,
+    );
+    expect(computeCommandTimeout("kicad_run_drc", { timeout: 30, runTimeout: 600 }, env)).toBe(
+      630 * 1000 + GUI_WAIT_OVERHEAD_MS,
+    );
+    expect(computeCommandTimeout("kicad_gui_wait_for", { timeout: 120 }, env)).toBe(
+      120 * 1000 + GUI_WAIT_OVERHEAD_MS,
+    );
+    // Default 10 s wait plus overhead.
+    expect(computeCommandTimeout("kicad_gui_wait_for", {}, env)).toBe(
+      10 * 1000 + GUI_WAIT_OVERHEAD_MS,
+    );
+  });
+});
+
+describe("environment overrides", () => {
+  it("KICAD_MCP_COMMAND_TIMEOUT_MS sets the default", () => {
+    const env = { KICAD_MCP_COMMAND_TIMEOUT_MS: "90000" };
+    expect(defaultTimeout(env)).toBe(90_000);
+    expect(computeCommandTimeout("get_board_info", {}, env)).toBe(90_000);
+    // Long tiers are unaffected by a smaller default ...
+    expect(computeCommandTimeout("run_drc", {}, env)).toBe(CHECK_COMMAND_TIMEOUT_MS);
+    // ... and the medium tier never drops below a larger default.
+    expect(
+      computeCommandTimeout("open_board", {}, { KICAD_MCP_COMMAND_TIMEOUT_MS: "200000" }),
+    ).toBe(200_000);
+  });
+
+  it("ignores nonsense default values", () => {
+    for (const bad of ["", "abc", "-5", "0"]) {
+      expect(defaultTimeout({ KICAD_MCP_COMMAND_TIMEOUT_MS: bad })).toBe(
+        DEFAULT_COMMAND_TIMEOUT_MS,
+      );
+    }
+  });
+
+  it("KICAD_MCP_TOOL_TIMEOUTS overrides individual tools, computed ones included", () => {
+    const env = {
+      KICAD_MCP_TOOL_TIMEOUTS: "batch_connect=1200000, autoroute=60000;bogus, x=abc",
+    };
+    expect(computeCommandTimeout("batch_connect", {}, env)).toBe(1_200_000);
+    expect(computeCommandTimeout("autoroute", { timeout: 900 }, env)).toBe(60_000);
+    expect(computeCommandTimeout("get_board_info", {}, env)).toBe(DEFAULT_COMMAND_TIMEOUT_MS);
+    expect(parseToolTimeoutOverrides(env.KICAD_MCP_TOOL_TIMEOUTS)).toEqual({
+      batch_connect: 1_200_000,
+      autoroute: 60_000,
+    });
+  });
+
+  it("KICAD_MCP_TIMEOUT_GRACE_MS sets the wedged-worker grace period", () => {
+    expect(computeTimeoutGrace({})).toBe(DEFAULT_TIMEOUT_GRACE_MS);
+    expect(computeTimeoutGrace({ KICAD_MCP_TIMEOUT_GRACE_MS: "1000" })).toBe(1000);
   });
 });

@@ -4,6 +4,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { formatKicadResult } from "./tool-response.js";
 
 export function registerProjectTools(server: McpServer, callKicadScript: Function) {
   // Create project tool
@@ -248,6 +249,33 @@ export function registerProjectTools(server: McpServer, callKicadScript: Functio
           },
         ],
       };
+    },
+  );
+
+  // Project status: the cheapest way to re-orient (MCP_ISSUES I2)
+  server.tool(
+    "project_status",
+    "About 10 lines to re-orient after a context reset: sheet and part counts, board footprint and unrouted counts, schematic<->board parity (refs missing on either side), the last DRC/ERC counts (cached from run_drc/run_erc, never re-run here), unsaved board state and the last snapshot. Read-only and cheap; call it instead of re-reading files.",
+    {
+      projectPath: z
+        .string()
+        .optional()
+        .describe(
+          "A .kicad_pro, .kicad_sch, .kicad_pcb or project directory (default: the loaded board's project)",
+        ),
+      detail: z
+        .enum(["summary", "full"])
+        .optional()
+        .describe("summary (default): the text lines only. full: also the structured fields."),
+    },
+    async (args: { projectPath?: string; detail?: "summary" | "full" }) => {
+      const result = await callKicadScript("project_status", {
+        projectPath: args.projectPath,
+      });
+      if (!result?.success || args.detail === "full") {
+        return formatKicadResult(result);
+      }
+      return { content: [{ type: "text", text: String(result.text ?? result.message) }] };
     },
   );
 
