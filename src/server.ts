@@ -4,7 +4,6 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import express from "express";
 import { spawn, exec, execSync, ChildProcess } from "child_process";
 import { existsSync, readdirSync } from "fs";
 import { join, dirname, isAbsolute } from "path";
@@ -63,6 +62,63 @@ import { registerRoutingPrompts } from "./prompts/routing.js";
 import { registerDesignPrompts } from "./prompts/design.js";
 import { registerFootprintPrompts } from "./prompts/footprint.js";
 import { flagBackendFailuresAsErrors } from "./tools/failure-as-error.js";
+import {
+  BackgroundCalls,
+  DEFAULT_HTTP_DEFER_AFTER_MS,
+  enableBackgroundCalls,
+  MAX_STATUS_WAIT_SECONDS,
+} from "./background-calls.js";
+import { McpHttpServer, type HttpOptions } from "./http-transport.js";
+import { windowsHideOption } from "./hidden-windows.js";
+
+/** Env var: defer a call still running after this many ms (0 = never). */
+export const DEFER_AFTER_ENV = "KICAD_MCP_DEFER_AFTER_MS";
+
+export interface KiCADServerOptions {
+  /** "stdio" (default) or "http" (Streamable HTTP, see http-transport.ts). */
+  transport?: "stdio" | "http";
+  /** Required when transport is "http". */
+  http?: HttpOptions;
+  /** Override KICAD_MCP_DEFER_AFTER_MS (default: 20 s over HTTP, never over stdio). */
+  deferAfterMs?: number;
+}
+
+/** Deferral threshold: the env var, else the transport default. */
+export function resolveDeferAfterMs(
+  transport: "stdio" | "http",
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = env[DEFER_AFTER_ENV];
+  if (raw !== undefined && raw.trim() !== "") {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return transport === "http" ? DEFAULT_HTTP_DEFER_AFTER_MS : 0;
+}
+
+/** MCP `instructions`: what a client should know before it calls anything. */
+export function serverInstructions(deferAfterMs: number): string {
+  return [
+    "KiCad PCB and schematic design tools. Open a design first (open_project), then inspect " +
+      "(get_project_info, project_status, query_* tools) before editing. Coordinates are mm.",
+    "Long-running tools (autoroute, run_drc, run_erc, refill_zones, export_* and fab_package, " +
+      "sync_schematic_to_board, the batch_* schematic tools, and others whose description says " +
+      "'Long-running') can take minutes. Call them with async:true: the reply is {jobId} at " +
+      `once. Then call job_status {jobId, waitSeconds: ${MAX_STATUS_WAIT_SECONDS}} until state ` +
+      "is succeeded or failed; the finished status carries the tool's normal reply. " +
+      "autoroute's async result is written to the board with job_apply.",
+    deferAfterMs > 0
+      ? `Any call still running after ${Math.round(deferAfterMs / 1000)} s is answered with a ` +
+        "jobId the same way and keeps running: never repeat such a call, wait for it with " +
+        "job_status."
+      : "",
+    "The KiCad worker runs one command at a time: while a long job runs, other calls queue " +
+      "behind it. A reply with isError means nothing was changed; success:false with applied " +
+      "items means a partial success (do not retry the applied part).",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
 
 function getWindowsKiCadPythonCandidates(): string[] {
   const roots = [
@@ -222,7 +278,10 @@ function findPythonExecutable(scriptPath: string): string {
 
     // Resolve system python3 to full path using 'which'
     try {
-      const result = execSync("which python3", { encoding: "utf-8" }).trim();
+      const result = execSync("which python3", {
+        encoding: "utf-8",
+        ...windowsHideOption(),
+      }).trim();
       if (result && existsSync(result)) {
         logger.info(`Resolved system Python via which: ${result}`);
         return result;
@@ -276,7 +335,13 @@ export class KiCADMcpServer {
   private kicadScriptPath: string;
   /** Which registered tools a client sees; set up in registerAll(). */
   private toolboxes!: ToolboxManager;
-  private stdioTransport!: StdioServerTransport;
+  private stdioTransport?: StdioServerTransport;
+  private readonly transportKind: "stdio" | "http";
+  private readonly httpOptions?: HttpOptions;
+  private httpServer?: McpHttpServer;
+  /** Background calls (async:true / deferred), shared by every MCP session. */
+  readonly backgroundCalls = new BackgroundCalls();
+  private readonly deferAfterMs: number;
   private requestQueue: Array<{
     request: {
       command: string;
@@ -330,7 +395,11 @@ export class KiCADMcpServer {
    * @param kicadScriptPath Path to the Python KiCAD interface script
    * @param logLevel Log level for the server
    */
-  constructor(kicadScriptPath: string, logLevel: "error" | "warn" | "info" | "debug" = "info") {
+  constructor(
+    kicadScriptPath: string,
+    logLevel: "error" | "warn" | "info" | "debug" = "info",
+    options: KiCADServerOptions = {},
+  ) {
     // Set up the logger
     logger.setLogLevel(logLevel);
 
@@ -340,28 +409,55 @@ export class KiCADMcpServer {
       throw new Error(`KiCAD interface script not found: ${this.kicadScriptPath}`);
     }
 
-    // Initialize the MCP server
-    this.server = new McpServer({
-      name: "kicad-mcp-server",
-      version: "2.9.0",
-      description: "MCP server for KiCAD PCB design operations",
-    });
+    this.transportKind = options.transport ?? "stdio";
+    if (this.transportKind === "http" && !options.http) {
+      throw new Error("HTTP transport needs its options (see resolveHttpOptions)");
+    }
+    this.httpOptions = options.http;
+    this.deferAfterMs = options.deferAfterMs ?? resolveDeferAfterMs(this.transportKind);
+
     // Create the ready promise (resolved when Python sends {"type":"ready"})
     this.resetReadyState();
 
-    // Initialize STDIO transport
-    this.stdioTransport = new StdioServerTransport();
-    logger.info("Using STDIO transport for local communication");
+    if (this.transportKind === "stdio") {
+      this.stdioTransport = new StdioServerTransport();
+      logger.info("Using STDIO transport for local communication");
+    } else {
+      logger.info("Using Streamable HTTP transport");
+    }
 
-    // Register tools, resources, and prompts
-    this.registerAll();
+    // The primary MCP server: the one stdio connects to. Over HTTP every
+    // session builds its own with createMcpServer().
+    const primary = this.createMcpServer();
+    this.server = primary.server;
+    this.toolboxes = primary.toolboxes;
+    logger.info("All KiCAD tools, resources, and prompts registered");
+    logger.info(this.toolboxes.describe());
   }
 
   /**
-   * Register all tools, resources, and prompts
+   * Build an McpServer with every tool, resource and prompt registered. All of
+   * them drive this bridge's single Python worker, so every server built here
+   * sees the same open project; tool visibility (toolboxes) is per server.
    */
-  private registerAll(): void {
-    logger.info("Registering KiCAD tools, resources, and prompts...");
+  createMcpServer(): { server: McpServer; toolboxes: ToolboxManager } {
+    const server = new McpServer(
+      {
+        name: "kicad-mcp-server",
+        version: "2.9.0",
+        description: "MCP server for KiCAD PCB design operations",
+      },
+      { instructions: serverInstructions(this.deferAfterMs) },
+    );
+    const toolboxes = this.registerAll(server);
+    return { server, toolboxes };
+  }
+
+  /**
+   * Register all tools, resources, and prompts on `server`
+   */
+  private registerAll(server: McpServer): ToolboxManager {
+    logger.debug("Registering KiCAD tools, resources, and prompts...");
 
     // Toolboxes decide which registered tools a client sees (toolboxes.ts). The
     // manager has to see every registration, so it wraps the server first.
@@ -373,70 +469,71 @@ export class KiCADMcpServer {
       );
     }
     // A backend reply of {success: false} is an MCP error (failure-as-error.ts).
-    flagBackendFailuresAsErrors(this.server);
-    this.toolboxes = new ToolboxManager(
-      this.server,
+    flagBackendFailuresAsErrors(server);
+    // Long tools take async:true; over HTTP slow calls are answered with a jobId.
+    enableBackgroundCalls(server, this.backgroundCalls, { deferAfterMs: this.deferAfterMs });
+    const toolboxes = new ToolboxManager(
+      server,
       parseToolboxSetting(process.env[TOOLBOXES_ENV]),
       operatingMode.mode,
     );
-    this.toolboxes.captureRegistrations();
-    if (this.toolboxes.setting.mode === "toolboxes" && this.toolboxes.setting.unknown.length > 0) {
+    toolboxes.captureRegistrations();
+    if (toolboxes.setting.mode === "toolboxes" && toolboxes.setting.unknown.length > 0) {
       logger.warn(
-        `${TOOLBOXES_ENV}: ignoring unknown toolbox name(s): ${this.toolboxes.setting.unknown.join(", ")}`,
+        `${TOOLBOXES_ENV}: ignoring unknown toolbox name(s): ${toolboxes.setting.unknown.join(", ")}`,
       );
     }
 
     // Register the discovery tools first
-    registerRouterTools(this.server, this.callKicadScript.bind(this), this.toolboxes);
-    registerToolboxTools(this.server, this.toolboxes);
+    registerRouterTools(server, this.callKicadScript.bind(this), toolboxes);
+    registerToolboxTools(server, toolboxes);
 
     // Register all tools
-    registerProjectTools(this.server, this.callKicadScript.bind(this));
-    registerBoardTools(this.server, this.callKicadScript.bind(this));
-    registerBoardEditTools(this.server, this.callKicadScript.bind(this));
-    registerComponentTools(this.server, this.callKicadScript.bind(this));
-    registerRoutingTools(this.server, this.callKicadScript.bind(this));
-    registerBoardQueryTools(this.server, this.callKicadScript.bind(this));
-    registerDesignRuleTools(this.server, this.callKicadScript.bind(this));
-    registerExportTools(this.server, this.callKicadScript.bind(this));
-    registerSchematicTools(this.server, this.callKicadScript.bind(this));
-    registerLibraryTools(this.server, this.callKicadScript.bind(this));
-    registerSymbolLibraryTools(this.server, this.callKicadScript.bind(this));
-    registerSchematicHierarchyTools(this.server, this.callKicadScript.bind(this));
-    registerSchematicLayoutTools(this.server, this.callKicadScript.bind(this));
-    registerSchematicBatchTools(this.server, this.callKicadScript.bind(this));
-    registerJLCPCBApiTools(this.server, this.callKicadScript.bind(this));
-    registerDigiKeyApiTools(this.server, this.callKicadScript.bind(this));
-    registerPartsRegistryTools(this.server);
-    registerDatasheetTools(this.server, this.callKicadScript.bind(this));
-    registerFootprintTools(this.server, this.callKicadScript.bind(this));
-    registerSymbolCreatorTools(this.server, this.callKicadScript.bind(this));
-    registerUITools(this.server, this.callKicadScript.bind(this));
-    registerGuiDriverTools(this.server, this.callKicadScript.bind(this));
-    registerFreeroutingTools(this.server, this.callKicadScript.bind(this));
-    registerRoutingWorkflowTools(this.server, this.callKicadScript.bind(this));
-    registerJobTools(this.server, this.callKicadScript.bind(this));
-    registerEagleTools(this.server, this.callKicadScript.bind(this));
-    registerPcbImportTools(this.server, this.callKicadScript.bind(this));
-    registerFinishingTools(this.server, this.callKicadScript.bind(this));
-    registerValidationTools(this.server, this.callKicadScript.bind(this));
-    registerFabBomTools(this.server, this.callKicadScript.bind(this));
+    registerProjectTools(server, this.callKicadScript.bind(this));
+    registerBoardTools(server, this.callKicadScript.bind(this));
+    registerBoardEditTools(server, this.callKicadScript.bind(this));
+    registerComponentTools(server, this.callKicadScript.bind(this));
+    registerRoutingTools(server, this.callKicadScript.bind(this));
+    registerBoardQueryTools(server, this.callKicadScript.bind(this));
+    registerDesignRuleTools(server, this.callKicadScript.bind(this));
+    registerExportTools(server, this.callKicadScript.bind(this));
+    registerSchematicTools(server, this.callKicadScript.bind(this));
+    registerLibraryTools(server, this.callKicadScript.bind(this));
+    registerSymbolLibraryTools(server, this.callKicadScript.bind(this));
+    registerSchematicHierarchyTools(server, this.callKicadScript.bind(this));
+    registerSchematicLayoutTools(server, this.callKicadScript.bind(this));
+    registerSchematicBatchTools(server, this.callKicadScript.bind(this));
+    registerJLCPCBApiTools(server, this.callKicadScript.bind(this));
+    registerDigiKeyApiTools(server, this.callKicadScript.bind(this));
+    registerPartsRegistryTools(server);
+    registerDatasheetTools(server, this.callKicadScript.bind(this));
+    registerFootprintTools(server, this.callKicadScript.bind(this));
+    registerSymbolCreatorTools(server, this.callKicadScript.bind(this));
+    registerUITools(server, this.callKicadScript.bind(this));
+    registerGuiDriverTools(server, this.callKicadScript.bind(this));
+    registerFreeroutingTools(server, this.callKicadScript.bind(this));
+    registerRoutingWorkflowTools(server, this.callKicadScript.bind(this));
+    registerJobTools(server, this.callKicadScript.bind(this), this.backgroundCalls);
+    registerEagleTools(server, this.callKicadScript.bind(this));
+    registerPcbImportTools(server, this.callKicadScript.bind(this));
+    registerFinishingTools(server, this.callKicadScript.bind(this));
+    registerValidationTools(server, this.callKicadScript.bind(this));
+    registerFabBomTools(server, this.callKicadScript.bind(this));
     // Register all resources
-    registerProjectResources(this.server, this.callKicadScript.bind(this));
-    registerBoardResources(this.server, this.callKicadScript.bind(this));
-    registerComponentResources(this.server, this.callKicadScript.bind(this));
-    registerLibraryResources(this.server, this.callKicadScript.bind(this));
+    registerProjectResources(server, this.callKicadScript.bind(this));
+    registerBoardResources(server, this.callKicadScript.bind(this));
+    registerComponentResources(server, this.callKicadScript.bind(this));
+    registerLibraryResources(server, this.callKicadScript.bind(this));
 
     // Register all prompts
-    registerComponentPrompts(this.server);
-    registerRoutingPrompts(this.server);
-    registerDesignPrompts(this.server);
-    registerFootprintPrompts(this.server);
+    registerComponentPrompts(server);
+    registerRoutingPrompts(server);
+    registerDesignPrompts(server);
+    registerFootprintPrompts(server);
 
-    this.toolboxes.annotateReadOnly();
-    this.toolboxes.applyVisibility();
-    logger.info("All KiCAD tools, resources, and prompts registered");
-    logger.info(this.toolboxes.describe());
+    toolboxes.annotateReadOnly();
+    toolboxes.applyVisibility();
+    return toolboxes;
   }
 
   /**
@@ -479,6 +576,7 @@ export class KiCADMcpServer {
             {
               timeout: 3000,
               env: { ...process.env },
+              ...windowsHideOption(),
             },
             (error: any, stdout: string, stderr: string) => {
               if (error) {
@@ -534,6 +632,7 @@ export class KiCADMcpServer {
             {
               timeout: 5000,
               env: { ...process.env },
+              ...windowsHideOption(),
             },
             (error: any, stdout: string, stderr: string) => {
               if (error) {
@@ -620,13 +719,24 @@ export class KiCADMcpServer {
       // registered in the constructor, so initialize/tools/list/prompts/get
       // need no Python; tool CALLS queue until the backend is ready (see
       // processNextRequest's ready gate).
-      logger.info("Connecting MCP server to STDIO transport...");
-      try {
-        await this.server.connect(this.stdioTransport);
-        logger.info("Successfully connected to STDIO transport");
-      } catch (error) {
-        logger.error(`Failed to connect to STDIO transport: ${error}`);
-        throw error;
+      if (this.transportKind === "http") {
+        // Over HTTP each session connects its own server (http-transport.ts).
+        this.httpServer = new McpHttpServer(
+          this.httpOptions!,
+          () => this.createMcpServer().server,
+          { ready: () => this.readyDetected },
+        );
+        await this.httpServer.listen();
+        process.stderr.write(`KiCAD MCP HTTP endpoint: ${this.httpServer.url}\n`);
+      } else {
+        logger.info("Connecting MCP server to STDIO transport...");
+        try {
+          await this.server.connect(this.stdioTransport!);
+          logger.info("Successfully connected to STDIO transport");
+        } catch (error) {
+          logger.error(`Failed to connect to STDIO transport: ${error}`);
+          throw error;
+        }
       }
 
       // Start the Python process for KiCAD scripting
@@ -699,6 +809,10 @@ export class KiCADMcpServer {
   async stop(): Promise<void> {
     logger.info("Stopping KiCAD MCP server...");
     this.stopping = true;
+    if (this.httpServer) {
+      await this.httpServer.close();
+      this.httpServer = undefined;
+    }
 
     // Stop the Python process if it's running. If it is in the middle of a
     // command, close its stdin first so it can finish (the stdin loop exits on
@@ -727,6 +841,7 @@ export class KiCADMcpServer {
     const worker = spawn(this.pythonExecutable, [this.kicadScriptPath], {
       stdio: ["pipe", "pipe", "pipe"],
       env: this.pythonEnv,
+      ...windowsHideOption(),
     });
     this.pythonProcess = worker;
 

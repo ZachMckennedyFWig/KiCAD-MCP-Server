@@ -22,6 +22,13 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# Optional (KICAD_MCP_HIDE_CONSOLE_WINDOWS): start kicad-cli, Java and other
+# console programs without a window on Windows. Installed before anything
+# can start a process.
+from utils.hidden_windows import install as _hide_console_windows  # noqa: E402
+
+_hide_console_windows()
+
 # Fix cairo DLL loading on Windows before any cairocffi import.
 # cairocffi uses cffi's ffi.dlopen('cairo-2') which needs the DLL on PATH.
 # utils.kicad_roots needs only the standard library, so it can run this early.

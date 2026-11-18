@@ -6,6 +6,7 @@ import { spawn, ChildProcess } from "child_process";
 import { existsSync } from "fs";
 import { fileURLToPath } from "url";
 import path from "path";
+import { windowsHideOption } from "./hidden-windows.js";
 
 // Import all tool definitions for reference
 // import { registerBoardTools } from './tools/board.js';
@@ -316,6 +317,7 @@ class KiCADServer {
         env: {
           ...process.env,
         },
+        ...windowsHideOption(),
       });
 
       // Listen for process exit

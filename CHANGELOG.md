@@ -42,6 +42,53 @@ All notable changes to the KiCAD MCP Server project are documented here.
 
 ### New Features
 
+- **No console windows on Windows.** Under an MCP client every command-line
+  program the server started got its own console window, which flashed up and
+  took the focus: the Python worker, `kicad-cli` for DRC and exports, Java for
+  Freerouting, and helper Python processes. They now all start without one.
+  `KICAD_MCP_HIDE_CONSOLE_WINDOWS=0` shows them again, for debugging.
+  - The Node bridge starts the worker with `windowsHide`.
+  - The worker, and the helper process behind `run_pcbnew_script`, patch
+    `subprocess.Popen` to pass `CREATE_NO_WINDOW`, so nothing further down gets
+    a window either.
+  - KiCad's own windows (`launch_kicad_ui`, the GUI driver) are unaffected,
+    since the flag only applies to console programs.
+  - The test suites hide their own windows too: `tests/conftest.py` forces the
+    setting on for pytest and every process it starts, vitest runs its workers
+    as threads instead of child processes, and the schema generator builds the
+    server in-process instead of starting it.
+  - A test checks the flags handed to the Windows `CreateProcess` call, and
+    another fails if any script or test starts a process without `windowsHide`.
+  - See "Console windows" in the README and Issue 9 in
+    `docs/WINDOWS_TROUBLESHOOTING.md`.
+- **HTTP mode: MCP over Streamable HTTP** (`--http`, or
+  `KICAD_MCP_TRANSPORT=http`), for clients that cannot start a local process,
+  such as Executor. It serves `http://127.0.0.1:8808/mcp` and `/health`.
+  Each MCP session gets its own server (tool visibility is per session), and
+  all of them drive the one KiCad worker. Idle sessions are closed, and a
+  session cap drops the least recently used. It binds to loopback by default
+  and checks the `Host` header against DNS rebinding. It refuses another
+  address without `KICAD_MCP_HTTP_TOKEN`, which it then requires as a bearer
+  token. Over stdio, nothing changes.
+- **Long-running tools answer with a job id.** The 82 tools whose command
+  timeout is the long allowance or more (DRC, ERC, zone refill, exports,
+  `fab_package`, sync, the batch schematic tools and others) take
+  `async: true`. They return `{jobId}` at once, and `job_status` returns the
+  tool's own reply, images included, when it finishes. Over HTTP, a call still
+  running after 20 s (`KICAD_MCP_DEFER_AFTER_MS`) is answered the same way and
+  keeps running, below Executor's 30 s call timeout. `job_status` takes
+  `waitSeconds` (up to 20), so an agent can wait for a job without polling in a
+  loop. For autoroute's own jobs it polls Python until the job ends.
+  - `job_list` lists background calls with autoroute jobs. `job_cancel` and
+    `job_apply` refuse background calls, which run to completion and need no
+    apply.
+  - The server's MCP instructions tell agents to use `async: true` and
+    `job_status`, and every long tool's description says the same.
+  - On a copy of CD_Mainboard over HTTP, `run_drc` with `async: true` answered
+    in 11 ms and finished in 8 s on a single `job_status` wait. With a 3 s
+    threshold, a plain 15 s DRC was deferred and its result arrived through
+    `job_status`.
+
 - **`autoroute` passes Freerouting settings: `routerSettings`.** An object of
   setting name to value, by the names in Freerouting's `docs/settings.md` under
   `router`. Each is passed as `--router.<name>=<value>`; a list is joined with

@@ -1283,6 +1283,24 @@ The same workflow is available on [Linux](#linux-ubuntudebian)
 (`./setup-linux.sh --apply --use-uv`) and [macOS](#macos)
 (`./setup-macos.sh --apply --use-uv`).
 
+**Console windows:**
+
+On Windows, every command-line program the server starts (the Python worker,
+`kicad-cli` for DRC and exports, Java for Freerouting) would otherwise flash up
+its own console window and take the focus while you work. The server starts
+them all without a window, and so does the test suite. KiCad's own windows
+(`launch_kicad_ui`, the GUI driver) still appear. To see the console windows,
+for example to debug a child program, set
+`KICAD_MCP_HIDE_CONSOLE_WINDOWS=0` (or `false`, `no`, `off`) in the server's
+environment:
+
+```json
+"env": { "KICAD_MCP_HIDE_CONSOLE_WINDOWS": "0" }
+```
+
+Other platforms ignore the setting. See
+[Windows Troubleshooting](docs/WINDOWS_TROUBLESHOOTING.md#issue-9-console-windows-pop-up-while-the-server-works).
+
 **Manual Setup:**
 See [Platform Guide](docs/PLATFORM_GUIDE.md) for detailed instructions, and
 [Windows Troubleshooting](docs/WINDOWS_TROUBLESHOOTING.md) if setup fails.
@@ -1756,6 +1774,72 @@ To disable the server without removing the full configuration, set the entry to
 If OpenCode is running, the MCP server process is managed by OpenCode and
 normally stops when OpenCode exits.
 
+### HTTP mode (Executor and other remote clients)
+
+Every client above starts the server as a local process and talks to it over
+stdio. A client that cannot start a process, such as
+[Executor](https://github.com/UsefulSoftwareCo/executor), connects over MCP's
+Streamable HTTP transport instead. Start the server yourself:
+
+```bash
+node dist/index.js --http                # http://127.0.0.1:8808/mcp
+node dist/index.js --http --port 9000    # another port
+```
+
+or set `KICAD_MCP_TRANSPORT=http`. `GET /health` reports
+`{status, ready, sessions}`; `ready` turns true once the KiCad worker has
+started.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `KICAD_MCP_HTTP_PORT` / `--port` | `8808` | Port |
+| `KICAD_MCP_HTTP_HOST` / `--host` | `127.0.0.1` | Address to bind |
+| `KICAD_MCP_HTTP_TOKEN` | none | Require `Authorization: Bearer <token>`; mandatory when binding beyond loopback |
+| `KICAD_MCP_HTTP_ALLOWED_HOSTS` | loopback names | `Host` header values accepted, comma-separated (e.g. `host.docker.internal`) |
+| `KICAD_MCP_HTTP_MAX_SESSIONS` | `32` | Open sessions kept; the least recently used is closed past it |
+| `KICAD_MCP_HTTP_SESSION_IDLE_MS` | `1800000` | An idle session is closed after this long |
+| `KICAD_MCP_DEFER_AFTER_MS` | `20000` over HTTP, `0` over stdio | Answer a call still running after this long with a job id (see below) |
+| `KICAD_MCP_HIDE_CONSOLE_WINDOWS` | on | Start child programs without console windows on Windows; `0` shows them |
+
+The tools can write files and run Python against the board, so the server only
+listens on 127.0.0.1 by default and rejects requests whose `Host` header is not
+a loopback name (DNS-rebinding protection). It refuses to bind anywhere else
+without `KICAD_MCP_HTTP_TOKEN`.
+
+Every session drives the same KiCad worker, so all clients see the same open
+project. Clients that open a new session for every call (Executor does) are
+fine: background jobs belong to the server, not to the session.
+
+**Long-running tools.** Many clients give up on a single tool call after
+30-60 s; Executor's default is 30 s. Autoroute, DRC, zone refill, exports and
+the batch schematic tools can take minutes, so:
+
+- every long-running tool takes `async: true` (its description says so): the
+  reply is `{jobId}` at once, and `job_status` returns the tool's normal reply
+  when it is done. `autoroute` keeps its own `async`, whose result is written
+  with `job_apply`;
+- over HTTP, any call still running after 20 s (`KICAD_MCP_DEFER_AFTER_MS`) is
+  answered with a `jobId` the same way and keeps running; the reply tells the
+  agent not to repeat the call;
+- `job_status` takes `waitSeconds` (up to 20) and waits for the job to finish
+  before answering, so an agent can poll without a sleep (Executor programs
+  have no timers);
+- the server's MCP instructions explain all of this, and read-only tools carry
+  `readOnlyHint`, which Executor uses to skip approval prompts for them.
+
+The worker still runs one command at a time: a call made while a long job
+runs waits behind it (and may itself come back as a job).
+
+**Executor.** Run the server in HTTP mode on the same machine as Executor (it
+needs your KiCad install and project files), then add it in Executor's
+dashboard as a custom app from the URL `http://127.0.0.1:8808/mcp`. A
+self-hosted Executor in Docker reaches the host as `host.docker.internal`:
+start the server with `KICAD_MCP_HTTP_HOST=0.0.0.0`,
+`KICAD_MCP_HTTP_ALLOWED_HOSTS=host.docker.internal` and a
+`KICAD_MCP_HTTP_TOKEN`, and send `Authorization: Bearer <token>` from the app
+(for an authored app, `mcpRouter`'s `headers` option). Executor's hosted
+service cannot reach a server on your machine.
+
 ### JLCPCB Integration Setup (Optional)
 
 The JLCPCB integration provides two modes that can be used independently or together:
@@ -2082,6 +2166,14 @@ npm run format
 2. Verify Python path uses double backslashes: `C:\\Program Files\\KiCad\\10.0`
 3. Check Windows Event Viewer for Node.js errors
 4. See [Windows Troubleshooting Guide](docs/WINDOWS_TROUBLESHOOTING.md)
+
+**Symptoms:** Console windows flash up and take the focus while the server
+works
+
+**Solution:** Rebuild (`npm run build`) and reconnect the server: current
+versions start every child program without a window. Check that the server's
+MCP config does not set `KICAD_MCP_HIDE_CONSOLE_WINDOWS=0`; see "Console
+windows" under the Windows installation steps.
 
 ### Getting Help
 

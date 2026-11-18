@@ -267,6 +267,60 @@ This bypasses Node.js and runs Python directly.
 
 ---
 
+### Issue 9: Console windows pop up while the server works
+
+**Symptoms:**
+- Black console windows flash up during DRC, exports, autoroute or project
+  loading, and take the keyboard focus from whatever you are doing
+
+**Cause:** Under an MCP client the server has no console of its own, so
+Windows gives every command-line program it starts a new console window: the
+Python worker, `kicad-cli` (DRC, ERC, Gerber/PDF/3D exports, netlists), Java
+for Freerouting, git, and the helper Python processes behind
+`run_pcbnew_script` and zone refill.
+
+**Solution:** Current versions start every child program without a window
+(`KICAD_MCP_HIDE_CONSOLE_WINDOWS`, on by default). If windows still appear:
+
+1. Rebuild (`npm run build`) and restart or reconnect the server, so the
+   running server is the new one.
+2. Make sure the server's MCP config does not set
+   `KICAD_MCP_HIDE_CONSOLE_WINDOWS` to `0`, `false`, `no` or `off`.
+
+To see the windows on purpose (to watch a child program's output), set it to
+`0`:
+
+```json
+{
+  "mcpServers": {
+    "kicad": {
+      "command": "node",
+      "args": ["C:\\path\\to\\KiCAD-MCP-Server\\dist\\index.js"],
+      "env": {
+        "KICAD_MCP_HIDE_CONSOLE_WINDOWS": "0"
+      }
+    }
+  }
+}
+```
+
+The test suites hide their own windows regardless: `tests/conftest.py` forces
+the setting on for pytest and every process it starts, and vitest runs its
+workers as threads instead of child processes.
+
+How it works:
+- The Node bridge starts the Python worker with `windowsHide`.
+- The worker, and every helper Python process, starts its own children with
+  `CREATE_NO_WINDOW`, so nothing further down gets a window either.
+- The flag only affects console programs: KiCad's own windows
+  (`launch_kicad_ui`, the GUI driver) still open normally.
+- Program output is still captured and logged as before; only the window is
+  gone.
+- Only `0`, `false`, `no` and `off` turn it off. Other platforms ignore the
+  setting.
+
+---
+
 ## Configuration Examples
 
 ### For Claude Desktop

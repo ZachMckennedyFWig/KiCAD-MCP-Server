@@ -74,6 +74,12 @@ def main(request_path: str) -> int:
     server_path = [p for p in (req.get("sysPath") or []) if p]
     if server_path and server_path[0] not in sys.path:
         sys.path.insert(0, server_path[0])  # the server's python/ dir, for helpers
+    try:  # hide console windows of programs the script starts, when the server does
+        from utils.hidden_windows import install as hide_console_windows
+
+        hide_console_windows()
+    except Exception:
+        pass
     pcbnew_dir = req.get("pcbnewDir")
     if pcbnew_dir and pcbnew_dir not in sys.path:
         sys.path.insert(0, pcbnew_dir)

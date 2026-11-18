@@ -23,7 +23,7 @@ import { readFileSync, readdirSync, writeFileSync, existsSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const OUT = join(ROOT, "python", "schemas", "generated_tool_schemas.json");
@@ -49,20 +49,20 @@ function toolsThatCallPython() {
 }
 const pythonTools = toolsThatCallPython();
 
-const env = { ...process.env, LOG_LEVEL: "error" };
 // Every tool, as a client sees it in the default write mode with all
 // toolboxes open (the toolbox controls are TypeScript-only and stay hidden).
-delete env.KICAD_MCP_OPERATING_MODE;
-delete env.KICAD_MCP_TOOLBOXES;
+delete process.env.KICAD_MCP_OPERATING_MODE;
+delete process.env.KICAD_MCP_TOOLBOXES;
 
-const transport = new StdioClientTransport({
-  command: process.execPath,
-  args: [join(ROOT, "dist", "index.js")],
-  env,
-  stderr: "ignore",
-});
+// The built server, in this process: tools/list needs no Python worker, and
+// starting no child process means no console window flashing up on Windows.
+const { KiCADMcpServer } = await import(new URL("../dist/server.js", import.meta.url).href);
+const bridge = new KiCADMcpServer(join(ROOT, "python", "kicad_interface.py"), "error");
+const { server } = bridge.createMcpServer();
+const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+await server.connect(serverSide);
 const client = new Client({ name: "schema-generator", version: "1.0.0" });
-await client.connect(transport);
+await client.connect(clientSide);
 let tools;
 try {
   ({ tools } = await client.listTools());
@@ -77,6 +77,17 @@ for (const tool of [...tools].sort((a, b) => a.name.localeCompare(b.name))) {
   if (tool.title) entry.title = tool.title;
   entry.description = tool.description ?? "";
   entry.inputSchema = tool.inputSchema;
+  // `async` added by src/background-calls.ts is served by the TypeScript bridge;
+  // the Python server on its own runs every call in the foreground.
+  const asyncProp = entry.inputSchema?.properties?.async;
+  if (
+    asyncProp &&
+    String(asyncProp.description ?? "").includes("job_status returns this tool's reply")
+  ) {
+    const { async: _bridgeOnly, ...rest } = entry.inputSchema.properties;
+    entry.inputSchema = { ...entry.inputSchema, properties: rest };
+    entry.description = entry.description.replace(/ Long-running \(can take minutes\):.*$/s, "");
+  }
   schemas[tool.name] = entry;
 }
 const text = JSON.stringify(schemas, null, 2) + "\n";

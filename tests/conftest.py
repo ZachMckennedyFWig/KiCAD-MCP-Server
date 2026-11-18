@@ -27,6 +27,15 @@ if str(_PYTHON_ROOT) not in sys.path:
 # saturate the CPU. On-demand parses still work (and are cached process-wide).
 os.environ.setdefault("KICAD_SKIP_SYMBOL_WARMUP", "1")
 
+# No console windows from the test run, whatever the caller's setting: the suite
+# starts hundreds of kicad-cli, git and Python processes, and on Windows each
+# one would flash up a window and take the focus. Forced on (not setdefault) and
+# exported, so every Python process a test starts hides its children too.
+os.environ["KICAD_MCP_HIDE_CONSOLE_WINDOWS"] = "1"
+from utils.hidden_windows import install as _hide_console_windows  # noqa: E402
+
+_hide_console_windows()
+
 # ---------------------------------------------------------------------------
 # pcbnew stub — kicad_interface.py accesses pcbnew.__file__ and
 # pcbnew.GetBuildVersion() at module level.  Use MagicMock so that any

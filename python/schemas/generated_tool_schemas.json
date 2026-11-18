@@ -2006,7 +2006,7 @@
   },
   "autoroute": {
     "name": "autoroute",
-    "description": "Run Freerouting autorouter on the current PCB. Exports to Specctra DSN, runs Freerouting CLI, and imports the routed SES result. Requires freerouting.jar and the Java version it was built for (21+; Freerouting 2.4.x needs 25), or Docker/Podman (see check_freerouting). Set `attempts` > 1 to run best-of-N: Freerouting is invoked multiple times with varied `--max-passes`, each result is scored by (nets_routed * 1000 + segments, +50000 bonus when every `targetNets` entry routed), and the winning SES is imported. Single-attempt behaviour is unchanged when `attempts` is omitted. Orchestrated mode (any of async, nets, lockExisting, stripRuleAreas, forbidRegionsForNets, passes, stallTimeout, importMode, evaluate, lockRouted): the in-memory board is staged to a temp copy, the DSN is exported from that disk copy and rewritten (pour-only keepouts stripped, subset/locking), Freerouting's log is streamed (stall detection), the SES is imported into a copy, zones are refilled and KiCad DRC evaluates it; the board file is replaced only if accepted (importMode) and unchanged since the start. Returns {pipeline:'orchestrated', freerouting:{attempts:[{unroutedReportedByFreerouting, stopReason,...}]}, kicad:{before:{unconnected, unconnectedByNet, drcErrors}, after:{...}}, drcDelta:{newCount, resolvedCount, new, resolved}, decision:{import, reason}, applied, logTail, dsn:{ruleAreas, netFilter, lockedWiring}} or, with async, {jobId}.",
+    "description": "Run Freerouting autorouter on the current PCB. Exports to Specctra DSN, runs Freerouting CLI, and imports the routed SES result. Requires freerouting.jar and the Java version it was built for (21+; Freerouting 2.4.x needs 25), or Docker/Podman (see check_freerouting). Set `attempts` > 1 to run best-of-N: Freerouting is invoked multiple times with varied `--max-passes`, each result is scored by (nets_routed * 1000 + segments, +50000 bonus when every `targetNets` entry routed), and the winning SES is imported. Single-attempt behaviour is unchanged when `attempts` is omitted. Orchestrated mode (any of async, nets, lockExisting, stripRuleAreas, forbidRegionsForNets, passes, stallTimeout, importMode, evaluate, lockRouted): the in-memory board is staged to a temp copy, the DSN is exported from that disk copy and rewritten (pour-only keepouts stripped, subset/locking), Freerouting's log is streamed (stall detection), the SES is imported into a copy, zones are refilled and KiCad DRC evaluates it; the board file is replaced only if accepted (importMode) and unchanged since the start. Returns {pipeline:'orchestrated', freerouting:{attempts:[{unroutedReportedByFreerouting, stopReason,...}]}, kicad:{before:{unconnected, unconnectedByNet, drcErrors}, after:{...}}, drcDelta:{newCount, resolvedCount, new, resolved}, decision:{import, reason}, applied, logTail, dsn:{ruleAreas, netFilter, lockedWiring}} or, with async, {jobId}. Long-running (can take minutes): pass async:true to get a jobId at once, then follow it with job_status (waitSeconds).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -8633,7 +8633,7 @@
   },
   "job_apply": {
     "name": "job_apply",
-    "description": "Write a finished job's result into the board (for autoroute: replace the .kicad_pcb with the routed and evaluated copy, then reload it). Runs on the main command thread, so it never races another edit. Refuses when the board changed in memory or on disk since the job started, or when the job's importMode=if_better check rejected the result (pass importAnyway:true to override that check only). Returns {success, boardPath, kicad:{before, after}, decision}.",
+    "description": "Write a finished autoroute job's result into the board (replace the .kicad_pcb with the routed and evaluated copy, then reload it). Runs on the main command thread, so it never races another edit. Refuses when the board changed in memory or on disk since the job started, or when the job's importMode=if_better check rejected the result (pass importAnyway:true to override that check only). Background calls (jobId bg-...) need no apply: their changes are already made. Returns {success, boardPath, kicad:{before, after}, decision}.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -8655,7 +8655,7 @@
   },
   "job_cancel": {
     "name": "job_cancel",
-    "description": "Cancel a running background job (kills its child processes). Cancelling never changes the board: job results are only written by job_apply. Returns {state}.",
+    "description": "Cancel a running autoroute job (kills its child processes). Cancelling never changes the board: job results are only written by job_apply. Background calls (jobId bg-...) cannot be cancelled: the KiCad command runs to the end so no file is left half-written. Returns {state}.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -8673,13 +8673,13 @@
   },
   "job_list": {
     "name": "job_list",
-    "description": "List background jobs known to this server session (newest last), without results or logs. Returns {count, jobs:[{jobId, kind, state, progress, message, elapsedSeconds, stalled, ...}]}. Jobs are kept in memory; a server restart forgets them.",
+    "description": "List background jobs known to this server process (newest last), without results or logs: background calls (jobId bg-...) and autoroute jobs. Returns {count, jobs:[{jobId, kind, tool?, state, elapsedSeconds, ...}]}. Jobs are kept in memory; a server restart forgets them.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "kind": {
           "type": "string",
-          "description": "Only jobs of this kind, e.g. autoroute"
+          "description": "Only jobs of this kind: call, or e.g. autoroute"
         },
         "states": {
           "type": "array",
@@ -8695,13 +8695,19 @@
   },
   "job_status": {
     "name": "job_status",
-    "description": "State of a background job started by a long tool (e.g. autoroute with async:true). Returns {jobId, kind, state: queued|running|succeeded|failed|cancelled, progress 0..1, message, elapsedSeconds, secondsSinceProgress, stalled (no progress for the job's stallTimeout), logTail:[last lines], result (when finished), applyStep:{required, applied}}. Never changes the board.",
+    "description": "State of a background job: one started by a long tool called with async:true, a call that was still running when the server answered with a jobId, or autoroute's own async job. Pass waitSeconds (up to 20) to wait for it to finish before answering, instead of polling in a tight loop. For a background call (jobId bg-...) the reply is {jobId, tool, state: running|succeeded|failed, elapsedSeconds, message} followed by the tool's own reply once finished. For autoroute jobs: {jobId, kind, state: queued|running|succeeded|failed|cancelled, progress 0..1, message, elapsedSeconds, secondsSinceProgress, stalled, logTail, result, applyStep:{required, applied}}. Never changes the board.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "jobId": {
           "type": "string",
           "description": "Job id returned by the tool that started it"
+        },
+        "waitSeconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 20,
+          "description": "Wait up to this many seconds (max 20) for the job to finish before answering (default 0: answer at once)"
         },
         "logLines": {
           "type": "number",
@@ -10428,6 +10434,7 @@
     "inputSchema": {
       "type": "object",
       "properties": {},
+      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     }
   },
