@@ -52,6 +52,32 @@ class TestHelpers:
         # Too far -> None
         assert _find_facing_label(f, "VBUS", [100, 200], orientation=180) is None
 
+    def test_facing_label_must_be_on_the_pins_axis(self, tmp_path):
+        # The HV PWR case: C39's pin at (351.79, 96.52) points left (180); a "U10 BST"
+        # label at angle 0 sits 9 mm left and 10 mm down. Joining them drew a diagonal.
+        f = tmp_path / "s.kicad_sch"
+        f.write_text('(kicad_sch (label "U10 BST" (at 342.9 106.68 0)))')
+        assert _find_facing_label(f, "U10 BST", [351.79, 96.52], orientation=180) is None
+        # Same label straight out to the left of the pin, on its row: a wire is right.
+        assert _find_facing_label(f, "U10 BST", [351.79, 106.68], orientation=180) == [
+            342.9,
+            106.68,
+        ]
+
+    def test_facing_label_behind_the_pin_is_not_facing(self, tmp_path):
+        # A pin pointing left (180) with the label to its right would wire back
+        # across its own symbol body.
+        f = tmp_path / "s.kicad_sch"
+        f.write_text('(kicad_sch (label "VBUS" (at 20 20 0)))')
+        assert _find_facing_label(f, "VBUS", [12, 20], orientation=180) is None
+
+    def test_facing_label_vertical_pins(self, tmp_path):
+        # Pin pointing up (90; outward is -y on the sheet) with a label above it at 270.
+        f = tmp_path / "s.kicad_sch"
+        f.write_text('(kicad_sch (label "SDA" (at 30 10 270)))')
+        assert _find_facing_label(f, "SDA", [30, 20], orientation=90) == [30.0, 10.0]
+        assert _find_facing_label(f, "SDA", [30, 0], orientation=90) is None
+
     def test_field_positions_two_pin_vertical(self):
         # pins stacked vertically -> labels go left/right
         pins = {"1": [0, 5], "2": [0, -5]}
@@ -160,8 +186,8 @@ class TestBatchConnect:
         )
         labels = []
         fake_wm = types.SimpleNamespace(
-            add_label=lambda p, net, pos, label_type="label", orientation=0: labels.append(
-                (net, orientation)
+            add_labels_and_wires=lambda p, new_labels, wires, **k: labels.extend(
+                (net, orientation) for net, _pos, _kind, orientation in new_labels
             )
             or True,
             add_wire=lambda *a: True,
@@ -191,8 +217,8 @@ class TestBatchConnect:
         )
         kinds = []
         fake_wm = types.SimpleNamespace(
-            add_label=lambda p, net, pos, label_type="label", orientation=0: kinds.append(
-                label_type
+            add_labels_and_wires=lambda p, new_labels, wires, **k: kinds.extend(
+                kind for _net, _pos, kind, _angle in new_labels
             )
             or True,
             add_wire=lambda *a: True,
@@ -325,6 +351,25 @@ class TestBatchAddAndConnect:
         assert conn_args["connections"] == {"R1": {"1": "VCC"}}
         # labelType threaded through to batch_connect
         assert conn_args["labelType"] == "global_label"
+
+    def test_threads_connect_options(self):
+        # stubLength (upstream) and scope / avoidFieldOverlap (fork) reach batch_connect.
+        c = SchematicBatchCommands(types.SimpleNamespace())
+        conn_args = {}
+        c.batch_add_components = lambda params: {"added_count": 1, "added": [], "errors": []}
+        c.batch_connect = lambda params: conn_args.update(params) or {"placed": [], "failed": []}
+        c.batch_add_and_connect(
+            {
+                "schematicPath": "/x.kicad_sch",
+                "components": [{"symbol": "Device:R", "reference": "R1", "nets": {"1": "A"}}],
+                "stubLength": 2.54,
+                "scope": "auto",
+                "avoidFieldOverlap": False,
+            }
+        )
+        assert conn_args["stubLength"] == 2.54
+        assert conn_args["scope"] == "auto"
+        assert conn_args["avoidFieldOverlap"] is False
 
 
 class TestReplaceFieldRestore:

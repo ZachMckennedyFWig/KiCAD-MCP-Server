@@ -2014,6 +2014,36 @@ ROUTING_TOOLS = [
         },
     },
     {
+        "name": "add_copper_keepout",
+        "title": "Add Copper Keepout",
+        "description": "Creates a live rule area that prevents copper zone fill while allowing tracks, vias, pads and footprints.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string", "minLength": 1},
+                "name": {"type": "string", "minLength": 1},
+                "layers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                },
+                "points": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "x": {"type": "number"},
+                            "y": {"type": "number"},
+                        },
+                        "required": ["x", "y"],
+                    },
+                    "minItems": 3,
+                },
+            },
+            "required": ["boardPath", "name", "layers", "points"],
+        },
+    },
+    {
         "name": "add_copper_pour",
         "title": "Add Copper Pour",
         "description": "Creates a copper pour/zone (typically for ground or power planes).",
@@ -2041,14 +2071,27 @@ ROUTING_TOOLS = [
                 },
                 "outline": {
                     "type": "array",
-                    "description": "Array of [x, y] points defining the pour boundary",
+                    "description": "Array of {x, y} points (mm) defining the pour boundary",
                     "items": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "minItems": 2,
-                        "maxItems": 2,
+                        "type": "object",
+                        "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                        "required": ["x", "y"],
                     },
                     "minItems": 3,
+                },
+                "minWidth": {
+                    "type": "number",
+                    "description": "Minimum fill width in millimeters (default 0.2)",
+                },
+                "fillType": {
+                    "type": "string",
+                    "enum": ["solid", "hatched"],
+                    "description": "Fill style (default solid)",
+                },
+                "padConnection": {
+                    "type": "string",
+                    "enum": ["thermal", "solid", "none"],
+                    "description": "How pads of the zone's net connect (default thermal)",
                 },
             },
             "required": ["net", "layer", "outline"],
@@ -2151,7 +2194,18 @@ LIBRARY_TOOLS = [
                     "type": "string",
                     "description": "Library name (e.g., Resistor_SMD, Connector_PinHeader)",
                     "minLength": 1,
-                }
+                },
+                "filter": {
+                    "type": "string",
+                    "description": (
+                        "Keep names containing this text (case-insensitive, * as a wildcard)"
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of footprints to return",
+                    "minimum": 1,
+                },
             },
             "required": ["library"],
         },
@@ -2417,6 +2471,33 @@ DESIGN_RULE_TOOLS = [
         },
     },
     {
+        "name": "audit_via_nets",
+        "title": "Audit Via Nets Against a Reference",
+        "description": (
+            "Compares every via's net in the saved board with a reference board (a "
+            ".kicad_pcb file or a git revision such as HEAD) and lists vias whose net "
+            "changed, plus vias added, removed or moved. KiCad can silently change a via's "
+            "net on save, and DRC does not flag it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reference": {
+                    "type": "string",
+                    "description": (
+                        "A .kicad_pcb path, or a git revision of the same board file "
+                        "(HEAD, HEAD~1, a sha)"
+                    ),
+                },
+                "boardPath": {
+                    "type": "string",
+                    "description": "Board file to audit; defaults to the loaded board's file",
+                },
+            },
+            "required": ["reference"],
+        },
+    },
+    {
         "name": "check_clearance",
         "title": "Check Clearance",
         "description": "Checks the measured clearance between two PCB items against the board's minimum clearance design rule.",
@@ -2461,6 +2542,59 @@ DESIGN_RULE_TOOLS = [
                 },
             },
             "required": ["layer"],
+        },
+    },
+    {
+        "name": "set_voltage_clearance_rules",
+        "title": "Set Voltage Clearance Rules",
+        "description": (
+            "Writes clearance/creepage rules graded by working voltage between net classes "
+            "into a managed block of the board's .kicad_dru. A class's voltage is one number "
+            "(fixed potential) or [min, max] for a node that swings; the working voltage "
+            "between two classes is max(|maxA - minB|, |maxB - minA|). The spacing table's "
+            "voltage key must suit both columns (IEC 60664-1: clearance from impulse/peak, "
+            "creepage from RMS working voltage). KiCad 9 or newer; refused on KiCad 8."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "classes": {
+                    "type": "array",
+                    "description": (
+                        "[{name, voltage}]: potential per net class against the shared "
+                        "reference (V): a number for a fixed node, [min, max] for one that swings"
+                    ),
+                    "items": {"type": "object"},
+                },
+                "spacing": {
+                    "type": "array",
+                    "description": "[{upTo, clearance, creepage?}]: working voltage (V) to spacing (mm)",
+                    "items": {"type": "object"},
+                },
+                "pairs": {
+                    "type": "array",
+                    "description": "[{a, b, voltage}]: explicit working voltage between two classes",
+                    "items": {"type": "object"},
+                },
+                "otherNetsVoltage": {
+                    "type": ["number", "array", "null"],
+                    "description": (
+                        "Potential of nets in no listed class, a number or [min, max] "
+                        "(default 0); null skips those rules"
+                    ),
+                },
+                "excludeUnconnectedNets": {
+                    "type": "boolean",
+                    "description": (
+                        "Leave KiCad's unconnected-(...) nets (unwired pins) out of the 'other "
+                        "nets' rules (default false; an unwired pin of a low-voltage part sits "
+                        "near that part's potential and needs the full spacing)"
+                    ),
+                },
+                "boardPath": {"type": "string", "description": "Board .kicad_pcb"},
+                "dryRun": {"type": "boolean", "description": "Plan only, write nothing"},
+            },
+            "required": ["classes", "spacing"],
         },
     },
 ]
@@ -2954,22 +3088,29 @@ SCHEMATIC_TOOLS = [
                     "type": "string",
                     "description": "Path to .kicad_pcb file. If omitted, uses currently loaded board.",
                 },
-                "updateFootprints": {
-                    "type": "boolean",
-                    "description": (
-                        "Replace board footprints whose schematic Footprint field changed, "
-                        "keeping position, rotation, side and nets (default true)"
-                    ),
-                },
                 "dryRun": {
                     "type": "boolean",
-                    "description": "Report every change without modifying the board (default false)",
+                    "description": (
+                        "Report every change (pad nets, values, fields, footprints added) "
+                        "without saving. The sync overwrites board values and fields with the "
+                        "schematic's, so preview first on a board edited after its last sync."
+                    ),
                 },
-                "removeExtra": {
+                "replaceFootprints": {
                     "type": "boolean",
                     "description": (
-                        "Remove footprints whose reference is no longer in the schematic "
-                        "(default false: only reported)"
+                        "Swap footprints whose library ID differs from the symbol's footprint, keeping "
+                        "position, rotation, side and symbol link."
+                    ),
+                },
+                "deleteUnusedFootprints": {
+                    "type": "boolean",
+                    "description": (
+                        "Delete footprints with no symbol in the schematic; board-only and "
+                        "locked footprints are kept, and a footprint whose symbol UUID matches "
+                        "a schematic symbol is renamed to it (re-annotation), never deleted. "
+                        "Refused, like replaceFootprints, while the board is open in KiCad "
+                        "(session pinned to IPC) unless dryRun."
                     ),
                 },
             },
@@ -3157,6 +3298,25 @@ SCHEMATIC_TOOLS = [
         },
     },
     {
+        "name": "check_schematic_legibility",
+        "title": "Check Schematic Legibility",
+        "description": "Checks whether a person can read a schematic sheet: what ERC and a netlist cannot see. Boxes every symbol body, visible reference/value, label and free text and reports text over text (a symbol's own fields included), text over another symbol's body, a symbol's own field across a drawn line of its body (inside an IC's rectangle or beside a capacitor's plates is fine), body over body, a wire through a text (a label's own wire only touches its edge), items on the title block or outside the frame, and upside-down text. Each problem comes with its box in sheet mm; look at it with get_schematic_view_region.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch sheet to check (one sheet; check each sub-sheet separately)",
+                },
+                "maxProblems": {
+                    "type": "integer",
+                    "description": "Most problems to list (default 200); counts always cover all",
+                },
+            },
+            "required": ["schematicPath"],
+        },
+    },
+    {
         "name": "get_elements_in_region",
         "title": "Get Elements in Region",
         "description": "Lists all symbols, wires, and labels within a rectangular region of the schematic. Useful for understanding what is in a specific area before modifying it.",
@@ -3190,7 +3350,15 @@ SCHEMATIC_TOOLS = [
     {
         "name": "find_wires_crossing_symbols",
         "title": "Find Wires Crossing Symbols",
-        "description": "Find all wires that cross over component symbol bodies. Wires passing over symbols are unacceptable in schematics — they indicate routing mistakes where a wire was drawn across a component instead of around it.",
+        "description": (
+            "Find all wires that cross over component symbol bodies. Wires passing over symbols are "
+            "unacceptable in schematics — they indicate routing mistakes where a wire was drawn across "
+            "a component instead of around it. "
+            "Also lists, under pinsOnWireInterior (with pinsOnWireInteriorCount), every symbol pin, "
+            "power pins included, that lies on the middle of a wire without being connected to it: "
+            "KiCad joins a pin to a wire only where the wire ends or where a junction sits on the pin, "
+            "so a label there does not connect it to the wire. collisions and count are unchanged."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3198,6 +3366,120 @@ SCHEMATIC_TOOLS = [
                     "type": "string",
                     "description": "Path to the .kicad_sch schematic file",
                 }
+            },
+            "required": ["schematicPath"],
+        },
+    },
+    {
+        "name": "list_schematic_rectangles",
+        "title": "List Schematic Rectangles",
+        "description": (
+            "List the rectangles drawn on a schematic sheet: uuid, start and end corners "
+            "in mm, stroke and fill, plus radius and locked when KiCad wrote them. "
+            "Rectangles inside symbol bodies are not included."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file",
+                }
+            },
+            "required": ["schematicPath"],
+        },
+    },
+    {
+        "name": "set_schematic_rectangle",
+        "title": "Create, Edit or Delete a Schematic Rectangle",
+        "description": (
+            "Without uuid, create a rectangle from start and end and return its uuid. "
+            "With uuid, change only the fields given. With uuid and delete: true, remove it. "
+            "An unknown uuid is an error. A corner radius is never written (KiCad 9 "
+            "cannot load one); an existing radius is kept."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file",
+                },
+                "uuid": {
+                    "type": "string",
+                    "description": "Rectangle to change or delete; leave out to create one",
+                },
+                "start": {
+                    "description": 'First corner in mm, as [x, y] or {"x": .., "y": ..}',
+                    "oneOf": [
+                        {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "minItems": 2,
+                            "maxItems": 2,
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                            "required": ["x", "y"],
+                        },
+                    ],
+                },
+                "end": {
+                    "description": 'Opposite corner in mm, as [x, y] or {"x": .., "y": ..}',
+                    "oneOf": [
+                        {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "minItems": 2,
+                            "maxItems": 2,
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                            "required": ["x", "y"],
+                        },
+                    ],
+                },
+                "stroke": {
+                    "type": "object",
+                    "description": "Outline style; a partial stroke keeps the rest",
+                    "properties": {
+                        "width": {"type": "number", "minimum": 0},
+                        "type": {
+                            "type": "string",
+                            "enum": ["default", "solid", "dash", "dot", "dash_dot", "dash_dot_dot"],
+                        },
+                        "color": {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "minItems": 4,
+                            "maxItems": 4,
+                            "description": "[r, g, b, a]: r, g, b from 0 to 255, a from 0 to 1",
+                        },
+                    },
+                },
+                "fill": {
+                    "type": "object",
+                    "description": "Fill style; type color needs color",
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": ["none", "outline", "background", "color"],
+                        },
+                        "color": {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "minItems": 4,
+                            "maxItems": 4,
+                            "description": "[r, g, b, a]: r, g, b from 0 to 255, a from 0 to 1",
+                        },
+                    },
+                },
+                "delete": {
+                    "type": "boolean",
+                    "description": "With uuid: remove the rectangle",
+                },
             },
             "required": ["schematicPath"],
         },

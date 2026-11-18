@@ -5,6 +5,7 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { reportsAppliedWork } from "./failure-as-error.js";
 
 export function registerSchematicBatchTools(server: McpServer, callKicadScript: Function) {
   // Add many components at once
@@ -45,7 +46,7 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
     async (args: any) => {
       const r = await callKicadScript("batch_add_components", args);
       if (r.success === false && r.message)
-        return { content: [{ type: "text", text: `Failed: ${r.message}` }] };
+        return { content: [{ type: "text", text: `Failed: ${r.message}` }], isError: true };
       const lines = [`Added ${r.added_count} component(s), ${r.error_count} error(s).`];
       for (const e of r.errors || []) lines.push(`  ✗ ${e.reference} (${e.symbol}): ${e.error}`);
       return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -65,7 +66,7 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
     async (args: any) => {
       const r = await callKicadScript("batch_edit_schematic_components", args);
       if (r.success === false && r.message)
-        return { content: [{ type: "text", text: `Failed: ${r.message}` }] };
+        return { content: [{ type: "text", text: `Failed: ${r.message}` }], isError: true };
       const lines = [`Updated ${r.updated_count}, ${r.error_count} error(s).`];
       for (const e of r.errors || []) lines.push(`  ✗ ${e.reference}: ${e.error}`);
       return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -202,8 +203,10 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
     },
     async (args: any) => {
       const r = await callKicadScript("batch_add_no_connects", args);
-      if (r.success === false && r.message)
-        return { content: [{ type: "text", text: `Failed: ${r.message}` }] };
+      // A partial batch answers success=false with the pins it did write in `placed`: that is not
+      // an error, or an agent retries and writes those pins a second time.
+      if (r.success === false && r.message && !reportsAppliedWork(r))
+        return { content: [{ type: "text", text: `Failed: ${r.message}` }], isError: true };
       const lines = [r.message];
       for (const f of r.failed || []) lines.push(`  ✗ ${f.componentRef}/${f.pinName}: ${f.reason}`);
       return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -213,7 +216,7 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
   // Net labels on many pins
   server.tool(
     "batch_connect",
-    "Place net labels on multiple pins in one call to wire nets quickly. 'connections' is a map {reference: {pin: netName}} where pin is a number or name. labelType selects 'label' (sheet-local, the default) or 'global_label' (connects across all sheets by name — use this for power rails and any net that spans sheets). For local labels, if a facing label for the same net is nearby an orthogonal wire (straight, or a Z with a grid-snapped jog — never diagonal) is drawn instead of a duplicate label; when that wire would land on or cross another object a plain label is placed instead. Global labels are placed one-per-pin since they join their net by name. On two-pin parts a label whose text would overlap a visible Reference/Value field is moved 2.54 or 5.08 mm out along the pin with a stub wire (avoidFieldOverlap, default true). scope='auto' picks global_label per net when the name is already used on another sheet of the hierarchy, else a local label (each placed row then reports labelType). Set replace=true to remove every existing label (local, global, hierarchical) on each pin first, plus a wire run from the pin that ends at a label of another net (e.g. an earlier auto-wire to another pin's label) when nothing else hangs off it. Coordinates are schematic mm, origin top-left, Y down. Returns {success, message, placed:[{ref, pin, net, position:{x,y}, label_position?, wire?, note?, replaced?}], failed:[{ref, pin, reason}], warnings?}. Warns only about nets touched by this call that hold a power_in pin and no power_out pin (PWR_FLAG or regulator output) anywhere in the sheet hierarchy.",
+    "Place net labels on multiple pins in one call to wire nets quickly. 'connections' is a map {reference: {pin: netName}} where pin is a number or name. labelType selects 'label' (sheet-local, the default) or 'global_label' (connects across all sheets by name — use this for power rails and any net that spans sheets). For local labels, if a label for the same net lies straight out in front of the pin, on the pin's axis, a straight wire is drawn to it instead of a duplicate label (never diagonal); when that wire would land on or cross another object a plain label is placed instead. stubLength draws a wire that long out of each pin and puts the label at its end. All labels and wires are written in one pass, so a batch never stops half-written. Global labels are placed one-per-pin since they join their net by name. On two-pin parts a label whose text would overlap a visible Reference/Value field is moved 2.54 or 5.08 mm out along the pin with a stub wire (avoidFieldOverlap, default true; an explicit stubLength wins). scope='auto' picks global_label per net when the name is already used on another sheet of the hierarchy, else a local label (each placed row then reports labelType). Set replace=true to remove every existing label (local, global, hierarchical) on each pin first, an earlier run's stub wire and the label at its end, plus a wire run from the pin that ends at a label of another net (e.g. an earlier auto-wire to another pin's label) when nothing else hangs off it; removals happen in the same write as the new labels. Coordinates are schematic mm, origin top-left, Y down. Returns {success, message, placed:[{ref, pin, net, position:{x,y}, label_position?, wire?, note?, replaced?}], failed:[{ref, pin, reason}], warnings?}. Warns only about nets touched by this call that hold a power_in pin and no power_out pin (PWR_FLAG or regulator output) anywhere in the sheet hierarchy.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       connections: z
@@ -244,13 +247,21 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
         .optional()
         .default(true)
         .describe(
-          "On two-pin parts, move a label out along the pin (with a stub wire) when its text would overlap a visible Reference/Value field (default true)",
+          "On two-pin parts, move a label out along the pin (with a stub wire) when its text would overlap a visible Reference/Value field (default true). Not applied when stubLength is given.",
+        ),
+      stubLength: z
+        .number()
+        .optional()
+        .describe(
+          "Draw a wire this long (mm) out of each pin and put the label at its end, so the label doesn't sit on the pin number and name. 2.54 is typical; default 0 (label on the pin).",
         ),
     },
     async (args: any) => {
       const r = await callKicadScript("batch_connect", args);
-      if (r.success === false && r.message)
-        return { content: [{ type: "text", text: `Failed: ${r.message}` }] };
+      // A partial batch answers success=false with the pins it did write in `placed`: that is not
+      // an error, or an agent retries and writes those pins a second time.
+      if (r.success === false && r.message && !reportsAppliedWork(r))
+        return { content: [{ type: "text", text: `Failed: ${r.message}` }], isError: true };
       const lines = [r.message];
       for (const f of r.failed || []) lines.push(`  ✗ ${f.ref}/${f.pin}: ${f.reason}`);
       for (const w of r.warnings || []) lines.push(`  ⚠ ${w}`);
@@ -293,13 +304,17 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
         .describe(
           "Label scope, overrides labelType: 'local' = label, 'global' = global_label, 'auto' = per net, a global label when the net name is already used on another sheet of the hierarchy (or as a global label on this sheet), else a local label. Omit to use labelType.",
         ),
+      stubLength: z
+        .number()
+        .optional()
+        .describe("Wire stub (mm) between each pin and its label, as in batch_connect (default 0)"),
       origin_x: z.number().optional(),
       origin_y: z.number().optional(),
     },
     async (args: any) => {
       const r = await callKicadScript("batch_add_and_connect", args);
       if (r.success === false && r.message)
-        return { content: [{ type: "text", text: `Failed: ${r.message}` }] };
+        return { content: [{ type: "text", text: `Failed: ${r.message}` }], isError: true };
       const lines = [r.message];
       for (const e of r.errors || []) lines.push(`  ✗ add ${e.reference}: ${e.error}`);
       for (const f of r.failed_connections || [])

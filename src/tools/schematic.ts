@@ -120,6 +120,7 @@ export function registerSchematicTools(server: McpServer, callKicadScript: Funct
               text: `Failed to add component: ${result.message || JSON.stringify(result)}`,
             },
           ],
+          isError: true,
         };
       }
     },
@@ -210,6 +211,7 @@ To remove a footprint from a PCB, use delete_component instead.`,
             text: `Failed to remove component: ${result.message || "Unknown error"}`,
           },
         ],
+        isError: true,
       };
     },
   );
@@ -377,6 +379,7 @@ use edit_component instead.`,
             text: `Failed to edit component: ${result.message || "Unknown error"}`,
           },
         ],
+        isError: true,
       };
     },
   );
@@ -468,6 +471,7 @@ with the \`properties\` parameter instead.`,
             text: `Failed to set property '${args.name}' on ${args.reference}: ${result.message || "Unknown error"}`,
           },
         ],
+        isError: true,
       };
     },
   );
@@ -517,6 +521,7 @@ edit_schematic_component and set its value to an empty string.`,
             text: `Failed to remove property '${args.name}' from ${args.reference}: ${result.message || "Unknown error"}`,
           },
         ],
+        isError: true,
       };
     },
   );
@@ -560,6 +565,7 @@ edit_schematic_component and set its value to an empty string.`,
             text: `Failed to get component: ${result.message || "Unknown error"}`,
           },
         ],
+        isError: true,
       };
     },
   );
@@ -604,6 +610,7 @@ edit_schematic_component and set its value to an empty string.`,
               text: `Failed to add wire: ${result.message || "Unknown error"}`,
             },
           ],
+          isError: true,
         };
       }
     },
@@ -623,11 +630,10 @@ edit_schematic_component and set its value to an empty string.`,
       schematicPath: z.string().describe("Path to the schematic file"),
       netName: z.string().describe("Name of the net (e.g., VCC, GND, SIGNAL_1)"),
       position: z
-        .array(z.number())
-        .length(2)
+        .union([z.array(z.number()).length(2), z.object({ x: z.number(), y: z.number() })])
         .optional()
         .describe(
-          "Position [x, y] for the label. Required when componentRef/pinNumber are not given.",
+          "Position for the label in mm, as [x, y] or {x, y}. Required when componentRef/pinNumber are not given.",
         ),
       componentRef: z
         .string()
@@ -655,7 +661,7 @@ edit_schematic_component and set its value to an empty string.`,
     async (args: {
       schematicPath: string;
       netName: string;
-      position?: number[];
+      position?: number[] | { x: number; y: number };
       componentRef?: string;
       pinNumber?: string | number;
       labelType?: string;
@@ -679,6 +685,7 @@ edit_schematic_component and set its value to an empty string.`,
               text: `Failed to add net label: ${result.message || "Unknown error"}`,
             },
           ],
+          isError: true,
         };
       }
     },
@@ -726,6 +733,7 @@ edit_schematic_component and set its value to an empty string.`,
               text: `Failed to add no-connect: ${result.message || "Unknown error"}`,
             },
           ],
+          isError: true,
         };
       }
     },
@@ -777,6 +785,7 @@ edit_schematic_component and set its value to an empty string.`,
               text: `Failed to connect to net: ${result.message || "Unknown error"}`,
             },
           ],
+          isError: true,
         };
       }
     },
@@ -812,6 +821,7 @@ edit_schematic_component and set its value to an empty string.`,
               text: `Failed to get net connections: ${result.message || "Unknown error"}`,
             },
           ],
+          isError: true,
         };
       }
     },
@@ -875,6 +885,7 @@ edit_schematic_component and set its value to an empty string.`,
               text: `Failed to get wire connections: ${result.message || "Unknown error"}`,
             },
           ],
+          isError: true,
         };
       }
     },
@@ -911,6 +922,7 @@ edit_schematic_component and set its value to an empty string.`,
               text: `Failed to get pin locations: ${result.message || "Unknown error"}`,
             },
           ],
+          isError: true,
         };
       }
     },
@@ -1385,14 +1397,16 @@ edit_schematic_component and set its value to an empty string.`,
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       netName: z.string().describe("Name of the net label to remove"),
       position: z
-        .object({ x: z.number(), y: z.number() })
+        .union([z.array(z.number()).length(2), z.object({ x: z.number(), y: z.number() })])
         .optional()
-        .describe("Position to disambiguate if multiple labels with same name"),
+        .describe(
+          "Position in mm, as [x, y] or {x, y}, to disambiguate if multiple labels share the name",
+        ),
     },
     async (args: {
       schematicPath: string;
       netName: string;
-      position?: { x: number; y: number };
+      position?: number[] | { x: number; y: number };
     }) => {
       const result = await callKicadScript("delete_schematic_net_label", args);
       if (result.success) {
@@ -1653,6 +1667,7 @@ edit_schematic_component and set its value to an empty string.`,
               text: `Failed to generate netlist: ${result.message || "Unknown error"}`,
             },
           ],
+          isError: true,
         };
       }
     },
@@ -1662,43 +1677,61 @@ edit_schematic_component and set its value to an empty string.`,
   server.tool(
     "sync_schematic_to_board",
     "Import the schematic netlist into the PCB board — equivalent to pressing F8 in KiCAD (Tools → Update PCB from Schematic). MUST be called after the schematic is complete and before placing or routing components on the PCB. Without this step, the board has no footprints and no net assignments — place_component and route_pad_to_pad will produce an empty, unroutable board. " +
-      "Works from kicad-cli's XML netlist: adds missing footprints (at the origin), swaps footprints whose " +
-      "schematic Footprint field changed (updateFootprints), re-nets every numbered pad (a pad its symbol " +
-      "has no pin for is disconnected, as in F8; generated 'unconnected-(...)' names escape '/' as {slash}), " +
-      "and syncs Value, Datasheet, Description and custom fields (e.g. LCSC), DNP, exclude-from-BOM and " +
-      "the schematic link. Footprints whose symbol is gone are always reported (footprints_without_symbol) " +
-      "and removed only with removeExtra=true; board-only footprints are never touched. dryRun=true " +
-      "returns the same report without changing or saving the board. Returns {success, dryRun, message, " +
-      "footprints_added, footprints_replaced, footprints_mismatched, footprints_removed, " +
-      "footprints_without_symbol, field_updates:[{reference, changes:[{what, from, to}]}], nets_added, " +
-      "pad_net_changes:[{pad, from, to}], pads_cleared, unmatched_pads, warnings}.",
+      "Nets come from kicad-cli's netlist (netSource), with the built-in sheet walker as a fallback. " +
+      "Adds missing footprints, renames footprints whose symbol was re-annotated (matched by symbol " +
+      "path), carries values, fields, DNP and exclude-from-BOM to the board (new fields hidden on Fab), " +
+      "and re-nets every pad; a pad its symbol has no pin for is cleared, as in F8. Footprints whose " +
+      "library ID differs are listed in footprint_changes_pending and swapped only with " +
+      "replaceFootprints; parts with no symbol are deleted only with deleteUnusedFootprints. " +
+      "dryRun=true previews against the board file on disk and writes nothing. Returns {success, " +
+      "dryRun, message, netSource, pads_changed, pads_changed_count, footprints_added, " +
+      "footprints_renamed, footprints_updated, footprint_changes_pending, footprints_replaced, " +
+      "footprints_deleted, pads_cleared, nets_added, unmatched_pads, warnings}.",
     {
       schematicPath: z.string().describe("Absolute path to the .kicad_sch schematic file"),
       boardPath: z.string().describe("Absolute path to the .kicad_pcb board file"),
-      updateFootprints: z
-        .boolean()
-        .optional()
-        .describe(
-          "Replace board footprints whose schematic Footprint field changed, keeping position, " +
-            "rotation, side and nets (default true). false only reports them in footprints_mismatched.",
-        ),
       dryRun: z
         .boolean()
         .optional()
-        .describe("Report every change without modifying or saving the board (default false)"),
+        .describe(
+          "Report every change (pad nets, values, fields, footprints added) without saving. " +
+            "The sync overwrites board values and fields with the schematic's, so preview first " +
+            "on a board that was edited after its last sync.",
+        ),
+      replaceFootprints: z
+        .boolean()
+        .optional()
+        .describe(
+          "Swap footprints whose library ID differs from the symbol's footprint, keeping position, " +
+            "rotation, side and symbol link (KiCad F8: 'Replace footprints with those specified by symbols').",
+        ),
+      deleteUnusedFootprints: z
+        .boolean()
+        .optional()
+        .describe(
+          "Delete footprints with no symbol in the schematic; board-only and locked footprints are kept, " +
+            "and a footprint whose symbol UUID matches a schematic symbol is renamed to it (re-annotation), " +
+            "never deleted (KiCad F8: 'Delete footprints with no symbols'). Refused, like replaceFootprints, " +
+            "while the board is open in KiCad (session pinned to IPC) unless dryRun.",
+        ),
+      updateFootprints: z
+        .boolean()
+        .optional()
+        .describe("Deprecated alias of replaceFootprints (used when replaceFootprints is omitted)"),
       removeExtra: z
         .boolean()
         .optional()
         .describe(
-          "Remove footprints whose reference is no longer in the schematic (default false: they " +
-            "are only reported in footprints_without_symbol). Board-only footprints are kept.",
+          "Deprecated alias of deleteUnusedFootprints (used when deleteUnusedFootprints is omitted)",
         ),
     },
     async (args: {
       schematicPath: string;
       boardPath: string;
-      updateFootprints?: boolean;
       dryRun?: boolean;
+      replaceFootprints?: boolean;
+      deleteUnusedFootprints?: boolean;
+      updateFootprints?: boolean;
       removeExtra?: boolean;
     }) => {
       const result = await callKicadScript("sync_schematic_to_board", args);
@@ -1822,6 +1855,37 @@ edit_schematic_component and set its value to an empty string.`,
     },
   );
 
+  // Legibility: what a reader trips over
+  server.tool(
+    "check_schematic_legibility",
+    "Checks whether a person can read a schematic sheet: what ERC and a netlist cannot see. Boxes every symbol body, visible reference/value, label and free text and reports text over text (a symbol's own fields included), text over another symbol's body, a symbol's own field across a drawn line of its body (inside an IC's rectangle or beside a capacitor's plates is fine), body over body, a wire through a text (a label's own wire only touches its edge), items on the title block or outside the frame, and a field stored upside down. Each problem comes with its box in sheet mm; look at it with get_schematic_view_region.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch sheet to check (one sheet)"),
+      maxProblems: z
+        .number()
+        .optional()
+        .describe("Most problems to list (default 200); counts always cover all"),
+    },
+    async (args: { schematicPath: string; maxProblems?: number }) => {
+      const result = await callKicadScript("check_schematic_legibility", args);
+      if (result.success) {
+        const counts = Object.entries(result.counts || {})
+          .map(([k, v]) => `${k}: ${v}`)
+          .join(", ");
+        const lines = [`${result.total} legibility problem(s)${counts ? ` (${counts})` : ""}`];
+        (result.problems || []).forEach((p: any) => {
+          const b = p.box;
+          lines.push(`  ${p.kind.padEnd(19)} ${p.items}  @(${b.x0},${b.y0})-(${b.x1},${b.y1})`);
+        });
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+      return {
+        content: [{ type: "text", text: `Failed: ${result.message || "Unknown error"}` }],
+        isError: true,
+      };
+    },
+  );
+
   // Find overlapping elements
   server.tool(
     "find_overlapping_elements",
@@ -1926,7 +1990,10 @@ edit_schematic_component and set its value to an empty string.`,
   // Find wires crossing symbols
   server.tool(
     "find_wires_crossing_symbols",
-    "Find all wires that cross over component symbol bodies. Wires passing over symbols are unacceptable in schematics — they indicate routing mistakes where a wire was drawn across a component instead of around it.",
+    "Find all wires that cross over component symbol bodies. Wires passing over symbols are unacceptable in schematics — they indicate routing mistakes where a wire was drawn across a component instead of around it. " +
+      "Also lists, under pinsOnWireInterior (with pinsOnWireInteriorCount), every symbol pin, power pins included, that lies on the middle of a wire without being connected to it: " +
+      "KiCad joins a pin to a wire only where the wire ends or where a junction sits on the pin, so a label there does not connect it to the wire. " +
+      "collisions and count are unchanged.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch schematic file"),
     },
@@ -1941,6 +2008,14 @@ edit_schematic_component and set its value to an empty string.`,
           );
         });
         if (collisions.length > 30) lines.push(`  ... and ${collisions.length - 30} more`);
+        const pinsOnWire: any[] = result.pinsOnWireInterior || [];
+        lines.push(`Found ${pinsOnWire.length} pin(s) on a wire's interior, not connected to it:`);
+        pinsOnWire.slice(0, 30).forEach((p: any, i: number) => {
+          lines.push(
+            `  ${i + 1}. ${p.component.reference} pin ${p.pin} at (${p.pinPosition.x},${p.pinPosition.y}) lies on wire (${p.wire.start.x},${p.wire.start.y})→(${p.wire.end.x},${p.wire.end.y})`,
+          );
+        });
+        if (pinsOnWire.length > 30) lines.push(`  ... and ${pinsOnWire.length - 30} more`);
         return { content: [{ type: "text", text: lines.join("\n") }] };
       }
       return {
@@ -2130,6 +2205,7 @@ edit_schematic_component and set its value to an empty string.`,
               text: `Failed to get net at point: ${result.message || "Unknown error"}`,
             },
           ],
+          isError: true,
         };
       }
     },
@@ -2145,7 +2221,9 @@ edit_schematic_component and set its value to an empty string.`,
     {
       schematicPath: z.string().describe("Path to the sub-sheet .kicad_sch file"),
       text: z.string().describe("Label text (e.g. 'SD_CLK') — must match the sheet pin name"),
-      position: z.array(z.number()).length(2).describe("Position [x, y] in mm"),
+      position: z
+        .union([z.array(z.number()).length(2), z.object({ x: z.number(), y: z.number() })])
+        .describe("Position in mm, as [x, y] or {x, y}"),
       shape: z
         .enum(["input", "output", "bidirectional"])
         .describe("Signal direction from the sub-sheet's perspective"),
@@ -2157,7 +2235,7 @@ edit_schematic_component and set its value to an empty string.`,
     async (args: {
       schematicPath: string;
       text: string;
-      position: number[];
+      position: number[] | { x: number; y: number };
       shape: "input" | "output" | "bidirectional";
       orientation?: number;
     }) => {
@@ -2179,6 +2257,7 @@ edit_schematic_component and set its value to an empty string.`,
             text: `Failed to add hierarchical label: ${result.message || "Unknown error"}`,
           },
         ],
+        isError: true,
       };
     },
   );
@@ -2246,9 +2325,8 @@ edit_schematic_component and set its value to an empty string.`,
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       text: z.string().describe("Text content to display"),
       position: z
-        .array(z.number())
-        .length(2)
-        .describe("Position [x, y] in schematic mm coordinates"),
+        .union([z.array(z.number()).length(2), z.object({ x: z.number(), y: z.number() })])
+        .describe("Position in schematic mm coordinates, as [x, y] or {x, y}"),
       angle: z.number().optional().describe("Rotation angle in degrees (default: 0)"),
       fontSize: z.number().optional().describe("Font size in mm (default: 1.27)"),
       bold: z.boolean().optional().describe("Bold text (default: false)"),
@@ -2261,7 +2339,7 @@ edit_schematic_component and set its value to an empty string.`,
     async (args: {
       schematicPath: string;
       text: string;
-      position: number[];
+      position: number[] | { x: number; y: number };
       angle?: number;
       fontSize?: number;
       bold?: boolean;
@@ -2286,8 +2364,146 @@ edit_schematic_component and set its value to an empty string.`,
               text: `Failed to add text annotation: ${result.message || "Unknown error"}`,
             },
           ],
+          isError: true,
         };
       }
+    },
+  );
+
+  // Schematic rectangles (graphic boxes drawn on the sheet, #525)
+  const point = z.union([
+    z.array(z.number()).length(2),
+    z.object({ x: z.number(), y: z.number() }),
+  ]);
+  const rgba = z
+    .array(z.number())
+    .length(4)
+    .describe("[r, g, b, a]: r, g, b from 0 to 255 and a (opacity) from 0 to 1");
+
+  server.tool(
+    "list_schematic_rectangles",
+    "List the rectangles drawn on a schematic sheet (graphic boxes, such as a titled box " +
+      "around a group of parts). Returns each one's uuid, start and end corners in mm, " +
+      "stroke and fill, plus the corner radius and locked flag when KiCad wrote them. " +
+      "Rectangles inside symbol bodies are not included. Use the uuid with " +
+      "set_schematic_rectangle to move, resize, restyle or delete one.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+    },
+    async (args: { schematicPath: string }) => {
+      const result = await callKicadScript("list_schematic_rectangles", args);
+      if (result.success) {
+        const rects = result.rectangles || [];
+        if (rects.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: "No rectangles found on this sheet." }],
+          };
+        }
+        const lines = rects.map(
+          (r: any) =>
+            `  ${r.uuid}: (${r.start.x}, ${r.start.y}) to (${r.end.x}, ${r.end.y})` +
+            ` stroke=${r.stroke.type}/${r.stroke.width}mm fill=${r.fill.type}` +
+            (r.radius ? ` radius=${r.radius}` : "") +
+            (r.locked ? " locked" : ""),
+        );
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Rectangles (${rects.length}):\n${lines.join("\n")}\n\n${JSON.stringify(rects, null, 2)}`,
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Failed to list rectangles: ${result.message || "Unknown error"}`,
+          },
+        ],
+        isError: true,
+      };
+    },
+  );
+
+  server.tool(
+    "set_schematic_rectangle",
+    "Create, change or delete a rectangle drawn on a schematic sheet. " +
+      "Without uuid it creates one from start and end (corners in mm) and returns its uuid. " +
+      "With uuid it changes only the fields given (start, end, stroke, fill); a stroke or fill " +
+      "given in part keeps the rest. With uuid and delete: true it removes the rectangle. " +
+      "An unknown uuid is an error that lists the rectangles on the sheet " +
+      "(see list_schematic_rectangles). A corner radius is not written, because KiCad 9 " +
+      "cannot load one; an existing radius is kept when a rectangle is edited.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      uuid: z
+        .string()
+        .optional()
+        .describe("Rectangle to change or delete; leave out to create a new one"),
+      start: point.optional().describe("First corner in mm, as [x, y] or {x, y}"),
+      end: point.optional().describe("Opposite corner in mm, as [x, y] or {x, y}"),
+      stroke: z
+        .object({
+          width: z
+            .number()
+            .min(0)
+            .optional()
+            .describe("Line width in mm; 0 (default) is KiCad's default width"),
+          type: z
+            .enum(["default", "solid", "dash", "dot", "dash_dot", "dash_dot_dot"])
+            .optional()
+            .describe("Line style (default: default)"),
+          color: rgba.optional(),
+        })
+        .optional()
+        .describe("Outline style"),
+      fill: z
+        .object({
+          type: z
+            .enum(["none", "outline", "background", "color"])
+            .optional()
+            .describe("none (default), outline, background, or color (needs fill.color)"),
+          color: rgba.optional(),
+        })
+        .optional()
+        .describe("Fill style"),
+      delete: z
+        .boolean()
+        .optional()
+        .describe("With uuid: remove the rectangle (no other fields allowed)"),
+    },
+    async (args: {
+      schematicPath: string;
+      uuid?: string;
+      start?: number[] | { x: number; y: number };
+      end?: number[] | { x: number; y: number };
+      stroke?: { width?: number; type?: string; color?: number[] };
+      fill?: { type?: string; color?: number[] };
+      delete?: boolean;
+    }) => {
+      const result = await callKicadScript("set_schematic_rectangle", args);
+      if (result.success) {
+        const detail = result.rectangle ? `\n${JSON.stringify(result.rectangle, null, 2)}` : "";
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `${result.message || "Rectangle updated"} (uuid ${result.uuid})${detail}`,
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Failed to set rectangle: ${result.message || "Unknown error"}`,
+          },
+        ],
+        isError: true,
+      };
     },
   );
 
@@ -2307,9 +2523,8 @@ edit_schematic_component and set its value to an empty string.`,
         .enum(["input", "output", "bidirectional"])
         .describe("Signal direction (should match the sub-sheet hierarchical label shape)"),
       position: z
-        .array(z.number())
-        .length(2)
-        .describe("Pin position [x, y] in mm — must be on the sheet block boundary"),
+        .union([z.array(z.number()).length(2), z.object({ x: z.number(), y: z.number() })])
+        .describe("Pin position in mm, as [x, y] or {x, y} — must be on the sheet block boundary"),
       orientation: z
         .number()
         .optional()
@@ -2320,7 +2535,7 @@ edit_schematic_component and set its value to an empty string.`,
       sheetName: string;
       pinName: string;
       pinType: "input" | "output" | "bidirectional";
-      position: number[];
+      position: number[] | { x: number; y: number };
       orientation?: number;
     }) => {
       const result = await callKicadScript("add_sheet_pin", args);
@@ -2342,6 +2557,7 @@ edit_schematic_component and set its value to an empty string.`,
             text: `Failed to add sheet pin: ${result.message || "Unknown error"}`,
           },
         ],
+        isError: true,
       };
     },
   );

@@ -29,7 +29,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const OUT = join(ROOT, "python", "schemas", "generated_tool_schemas.json");
 const check = process.argv.includes("--check");
 
-/** Names of tools whose server.tool() handler calls the Python backend. */
+/** Names of tools whose server.tool() handler calls the Python command of the same name. */
 function toolsThatCallPython() {
   const names = new Set();
   const dir = join(ROOT, "src", "tools");
@@ -38,7 +38,11 @@ function toolsThatCallPython() {
     const starts = [...src.matchAll(/server\.tool\(\s*"([^"]+)"\s*,/g)];
     starts.forEach((m, i) => {
       const end = i + 1 < starts.length ? starts[i + 1].index : src.length;
-      if (src.slice(m.index, end).includes("callKicadScript(")) names.add(m[1]);
+      // Only a tool that calls the Python command of its own name; a wrapper such as
+      // export_position_file (which runs export_pos) has no Python command to describe.
+      const body = src.slice(m.index, end);
+      const call = /callKicadScript\(\s*["'`]([A-Za-z0-9_]+)["'`]/g;
+      if ([...body.matchAll(call)].some((c) => c[1] === m[1])) names.add(m[1]);
     });
   }
   return names;

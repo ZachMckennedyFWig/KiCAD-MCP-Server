@@ -14,7 +14,8 @@
  * busy `TIMEOUT_GRACE_MS` after the timeout is treated as wedged and restarted.
  *
  * Environment overrides (all values in milliseconds):
- *   KICAD_MCP_COMMAND_TIMEOUT_MS  default for commands with no specific entry
+ *   KICAD_MCP_COMMAND_TIMEOUT_MS  floor for every command (slow machines, very large
+ *                                 designs); it never shortens a timeout
  *   KICAD_MCP_TOOL_TIMEOUTS       per-command overrides, "name=ms,name=ms"
  *                                 (wins over everything, including computed ones)
  *   KICAD_MCP_TIMEOUT_GRACE_MS    how long a timed-out command may keep running
@@ -236,7 +237,13 @@ export function computeCommandTimeout(
 ): number {
   const override = parseToolTimeoutOverrides(env.KICAD_MCP_TOOL_TIMEOUTS)[command];
   if (override !== undefined) return override;
+  // KICAD_MCP_COMMAND_TIMEOUT_MS raises the floor for every command, for slow
+  // machines or very large designs. It never shortens a timeout.
+  const floor = toPositiveNumber(env.KICAD_MCP_COMMAND_TIMEOUT_MS) ?? 0;
+  return Math.max(policyTimeout(command, params, env), floor);
+}
 
+function policyTimeout(command: string, params: unknown, env: Env): number {
   const p = (params ?? {}) as Record<string, unknown>;
 
   if (command === "autoroute") {
@@ -299,9 +306,12 @@ export function computeCommandTimeout(
   return defaultTimeout(env);
 }
 
-/** The default timeout, honouring `KICAD_MCP_COMMAND_TIMEOUT_MS`. */
+/** The default timeout, raised (never lowered) by `KICAD_MCP_COMMAND_TIMEOUT_MS`. */
 export function defaultTimeout(env: Env = process.env): number {
-  return toPositiveNumber(env.KICAD_MCP_COMMAND_TIMEOUT_MS) ?? DEFAULT_COMMAND_TIMEOUT_MS;
+  return Math.max(
+    DEFAULT_COMMAND_TIMEOUT_MS,
+    toPositiveNumber(env.KICAD_MCP_COMMAND_TIMEOUT_MS) ?? 0,
+  );
 }
 
 /** Grace period after a timeout before a still-busy worker is restarted. */

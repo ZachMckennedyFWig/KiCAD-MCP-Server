@@ -260,8 +260,9 @@ class TestBatchConnectLabels:
         assert {n for _k, n, *_ in _labels(root)} == {"OLD_GLOBAL", "NEW"}
 
     def test_facing_label_is_wired_orthogonally(self, tmp_path):
+        # U5/1 faces U1/2 on the same row: one straight wire joins them.
         body = fx.symbol("test:IC", "U1", "IC", 50.8, 50.8) + fx.symbol(
-            "test:IC", "U5", "IC", 71.12, 53.34
+            "test:IC", "U5", "IC", 71.12, 50.8
         )
         root = fx.write_project(tmp_path, "p", body)
         c = SchematicBatchCommands(types.SimpleNamespace())
@@ -274,8 +275,9 @@ class TestBatchConnectLabels:
         assert r["success"] is True
         wired = r["placed"][1]
         assert "wired to existing label" in wired["note"]
+        assert wired["wire"] == [{"x": 55.88, "y": 50.8}, {"x": 66.04, "y": 50.8}]
         wires = _wires(root)
-        assert len(wires) == 3
+        assert len(wires) == 1
         for (x1, y1), (x2, y2) in wires:
             assert abs(x1 - x2) < 1e-9 or abs(y1 - y2) < 1e-9, "diagonal wire drawn"
         # Only one label: the wire joins U1/2 to U5's label.
@@ -284,12 +286,31 @@ class TestBatchConnectLabels:
         netx = [n for n in nets.nets.values() if "NETX" in n["names"]][0]
         assert {(p["ref"], p["pin"]) for p in netx["pins"]} == {("U1", "2"), ("U5", "1")}
 
+    def test_offset_facing_label_gets_its_own_label(self, tmp_path):
+        # U5 one row down: the label is not on U1/2's axis, so it is not "facing"
+        # (upstream's straight-ahead rule). No Z or diagonal wire, two labels.
+        body = fx.symbol("test:IC", "U1", "IC", 50.8, 50.8) + fx.symbol(
+            "test:IC", "U5", "IC", 71.12, 53.34
+        )
+        root = fx.write_project(tmp_path, "p", body)
+        c = SchematicBatchCommands(types.SimpleNamespace())
+        r = c.batch_connect(
+            {
+                "schematicPath": str(root),
+                "connections": {"U5": {"1": "NETX"}, "U1": {"2": "NETX"}},
+            }
+        )
+        assert r["success"] is True
+        assert not any("wired to" in p.get("note", "") for p in r["placed"])
+        assert _wires(root) == []
+        assert [n for _k, n, *_ in _labels(root)] == ["NETX", "NETX"]
+
     def test_blocked_route_falls_back_to_a_label(self, tmp_path):
-        # R9 sits right where the Z route's vertical jog would run.
+        # R9's body sits across the straight run from U1/2 to U5/1's label.
         body = (
             fx.symbol("test:IC", "U1", "IC", 50.8, 50.8)
-            + fx.symbol("test:IC", "U5", "IC", 71.12, 55.88)
-            + fx.symbol("Device:R", "R9", "1k", 60.96, 53.34, hide_fields=True)
+            + fx.symbol("test:IC", "U5", "IC", 71.12, 50.8)
+            + fx.symbol("Device:R", "R9", "1k", 60.96, 50.8, hide_fields=True)
         )
         root = fx.write_project(tmp_path, "p", body)
         c = SchematicBatchCommands(types.SimpleNamespace())
@@ -326,6 +347,27 @@ class TestBatchConnectLabels:
         net = [n for n in nets.nets.values() if "A_LONG_NAME" in n["names"]][0]
         assert {(p["ref"], p["pin"]) for p in net["pins"]} == {("R1", "1")}
 
+    def test_stub_length_wins_over_the_field_offset(self, tmp_path):
+        # Same passive as above: with an explicit stub the label goes to the stub
+        # end (5.08 mm out), not to the field-avoiding 2.54 mm spot.
+        body = fx.symbol(
+            "Device:R", "R1", "10k", 127, 50.8, ref_at=(127, 45.72), val_at=(129.54, 50.8)
+        )
+        root = fx.write_project(tmp_path, "p", body)
+        c = SchematicBatchCommands(types.SimpleNamespace())
+        r = c.batch_connect(
+            {
+                "schematicPath": str(root),
+                "connections": {"R1": {"1": "A_LONG_NAME"}},
+                "stubLength": 5.08,
+            }
+        )
+        assert r["success"] is True, r
+        row = r["placed"][0]
+        assert row["label_position"] == {"x": 127.0, "y": 41.91}
+        assert "label moved" not in row.get("note", "")
+        assert [(round(a[1], 2), round(b[1], 2)) for a, b in _wires(root)] == [(46.99, 41.91)]
+
     def test_avoid_field_overlap_can_be_disabled(self, tmp_path):
         body = fx.symbol(
             "Device:R", "R1", "10k", 127, 50.8, ref_at=(127, 45.72), val_at=(129.54, 50.8)
@@ -346,7 +388,7 @@ class TestBatchConnectLabels:
     def _wired_pair(tmp_path):
         """U1/2 wired (by batch_connect's facing-label route) to U5/1's NETX label."""
         body = fx.symbol("test:IC", "U1", "IC", 50.8, 50.8) + fx.symbol(
-            "test:IC", "U5", "IC", 71.12, 53.34
+            "test:IC", "U5", "IC", 71.12, 50.8
         )
         root = fx.write_project(tmp_path, "p", body)
         c = SchematicBatchCommands(types.SimpleNamespace())

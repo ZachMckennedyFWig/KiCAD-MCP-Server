@@ -173,87 +173,9 @@ def test_tools_that_write_the_file_flag_it():
         "commands/hierarchical_place.py",
     ):
         assert "_boardFileWritten" in (root / rel).read_text(encoding="utf-8"), rel
+    # sync_schematic_to_board records its own write (upstream's mechanism).
     handlers = (root / "commands" / "schematic_handlers.py").read_text(encoding="utf-8")
-    assert "_adopt_board_file_write" in handlers
-
-
-# --------------------------------------------------------------------------- #
-# #5h / B1: footprint changes in the schematic
-# --------------------------------------------------------------------------- #
-
-
-def _sync_iface():
-    iface = KiCADInterface.__new__(KiCADInterface)
-    lm = MagicMock()
-    lm.libraries = {"Resistor_SMD": "/libs/Resistor_SMD.pretty"}
-    iface._get_project_library_manager = lambda project_dir: lm
-    return iface
-
-
-def _board_with(fps):
-    board = MagicMock()
-    board.GetFootprints.return_value = fps
-    return board
-
-
-def _fp(ref, lib_id):
-    fp = MagicMock(name=ref)
-    fp.GetReference.return_value = ref
-    fp.GetFPIDAsString.return_value = lib_id
-    return fp
-
-
-def test_changed_footprint_is_reported_when_updates_are_off(tmp_path):
-    iface = _sync_iface()
-    board = _board_with([_fp("L2", "Inductor_SMD:L_0603"), _fp("R1", "Resistor_SMD:R_0603")])
-    comps = [
-        {"reference": "L2", "footprint": "Inductor_SMD:L_1210"},
-        {"reference": "R1", "footprint": "Resistor_SMD:R_0603"},
-        {"reference": "#PWR01", "footprint": ""},
-    ]
-    out = iface._sync_changed_footprints(board, str(tmp_path / "x.kicad_sch"), comps, apply=False)
-    assert out["replaced"] == []
-    assert out["mismatched"] == [
-        {
-            "reference": "L2",
-            "boardFootprint": "Inductor_SMD:L_0603",
-            "schematicFootprint": "Inductor_SMD:L_1210",
-            "reason": "updateFootprints=false",
-        }
-    ]
-
-
-def test_changed_footprint_is_swapped(tmp_path):
-    iface = _sync_iface()
-    old = _fp("R1", "Resistor_SMD:R_0603")
-    board = _board_with([old])
-    new = MagicMock(name="new")
-    with (
-        patch("utils.footprint_swap.load_library_footprint", return_value=new) as load,
-        patch(
-            "utils.footprint_swap.swap_footprint",
-            return_value=(new, {"padNetsKept": 2}),
-        ) as swap,
-    ):
-        out = iface._sync_changed_footprints(
-            board,
-            str(tmp_path / "x.kicad_sch"),
-            [{"reference": "R1", "footprint": "Resistor_SMD:R_0805"}],
-        )
-    load.assert_called_once_with("/libs/Resistor_SMD.pretty", "R_0805")
-    swap.assert_called_once_with(board, old, new, "Resistor_SMD", "R_0805")
-    assert out["replaced"][0]["reference"] == "R1"
-    assert out["replaced"][0]["padNetsKept"] == 2
-
-
-def test_changed_footprint_from_unknown_library_is_reported(tmp_path):
-    iface = _sync_iface()
-    board = _board_with([_fp("U1", "A:B")])
-    out = iface._sync_changed_footprints(
-        board, str(tmp_path / "x.kicad_sch"), [{"reference": "U1", "footprint": "Nope:C"}]
-    )
-    assert out["replaced"] == []
-    assert "not in fp-lib-table" in out["mismatched"][0]["reason"]
+    assert "_record_board_signature" in handlers
 
 
 # --------------------------------------------------------------------------- #
@@ -384,9 +306,13 @@ def test_create_netclass_persists_nets_and_reports_matches(tmp_path):
     )
     assert result["success"] is True, result
     data = json.loads(pro.read_text())
-    assert {"netclass": "Power", "pattern": "/Power/+5V"} in data["net_settings"][
+    # Net names are written as literal patterns: KiCad reads a pattern as a
+    # regular expression, so the raw "+" would match "5" repeated.
+    assert {"netclass": "Power", "pattern": r"/Power/\+5V"} in data["net_settings"][
         "netclass_patterns"
     ]
+    assert data["net_settings"]["netclass_assignments"]["/Power/+5V"] == ["Power"]
+    assert "/Power/+5V" in result["netsAssigned"]
     by_pattern = {a["pattern"]: a for a in result["assignments"]}
     assert by_pattern["/Power/+5V"]["matchedNets"] == ["/Power/+5V"]
     assert by_pattern["+12V"]["matchCount"] == 0

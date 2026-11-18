@@ -156,13 +156,21 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
       priority: z
         .number()
         .int()
+        .min(0)
         .optional()
-        .describe("Zone priority; higher fills first (default 0)"),
+        .describe(
+          "Zone priority (default 0). Overlapping zones on one layer need distinct priorities; " +
+            "the higher one fills first.",
+        ),
       minWidth: z.number().optional().describe("Minimum copper width in mm (default 0.2)"),
+      fillType: z.enum(["solid", "hatched"]).optional().describe("Fill style (default solid)"),
       padConnection: z
         .enum(["thermal", "solid", "none", "thermal_tht"])
         .optional()
-        .describe("How pads connect to the pour"),
+        .describe(
+          "How pads of the zone's net connect: thermal reliefs (default), solid copper " +
+            "(for high-current pads), not at all, or thermal reliefs on through-hole pads only",
+        ),
       thermalGap: z.number().optional().describe("Thermal relief gap in mm"),
       thermalSpokeWidth: z.number().optional().describe("Thermal relief spoke width in mm"),
       islandRemoval: z.enum(["always", "never", "area"]).optional().describe("Island removal mode"),

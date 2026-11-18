@@ -103,6 +103,7 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set<string>([
   // Board inspection. run_drc and get_drc_violations write a JSON report next
   // to the board; get_board_2d_view can write a preview image there.
   "check_clearance",
+  "audit_via_nets",
   "check_courtyard_overlaps",
   "check_freerouting",
   // Background jobs and routing reports (never change the design)
@@ -148,6 +149,7 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set<string>([
   // expectation file under <project>/.kicad-mcp/, never the design.
   "assert_connectivity",
   "find_orphaned_wires",
+  "check_schematic_legibility",
   "find_overlapping_elements",
   "find_wires_crossing_symbols",
   "generate_netlist",
@@ -164,6 +166,7 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set<string>([
   "list_schematic_components",
   "list_schematic_labels",
   "list_schematic_nets",
+  "list_schematic_rectangles",
   "list_schematic_texts",
   "list_schematic_wires",
   "run_erc",
@@ -190,6 +193,7 @@ export const EXPORT_TOOLS: ReadonlySet<string> = new Set<string>([
   "export_pcb_svg",
   "export_pdf",
   "export_pos",
+  "export_position_file",
   "export_sch_bom",
   "export_sch_dxf",
   "export_sch_hpgl",
@@ -200,6 +204,7 @@ export const EXPORT_TOOLS: ReadonlySet<string> = new Set<string>([
   "export_schematic_pdf",
   "export_schematic_svg",
   "export_svg",
+  "export_vrml",
   // Gerber/drill/BOM/CPL into outputDir plus check reports; reads the design only.
   "fab_package",
 ]);

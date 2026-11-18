@@ -283,20 +283,15 @@ class DynamicSymbolLoader:
         return result
 
     def _global_sym_lib_table_paths(self) -> list:
-        """Candidate paths for the user-global sym-lib-table, newest version first."""
-        home = Path.home()
-        versions = ["10.0", "9.0", "8.0"]
-        bases = []
-        if os.name == "nt":
-            bases.append(home / "AppData" / "Roaming" / "kicad")
-        else:
-            bases.append(home / ".config" / "kicad")
-            bases.append(home / "Library" / "Preferences" / "kicad")  # macOS
-        candidates = []
-        for base in bases:
-            for v in versions:
-                candidates.append(base / v / "sym-lib-table")
-        return candidates
+        """The global sym-lib-table to search, as a list (empty when there is none).
+
+        Same discovery as ``SymbolLibraryManager``; see
+        ``library_tables.global_table_for_reading``.
+        """
+        from commands.library_tables import global_table_for_reading
+
+        table = global_table_for_reading("symbol")
+        return [table] if table is not None else []
 
     def _global_sym_lib_table(self) -> Optional[Path]:
         """The user-global sym-lib-table KiCad itself would read: the newest one present."""
@@ -820,16 +815,8 @@ class DynamicSymbolLoader:
     @staticmethod
     def _extract_paren_block(text: str, start: int) -> str:
         """Return the substring from text[start] up to and including the matching closing paren."""
-        depth, i = 0, start
-        while i < len(text):
-            if text[i] == "(":
-                depth += 1
-            elif text[i] == ")":
-                depth -= 1
-                if depth == 0:
-                    return text[start : i + 1]
-            i += 1
-        return text[start:]
+        end = match_paren(text, start)
+        return text[start : end + 1] if end != -1 else text[start:]
 
     def _extract_lib_property_positions(
         self,

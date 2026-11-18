@@ -89,6 +89,15 @@ def cmd_export(args: argparse.Namespace) -> Dict[str, Any]:
     ok = pcbnew.ExportSpecctraDSN(board, args.dsn)
     if not (ok is True or (type(ok) is int and ok == 0)) or not os.path.isfile(args.dsn):
         return {"ok": False, "error": f"ExportSpecctraDSN returned {ok} for {args.board}"}
+    # KiCad's exporter writes only a rule area's first outline; add the rest,
+    # as the in-process autoroute and export_dsn do.
+    keepouts_added = 0
+    try:
+        from commands.freerouting import _append_missing_keepouts
+
+        keepouts_added = _append_missing_keepouts(board, args.dsn)
+    except Exception as exc:  # never fail the export over the patch-up
+        warning = (warning + "; " if warning else "") + f"keepout outlines not appended: {exc}"
     ds = board.GetDesignSettings()
     nets = []
     netinfo = board.GetNetInfo()
@@ -99,6 +108,7 @@ def cmd_export(args: argparse.Namespace) -> Dict[str, Any]:
     tracks = list(board.GetTracks())
     info = {
         "ok": True,
+        "keepoutOutlinesAdded": keepouts_added,
         "copperEdgeClearanceMm": _mm(ds.m_CopperEdgeClearance),
         "ruleAreas": _rule_areas(board, pcbnew),
         "nets": nets,

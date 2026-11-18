@@ -3,7 +3,7 @@
 Added in: v2.1.0, expanded through v2.7.0
 Contributors: @Mehanik (PRs #60, #66), @Kletternaut (PR #57), @karu2003 (v2.7.0)
 
-`src/tools/schematic.ts` registers 46 schematic tools; another 19 live in
+`src/tools/schematic.ts` registers 48 schematic tools; another 19 live in
 `schematic-batch.ts`, `schematic-hierarchy.ts` and `schematic-layout.ts`. This
 document covers the ones that need more explanation than a one-line summary. For
 the full list, see the generated [Tool Inventory](TOOL_INVENTORY.md).
@@ -417,6 +417,57 @@ List all free-form text annotations in the schematic. Optionally filter by a sub
 | justify   | `"left"` \| `"center"` \| `"right"` |
 | uuid      | KiCad UUID of the element           |
 
+## Rectangles (2 tools)
+
+A rectangle drawn on the sheet, such as a titled box around the parts for one
+chip. Only rectangles at the top level of the sheet are read or changed; the
+rectangles inside symbol bodies (`lib_symbols`) are left alone.
+
+### list_schematic_rectangles
+
+| Parameter     | Type   | Required | Description                 |
+| ------------- | ------ | -------- | --------------------------- |
+| schematicPath | string | Yes      | Path to the .kicad_sch file |
+
+**Response fields (per rectangle):**
+
+| Field  | Description                                                          |
+| ------ | -------------------------------------------------------------------- |
+| uuid   | KiCad UUID; pass it to `set_schematic_rectangle`                     |
+| start  | `{"x": float, "y": float}` in mm                                     |
+| end    | `{"x": float, "y": float}` in mm (the opposite corner)               |
+| stroke | `{"width": mm, "type": ..., "color"?: [r, g, b, a]}`                 |
+| fill   | `{"type": "none" \| "outline" \| "background" \| "color", "color"?}` |
+| radius | Corner radius in mm, only when the file has one (KiCad 10)           |
+| locked | `true` / `false`, only when the file says                            |
+
+### set_schematic_rectangle
+
+One tool creates, edits and deletes:
+
+- no `uuid`: create a rectangle from `start` and `end`, and return its `uuid`;
+- `uuid`: change only the fields given. A partial `stroke` or `fill` keeps
+  the rest, and every other line of the file keeps its bytes;
+- `uuid` and `delete: true`: remove the rectangle.
+
+An unknown `uuid` is an error that lists the rectangles on the sheet. A corner
+radius is never written, because KiCad 9 cannot load a schematic that has one.
+An existing radius is kept when its rectangle is edited.
+
+| Parameter     | Type             | Required    | Description                                                          |
+| ------------- | ---------------- | ----------- | -------------------------------------------------------------------- |
+| schematicPath | string           | Yes         | Path to the .kicad_sch file                                          |
+| uuid          | string           | Edit/delete | The rectangle to change or delete                                    |
+| start         | [x, y] or {x, y} | Create      | First corner in mm                                                   |
+| end           | [x, y] or {x, y} | Create      | Opposite corner in mm                                                |
+| stroke        | object           | No          | `width` (mm, 0 = KiCad default), `type`, `color` [r, g, b, a]        |
+| fill          | object           | No          | `type` (`none`, `outline`, `background`, `color`), `color` [r,g,b,a] |
+| delete        | boolean          | No          | With `uuid`: remove the rectangle; no other fields allowed           |
+
+Stroke types are `default`, `solid`, `dash`, `dot`, `dash_dot` and
+`dash_dot_dot`. A color is `[r, g, b, a]` with r, g, b from 0 to 255 and a
+(opacity) from 0 to 1. A `color` fill needs `fill.color`.
+
 ## Schematic Creation and Export (6 tools)
 
 ### create_schematic
@@ -570,16 +621,28 @@ Runs the KiCAD Electrical Rules Check (ERC) on a schematic and returns all viola
 
 Import the schematic netlist into the PCB board — equivalent to pressing F8 in KiCAD (Tools → Update PCB from Schematic). MUST be called after the schematic is complete and before placing or routing components on the PCB. Without this step, the board has no footprints and no net assignments — place_component and route_pad_to_pad will produce an empty, unroutable board.
 
-| Parameter     | Type   | Required | Description                                    |
-| ------------- | ------ | -------- | ---------------------------------------------- |
-| schematicPath | string | Yes      | Absolute path to the .kicad_sch schematic file |
-| boardPath     | string | Yes      | Absolute path to the .kicad_pcb board file     |
+| Parameter              | Type    | Required | Description                                                                                                                                      |
+| ---------------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| schematicPath          | string  | Yes      | Absolute path to the .kicad_sch schematic file                                                                                                   |
+| boardPath              | string  | Yes      | Absolute path to the .kicad_pcb board file                                                                                                       |
+| dryRun                 | boolean | No       | Report every change (pad nets, values, fields, footprints added, replaced, deleted) without saving                                               |
+| replaceFootprints      | boolean | No       | Swap footprints whose library ID differs from the symbol's footprint, keeping position, rotation, side, symbol link and the board's field layout |
+| deleteUnusedFootprints | boolean | No       | Delete footprints with no symbol in the schematic; board-only and locked footprints are kept                                                     |
 
 **Usage Notes:** This is the F8 equivalent. It synchronizes the schematic design to the PCB, creating footprints on the board and assigning nets. This step is critical in the workflow: design in schematic → sync_schematic_to_board → place and route on PCB.
 
-Board footprints are matched to schematic symbols by reference designator _and_
-by symbol UUID. The UUID match is what stops a re-annotated schematic from
-looking entirely "missing" and being added to the board a second time.
+Board footprints are matched to schematic symbols by symbol path (UUID) first,
+then by reference designator. A footprint whose symbol UUID matches a schematic
+symbol with another reference is renamed in place (`footprints_renamed`), as
+KiCad does after a re-annotation; it is never counted as missing or unused.
+
+`replaceFootprints` and `deleteUnusedFootprints` are KiCad's two opt-in F8
+options and are off by default. Both are refused while the board is open in
+KiCad (the session is pinned to IPC), because this tool writes the board file
+and KiCad's next save would overwrite the swaps and deletions; a `dryRun`
+preview is still allowed there. The reply lists `footprints_replaced`,
+`footprints_deleted` and `footprints_renamed`; a footprint that could not be
+deleted (locked, or bound to a schematic symbol) is reported in `warnings`.
 
 ### backannotate_footprints
 

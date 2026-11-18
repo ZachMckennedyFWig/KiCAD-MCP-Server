@@ -7,6 +7,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { logger } from "../logger.js";
+import { positionFileToExportPos, vrmlToExport3dCli } from "./tool-aliases.js";
 
 // Command function type for KiCAD script calls
 type CommandFunction = (command: string, params: Record<string, unknown>) => Promise<any>;
@@ -243,6 +244,76 @@ export function registerExportTools(server: McpServer, callKicadScript: CommandF
         outputPath,
         format,
       });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result),
+          },
+        ],
+      };
+    },
+  );
+
+  // ------------------------------------------------------
+  // Export Position File Tool
+  // ------------------------------------------------------
+  server.tool(
+    "export_position_file",
+    "Export a component placement/position file (pick-and-place) for PCB assembly in CSV or ASCII format.",
+    {
+      outputPath: z.string().describe("Path to save the position file"),
+      format: z.enum(["CSV", "ASCII"]).optional().describe("File format (default: CSV)"),
+      units: z.enum(["mm", "mil", "inch"]).optional().describe("Units to use (default: mm)"),
+      side: z
+        .enum(["top", "bottom", "both"])
+        .optional()
+        .describe("Which board side to include (default: both)"),
+    },
+    async ({ outputPath, format, units, side }) => {
+      logger.debug(`Exporting position file to: ${outputPath}`);
+      // No Python export_position_file command exists; kicad-cli's export_pos
+      // does the job.
+      const mapped = positionFileToExportPos({ outputPath, format, units, side });
+      const result =
+        "error" in mapped
+          ? { success: false, message: mapped.error }
+          : await callKicadScript("export_pos", mapped.params);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result),
+          },
+        ],
+      };
+    },
+  );
+
+  // ------------------------------------------------------
+  // Export VRML Tool
+  // ------------------------------------------------------
+  server.tool(
+    "export_vrml",
+    "Export the PCB as a VRML 3D model for use in web viewers or simulation tools.",
+    {
+      outputPath: z.string().describe("Path to save the VRML file"),
+      includeComponents: z.boolean().optional().describe("Whether to include 3D component models"),
+      useRelativePaths: z
+        .boolean()
+        .optional()
+        .describe("Whether to use relative paths for 3D models"),
+    },
+    async ({ outputPath, includeComponents, useRelativePaths }) => {
+      logger.debug(`Exporting VRML to: ${outputPath}`);
+      // No Python export_vrml command exists; export_3d_cli covers VRML.
+      const mapped = vrmlToExport3dCli({ outputPath, includeComponents, useRelativePaths });
+      const result =
+        "error" in mapped
+          ? { success: false, message: mapped.error }
+          : await callKicadScript("export_3d_cli", mapped.params);
 
       return {
         content: [

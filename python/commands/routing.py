@@ -24,6 +24,7 @@ from commands.impedance import (
 from utils.board_items import delete_board_item
 from utils.impedance import ACCURACY_NOTE as IMPEDANCE_ACCURACY_NOTE
 from utils.impedance import ImpedanceError
+from utils.project_netclasses import load_project_net_classes, netclass_pattern_for_net
 
 logger = logging.getLogger("kicad_interface")
 
@@ -295,7 +296,180 @@ def apply_net_assignment_to_project_settings(
         assignments = {}
         net_settings["netclass_assignments"] = assignments
     assignments[net_name] = [class_name]
+    # The durable record is an exact-name entry in netclass_patterns. KiCad treats
+    # netclass_assignments as DERIVED from the schematic's net-class directives and
+    # rewrites it on Update PCB from Schematic: on a schematic with no directives a
+    # sync (sync_schematic_to_board) leaves it empty and every assignment made here
+    # is silently lost. The user-defined patterns survive a sync. Seen on a real
+    # 6-layer HV board: 21 voltage-class assignments dropped, every clearance rule
+    # keyed on those classes stopped matching, and DRC still passed.
+    #
+    # The pattern is the name made literal for KiCad (see netclass_pattern_for_net): KiCad reads
+    # a pattern as a regular expression, so the raw name would also capture other
+    # nets. A re-assignment updates the net's entry in place; an entry holding the
+    # raw name (what an earlier build of this code wrote) is the same net's record
+    # and is rewritten to the escaped form rather than left beside it.
+    pattern = netclass_pattern_for_net(net_name)
+    patterns = net_settings.get("netclass_patterns")
+    if not isinstance(patterns, list):
+        patterns = []
+        net_settings["netclass_patterns"] = patterns
+    for entry in patterns:
+        if isinstance(entry, dict) and entry.get("pattern") in (
+            pattern,
+            net_name,
+            re.escape(net_name),  # what this tool wrote before the KiCad-literal form
+        ):
+            entry["pattern"] = pattern
+            entry["netclass"] = class_name
+            break
+    else:
+        patterns.append({"netclass": class_name, "pattern": pattern})
     return data
+
+
+def _project_file_for(board: Any) -> Optional[str]:
+    """The ``.kicad_pro`` next to *board*'s file, or None."""
+    try:
+        board_path = board.GetFileName()
+    except Exception:
+        return None
+    if board_path and board_path.endswith(".kicad_pcb"):
+        return str(Path(board_path).with_suffix(".kicad_pro"))
+    return None
+
+
+def set_net_class_in_memory(net: Any, netclass: Any) -> None:
+    """Put *net* in *netclass* on the live board.
+
+    KiCad 8, 9 and 10 call the setter ``SetNetClass``; ``SetClass`` is the
+    KiCad 6/7 name. Calling ``SetClass`` on a current build raises
+    AttributeError, which used to abort net-class work after the class itself
+    had been set up.
+    """
+    setter = getattr(net, "SetNetClass", None) or getattr(net, "SetClass", None)
+    if setter is None:
+        raise AttributeError("NETINFO_ITEM has neither SetNetClass nor SetClass")
+    setter(netclass)
+
+
+def _board_net_settings(board: Any) -> Any:
+    """The board's in-memory NET_SETTINGS (KiCad 8+), or None."""
+    try:
+        return board.GetDesignSettings().m_NetSettings
+    except Exception:
+        return None
+
+
+def register_netclass_in_project_settings(board: Any, name: str, netclass: Any) -> Optional[str]:
+    """Add *netclass* to the board's in-memory project net settings.
+
+    On KiCad 9, ``pcbnew.SaveBoard`` rewrites the ``.kicad_pro`` from these
+    in-memory settings, so a class written only to the file is erased by the
+    next board save. KiCad 10 leaves the file alone, which is why the file write
+    stays. Returns a warning, or None.
+    """
+    settings = _board_net_settings(board)
+    if settings is None or not hasattr(settings, "SetNetclass"):
+        return None
+    try:
+        settings.SetNetclass(name, netclass)
+    except Exception as exc:
+        return f"in-memory project net class registration failed: {exc}"
+    return None
+
+
+def _project_file_patterns(pro_path: Optional[str]) -> Optional[List[Tuple[str, str]]]:
+    """The ``netclass_patterns`` entries the project file holds, as
+    ``(pattern, class)``. None when there is no readable project file.
+
+    ``netclass_assignments`` is left out on purpose. KiCad derives those
+    entries from the schematic's net-class directives, and on KiCad 9 the next
+    ``SaveBoard`` writes every in-memory pattern back to ``netclass_patterns``:
+    pushed in as patterns, a directive-derived membership became a permanent
+    pattern that outlived its directive (checked on 9.0.9; 10.0.8 leaves the
+    file alone on save)."""
+    try:
+        loaded = load_project_net_classes(pro_path)
+    except ValueError:
+        return None
+    if loaded is None:
+        return None
+    patterns: List[Tuple[str, str]] = []
+    for pattern, class_name in loaded["patterns"]:
+        if (pattern, class_name) not in patterns:
+            patterns.append((pattern, class_name))
+    return patterns
+
+
+# Worded so it holds whether or not the project-file write succeeded: the callers add it
+# in both cases, and their reply reports the file write separately.
+KICAD8_MEMBERSHIP_WARNING = (
+    "KiCad 8: the next board save rewrites the project file from memory, which this server "
+    "cannot reach on KiCad 8, and drops this net class membership. Assign the class in "
+    "KiCad's Board Setup, or use KiCad 9 or later."
+)
+
+
+def register_membership_in_project_settings(
+    board: Any, net_name: str, class_name: str, pro_path: Optional[str] = None
+) -> Optional[str]:
+    """``register_memberships_in_project_settings`` for one net."""
+    return register_memberships_in_project_settings(board, [net_name], class_name, pro_path)
+
+
+def register_memberships_in_project_settings(
+    board: Any, net_names: List[str], class_name: str, pro_path: Optional[str] = None
+) -> Optional[str]:
+    """Record that each of *net_names* belongs to *class_name* in the in-memory
+    net settings. Call it after the project file has been written.
+
+    Same reason as ``register_netclass_in_project_settings``. Python can't call
+    the label-assignment setter (SWIG doesn't wrap its ``std::set`` argument),
+    so membership goes in as a pattern assignment on the escaped net name
+    (``netclass_pattern_for_net``: KiCad reads a pattern as a regular
+    expression, so a raw ``D+`` would also claim ``D`` and ``DD``).
+
+    ``SetNetclassPatternAssignment`` appends, so assigning a net to A and then
+    to B would leave it in the composite class ``A,B`` with A's clearance
+    winning; on KiCad 9 the next save writes both into the project. Python
+    can't read the list back either (``GetNetclassPatternAssignments`` is an
+    opaque SWIG object), so the list is rebuilt from the project file, which
+    the writer keeps at one entry per net: cleared, then every pattern the
+    file holds is set again. Without a project file the nets' patterns are
+    appended. A label assignment loaded from the project for the net (the
+    old class, from a schematic directive) is cleared first. Returns a
+    warning, or None.
+    """
+    settings = _board_net_settings(board)
+    if settings is None:
+        return None
+    if not hasattr(settings, "SetNetclassPatternAssignment"):
+        # KiCad 8: no pattern API from Python, and SaveBoard rewrites the .kicad_pro from the
+        # in-memory NET_SETTINGS, so the membership just written to the file does not survive it.
+        return KICAD8_MEMBERSHIP_WARNING
+
+    try:
+        if hasattr(settings, "ClearNetclassLabelAssignment"):
+            for net_name in net_names:
+                settings.ClearNetclassLabelAssignment(net_name)
+        wanted = [(netclass_pattern_for_net(net_name), class_name) for net_name in net_names]
+        file_patterns = _project_file_patterns(pro_path)
+        if file_patterns is not None and hasattr(settings, "ClearNetclassPatternAssignments"):
+            settings.ClearNetclassPatternAssignments()
+            patterns = file_patterns
+            for entry in wanted:
+                if entry not in patterns:
+                    patterns.append(entry)
+        else:
+            patterns = wanted
+        for pattern, pattern_class in patterns:
+            settings.SetNetclassPatternAssignment(pattern, pattern_class)
+        if hasattr(settings, "ClearAllCaches"):
+            settings.ClearAllCaches()
+    except Exception as exc:
+        return f"in-memory project net class assignment failed: {exc}"
+    return None
 
 
 def persist_net_assignment_to_project(
@@ -310,6 +484,13 @@ def persist_net_assignment_to_project(
     assignment still stands. The write is atomic (temp file + ``os.replace``)
     so a crash mid-write cannot corrupt the project file.
     """
+    return persist_net_assignments_to_project(pro_path, [net_name], class_name)
+
+
+def persist_net_assignments_to_project(
+    pro_path: Optional[str], net_names: List[str], class_name: str
+) -> Dict[str, Any]:
+    """``persist_net_assignment_to_project`` for several nets in one write."""
     if not pro_path or not os.path.exists(pro_path):
         return {
             "persisted": False,
@@ -319,7 +500,8 @@ def persist_net_assignment_to_project(
     try:
         with open(pro_path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-        apply_net_assignment_to_project_settings(data, net_name, class_name)
+        for net_name in net_names:
+            apply_net_assignment_to_project_settings(data, net_name, class_name)
 
         directory = os.path.dirname(pro_path) or "."
         fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".netassign-", suffix=".kicad_pro")
@@ -412,27 +594,6 @@ def netclass_via_problem(props: Dict[str, Any]) -> Optional[str]:
                 f"diameter ({dia} mm)"
             )
     return None
-
-
-def assign_net_class_in_memory(
-    board: Any, net: Any, net_name: str, class_name: str, netclass: Any = None
-) -> None:
-    """Put one net in a class on the live board. Raises on failure.
-
-    KiCad 6-8 have ``NETINFO_ITEM.SetClass``; KiCad 9/10 dropped it (#5k) and
-    keep membership in ``NET_SETTINGS`` as pattern assignments, where an exact
-    net name is a pattern matching only itself.
-    """
-    if netclass is not None and hasattr(net, "SetClass"):
-        net.SetClass(netclass)
-        return
-    settings = board.GetDesignSettings().m_NetSettings
-    if not hasattr(settings, "SetNetclassPatternAssignment"):
-        raise RuntimeError("this KiCad build has neither SetClass nor netclass pattern assignment")
-    settings.SetNetclassPatternAssignment(net_name, class_name)
-    if hasattr(settings, "ClearAllCaches"):
-        settings.ClearAllCaches()
-    board.SynchronizeNetsAndNetClasses(False)
 
 
 def apply_netclass_patterns_to_project_settings(
@@ -667,18 +828,51 @@ class RoutingCommands:
                             resolved = net_classes[net_class]
                     except Exception:
                         resolved = None
-                if resolved is not None:
-                    assign_net_class_in_memory(self.board, net, name, net_class, resolved)
 
-            return {
+            # Report the class only where it actually landed: on the live board,
+            # in the project file (which is what survives a reload), or neither.
+            warnings: List[str] = []
+            assigned_class = "Default"
+            class_persisted = False
+            if net_class:
+                if resolved is None:
+                    warnings.append(
+                        f"net class '{net_class}' does not exist; the net was added "
+                        "without it (create it with create_netclass first)"
+                    )
+                else:
+                    try:
+                        set_net_class_in_memory(net, resolved)
+                        assigned_class = net_class
+                    except Exception as exc:
+                        warnings.append(f"in-memory net class assignment failed: {exc}")
+                    net_pro_path = _project_file_for(self.board)
+                    persist = persist_net_assignment_to_project(net_pro_path, name, net_class)
+                    warning = register_membership_in_project_settings(
+                        self.board, name, net_class, net_pro_path
+                    )
+                    if warning:
+                        warnings.append(warning)
+                    class_persisted = bool(persist.get("persisted"))
+                    if class_persisted:
+                        assigned_class = net_class
+                    elif persist.get("warning"):
+                        warnings.append(persist["warning"])
+
+            result: Dict[str, Any] = {
                 "success": True,
                 "message": f"Added net: {name}",
                 "net": {
                     "name": name,
-                    "class": net_class if net_class else "Default",
+                    "class": assigned_class,
                     "netcode": net.GetNetCode(),
                 },
             }
+            if net_class:
+                result["classPersisted"] = class_persisted
+            if warnings:
+                result["warning"] = "; ".join(warnings)
+            return result
 
         except Exception as e:
             logger.error(f"Error adding net: {str(e)}")
@@ -1092,6 +1286,14 @@ class RoutingCommands:
             if net_obj is not None:
                 via.SetNet(net_obj)
 
+            # A via placed on its own is a free via, as KiCad's own "Add Free-Standing Via"
+            # makes it. A non-free via takes its net from the copper it touches when the
+            # board is saved: inside another net's zone, with no path to a pad of its own
+            # net yet, it was written to the file on the zone's net, so the via the reply
+            # described was not the via on the board.
+            if hasattr(via, "SetIsFree"):
+                via.SetIsFree(True)
+
             # Add via to board
             self.board.Add(via)
 
@@ -1108,7 +1310,7 @@ class RoutingCommands:
                     "drill": via.GetDrill() / 1000000,
                     "from_layer": from_layer,
                     "to_layer": to_layer,
-                    "net": net,
+                    "net": via.GetNetname(),
                 },
             }
 
@@ -2000,7 +2202,8 @@ class RoutingCommands:
             )
             return
 
-        # KiCad 6-8: NETCLASSES container plus NETINFO_ITEM.SetClass.
+        # KiCad 6-8: NETCLASSES container plus NETINFO_ITEM.SetNetClass (SetClass
+        # before KiCad 8).
         existing = net_classes.Find(name) if hasattr(net_classes, "Find") else None
         netclass = existing or pcbnew.NETCLASS(name)
         if existing is None:
@@ -2021,18 +2224,20 @@ class RoutingCommands:
         nets_map = self.board.GetNetInfo().NetsByName()
         for net_name in nets:
             if nets_map.has_key(net_name):
-                nets_map[net_name].SetClass(netclass)
+                set_net_class_in_memory(nets_map[net_name], netclass)
 
     def create_netclass(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Create or update a net class and assign nets to it.
 
-        Values are millimetres. ``nets`` (and ``patterns``) are net names or
-        KiCad netclass patterns (``*``/``?`` wildcards). Each is written to
-        ``.kicad_pro`` ``net_settings.netclass_patterns`` -- where KiCad keeps
-        net-to-class membership -- and checked against the board's nets: the
-        response lists the nets each one matched and warns, with hierarchical
-        suggestions (``+5V`` -> ``/Power/+5V``), when one matches nothing
-        (#5k / #5q / C1).
+        Values are millimetres. ``nets`` are exact net names: each is written to
+        ``.kicad_pro`` as an assignment plus a pattern made literal for KiCad
+        (which reads patterns as regular expressions, so a raw ``D+`` would
+        also claim ``DD``), and registered in the board's in-memory settings,
+        which KiCad 9 writes back on save. ``patterns`` are KiCad netclass
+        patterns (``*``/``?`` wildcards) written as given. Every entry is
+        checked against the board's nets: the response lists the nets each one
+        matched and warns, with hierarchical suggestions (``+5V`` ->
+        ``/Power/+5V``), when one matches nothing (#5k / #5q / C1).
         """
         try:
             if not self.board:
@@ -2052,12 +2257,14 @@ class RoutingCommands:
             uvia_drill = params.get("uviaDrill")
             diff_pair_width = params.get("diffPairWidth")
             diff_pair_gap = params.get("diffPairGap")
-            nets = [n for n in (params.get("nets") or []) if isinstance(n, str) and n]
-            extra_patterns = [p for p in (params.get("patterns") or []) if isinstance(p, str) and p]
+            nets: List[str] = []
+            for n in params.get("nets") or []:
+                if isinstance(n, str) and n and n not in nets:
+                    nets.append(n)
             patterns: List[str] = []
-            for entry in nets + extra_patterns:
-                if entry not in patterns:
-                    patterns.append(entry)
+            for p in params.get("patterns") or []:
+                if isinstance(p, str) and p and p not in patterns:
+                    patterns.append(p)
 
             if not name:
                 return {
@@ -2108,11 +2315,11 @@ class RoutingCommands:
                     "Pass both viaDiameter and viaDrill to fix it."
                 )
 
-            # Which board nets each pattern matches (C1).
+            # Which board nets each name / pattern matches (C1).
             assignments: List[Dict[str, Any]] = []
             board_nets = self._board_net_names()
             if board_nets is not None:
-                for pattern in patterns:
+                for pattern in nets + [p for p in patterns if p not in nets]:
                     matched = match_netclass_pattern(pattern, board_nets)
                     entry: Dict[str, Any] = {
                         "pattern": pattern,
@@ -2150,6 +2357,36 @@ class RoutingCommands:
                     "errorDetails": "; ".join(warnings),
                 }
 
+            # Membership of the named nets, as assign_net_to_class writes it:
+            # netclass_assignments plus a literal pattern in the project file,
+            # then the in-memory settings KiCad 9 writes back on save. Report
+            # the nets actually written, not the ones requested.
+            nets_map = self.board.GetNetInfo().NetsByName()
+            found = [n for n in nets if nets_map.has_key(n)]
+            missing = [n for n in nets if not nets_map.has_key(n)]
+            assigned: List[str] = []
+            if found:
+                membership = persist_net_assignments_to_project(pro_path, found, name)
+                warning = register_memberships_in_project_settings(
+                    self.board, found, name, pro_path
+                )
+                if warning:
+                    warnings.append(warning)
+                # The pattern assignments above change NET_SETTINGS only; each
+                # net still reports its old class until the board resolves them
+                # again (KiCad 9/10). KiCad 6-8 got SetNetClass in
+                # _apply_netclass_in_memory.
+                try:
+                    self.board.SynchronizeNetsAndNetClasses(False)
+                except Exception as exc:
+                    warnings.append(f"in-memory net class refresh failed: {exc}")
+                if membership.get("persisted"):
+                    assigned = found
+                elif membership.get("warning"):
+                    warnings.append(membership["warning"])
+            if missing:
+                warnings.append("nets not on the board, not assigned: " + ", ".join(missing))
+
             net_class_values = {
                 "clearance": cls.get("clearance"),
                 "trackWidth": cls.get("track_width"),
@@ -2163,14 +2400,18 @@ class RoutingCommands:
             }
             result: Dict[str, Any] = {
                 "success": True,
-                "message": f"Created net class: {name}",
-                "netClass": {"name": name, "nets": nets, **net_class_values},
+                "message": f"Created net class: {name}"
+                + (f" with {len(assigned)} of {len(nets)} nets" if nets else ""),
+                "netClass": {"name": name, "nets": assigned, **net_class_values},
                 "patterns": patterns,
                 "assignments": assignments,
                 "persisted": persist.get("persisted", False),
                 "patternsPersisted": persist.get("patternsPersisted", []),
                 "appliedInMemory": in_memory_warning is None,
             }
+            if nets:
+                result["netsAssigned"] = assigned
+                result["netsNotAssigned"] = [n for n in nets if n not in assigned]
             if persist.get("reassigned"):
                 result["reassigned"] = persist["reassigned"]
             if persist.get("projectFile"):
@@ -2343,6 +2584,8 @@ class RoutingCommands:
             points = params.get("outline", params.get("points", []))
             priority = params.get("priority", 0)
             fill_type = params.get("fillType", "solid")  # solid or hatched
+            # padConnection (thermal | solid | none | thermal_tht) is validated
+            # and applied by _configure_zone.
 
             # If no outline provided, use board outline
             if not points or len(points) < 3:
@@ -2397,13 +2640,18 @@ class RoutingCommands:
             zone = pcbnew.ZONE(self.board)
             zone.SetLayer(layer_id)
 
-            # Set net if provided
+            # Set net if provided. An unknown name used to be ignored, which
+            # left a net-less zone on the board while reporting success.
             if net:
                 netinfo = self.board.GetNetInfo()
                 nets_map = netinfo.NetsByName()
-                if nets_map.has_key(net):
-                    net_obj = nets_map[net]
-                    zone.SetNet(net_obj)
+                if not nets_map.has_key(net):
+                    return {
+                        "success": False,
+                        "message": "Unknown net",
+                        "errorDetails": f"Net '{net}' does not exist on the board",
+                    }
+                zone.SetNet(nets_map[net])
 
             applied, error = self._configure_zone(
                 zone,
@@ -2439,11 +2687,13 @@ class RoutingCommands:
                     "minWidth": min_width,
                     "priority": applied.get("priority", priority),
                     "fillType": fill_type,
+                    "padConnection": applied.get("padConnection", "thermal"),
                     "pointCount": len(points_nm),
                     **{
                         k: v
                         for k, v in applied.items()
-                        if k not in ("priority", "clearance", "minWidth", "fillType")
+                        if k
+                        not in ("priority", "clearance", "minWidth", "fillType", "padConnection")
                     },
                 },
             }

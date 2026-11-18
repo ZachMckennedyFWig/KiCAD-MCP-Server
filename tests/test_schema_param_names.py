@@ -64,7 +64,6 @@ KNOWN_ZOD_UNREAD: Dict[str, Set[str]] = {
     "duplicate_component": {"count", "offset"},
     "get_footprint_info": {"library_name"},
     "list_libraries": {"search_paths"},
-    "list_library_footprints": {"filter", "limit"},
     "place_component_array": {"columnSpacing", "footprint", "rowSpacing", "startReference"},
     "set_design_rules": {"courtyardClearance", "requireCourtyard"},
 }
@@ -194,7 +193,13 @@ def _zod_keys(src: str, after: int) -> Optional[List[str]]:
 
 
 def ts_tools() -> Dict[str, Dict[str, Any]]:
-    """{tool: {"payload": keys sent to Python or None, "calls_python": bool}}."""
+    """{tool: {"payload": keys sent to Python or None, "calls_python": bool,
+    "commands": Python commands the tool sends}}.
+
+    A tool normally sends the command of its own name. A few older tools
+    (add_zone, export_position_file, export_vrml) translate their parameters
+    and send a sibling command instead; see src/tools/tool-aliases.ts.
+    """
     out: Dict[str, Dict[str, Any]] = {}
     for path in sorted(glob.glob(str(ROOT / "src" / "tools" / "*.ts"))):
         src = Path(path).read_text(encoding="utf-8")
@@ -209,8 +214,9 @@ def ts_tools() -> Dict[str, Dict[str, Any]]:
             payload: Set[str] = set()
             parsed = False
             unknown = False
+            commands: Set[str] = set()
             for m in re.finditer(r'callKicadScript\(\s*"([^"]+)"\s*,\s*', body):
-                assert m.group(1) == name, f"{name} calls {m.group(1)}"
+                commands.add(m.group(1))
                 k = m.end()
                 if re.match(r"(args|params|request)\s*[,)]", body[k:]):
                     payload |= set(zod)
@@ -227,6 +233,7 @@ def ts_tools() -> Dict[str, Dict[str, Any]]:
             out[name] = {
                 "payload": sorted(payload) if parsed and not unknown else None,
                 "calls_python": "callKicadScript(" in body,
+                "commands": sorted(commands),
             }
     return out
 
@@ -351,7 +358,11 @@ def test_parser_sees_the_tool_surface(tools) -> None:
 
 
 def test_every_ts_tool_that_calls_python_has_a_route(tools, routes) -> None:
-    unrouted = {t for t, info in tools.items() if info["calls_python"] and t not in routes}
+    unrouted = {
+        t
+        for t, info in tools.items()
+        if info["calls_python"] and any(c not in routes for c in info["commands"])
+    }
     assert not (unrouted - KNOWN_UNROUTED), (
         f"NEW unrouted tools {sorted(unrouted - KNOWN_UNROUTED)}: the TypeScript "
         "tool calls a command that kicad_interface.command_routes does not know, "
@@ -400,9 +411,12 @@ def test_every_command_called_from_typescript_has_a_route(routes) -> None:
 def test_zod_parameters_are_read_by_their_handlers(tools, routes, vocabulary) -> None:
     found: Dict[str, Set[str]] = {}
     for name, info in sorted(tools.items()):
-        if info["payload"] is None or name not in routes:
+        if info["payload"] is None or len(info["commands"]) != 1:
             continue
-        missing = {p for p in info["payload"] if p not in vocabulary(name)}
+        command = info["commands"][0]
+        if command not in routes:
+            continue
+        missing = {p for p in info["payload"] if p not in vocabulary(command)}
         if missing:
             found[name] = missing
     _ratchet(found, KNOWN_ZOD_UNREAD, "zod parameters never read")
@@ -436,8 +450,10 @@ def test_jsonrpc_schema_parameters_are_read_by_their_handlers(routes, vocabulary
 def test_generated_schemas_match_the_typescript_tools(tools) -> None:
     from schemas.tool_schemas import GENERATED_TOOL_SCHEMAS
 
-    # Tools answered by TypeScript alone have no Python command to describe.
-    expected = {name for name, info in tools.items() if info["calls_python"]}
+    # Only tools that call the Python command of their own name: those answered
+    # by TypeScript alone, or wrappers such as export_position_file (which runs
+    # export_pos), have no Python command to describe.
+    expected = {name for name, info in tools.items() if name in info.get("commands", [])}
     generated = set(GENERATED_TOOL_SCHEMAS)
     assert generated == expected, (
         "python/schemas/generated_tool_schemas.json is stale; run "

@@ -206,3 +206,42 @@ describe("environment overrides", () => {
     expect(computeTimeoutGrace({ KICAD_MCP_TIMEOUT_GRACE_MS: "1000" })).toBe(1000);
   });
 });
+
+describe("schematic batch and board-creation commands", () => {
+  it("get the long allowance", () => {
+    // One STM32 symbol took longer than the 30 s default to place, and a
+    // batch abandoned mid-write left a .kicad_sch that no longer loaded.
+    for (const cmd of [
+      "batch_add_components",
+      "batch_connect",
+      "batch_add_and_connect",
+      "batch_add_no_connects",
+      "batch_edit_schematic_components",
+      "create_board_from_schematic",
+    ]) {
+      expect(computeCommandTimeout(cmd, {}, {})).toBe(LONG_COMMAND_TIMEOUT_MS);
+    }
+    // ERC is a whole-design check here, with DRC: the check allowance.
+    expect(computeCommandTimeout("run_erc", {}, {})).toBe(CHECK_COMMAND_TIMEOUT_MS);
+  });
+});
+
+describe("KICAD_MCP_COMMAND_TIMEOUT_MS", () => {
+  it("raises the floor for every command", () => {
+    const env = { KICAD_MCP_COMMAND_TIMEOUT_MS: "120000" };
+    expect(computeCommandTimeout("get_board_info", {}, env)).toBe(120_000);
+  });
+
+  it("never shortens a longer policy timeout", () => {
+    const env = { KICAD_MCP_COMMAND_TIMEOUT_MS: "1000" };
+    expect(computeCommandTimeout("get_board_info", {}, env)).toBe(DEFAULT_COMMAND_TIMEOUT_MS);
+    expect(computeCommandTimeout("run_drc", {}, env)).toBe(CHECK_COMMAND_TIMEOUT_MS);
+  });
+
+  it("ignores values that are not positive numbers", () => {
+    for (const bad of ["", "abc", "-5", "0"]) {
+      const env = { KICAD_MCP_COMMAND_TIMEOUT_MS: bad };
+      expect(computeCommandTimeout("get_board_info", {}, env)).toBe(DEFAULT_COMMAND_TIMEOUT_MS);
+    }
+  });
+});

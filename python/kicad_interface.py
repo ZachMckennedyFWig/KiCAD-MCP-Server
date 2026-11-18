@@ -458,6 +458,10 @@ try:
     from commands.schematic_field_layout import SchematicFieldLayoutCommands
     from commands.schematic_hierarchy import SchematicHierarchyCommands
     from commands.schematic_lint import SchematicLintCommands
+    from commands.schematic_rectangles import (
+        list_schematic_rectangles,
+        set_schematic_rectangle,
+    )
     from commands.script_runner import ScriptRunnerCommands
     from commands.set_symbol_pin_type import set_symbol_pin_type
     from commands.snapshots import (
@@ -539,7 +543,9 @@ class KiCADInterface(SchematicHandlersMixin):
         # Reads self.board on every call, so open/reload need not update it.
         self.board_query_commands = BoardQueryCommands(lambda: self.board)
         self.impedance_commands = ImpedanceCommands(lambda: self.board)
-        self.freerouting_commands = FreeroutingCommands(self.board)
+        self.freerouting_commands = FreeroutingCommands(
+            self.board, on_board_saved=self._note_own_board_save
+        )
         self.eagle_commands = EagleCommands()
         self.symbol_schematic_commands = SymbolSchematicCommands()
         self.library_management_commands = LibraryManagementCommands()
@@ -566,6 +572,8 @@ class KiCADInterface(SchematicHandlersMixin):
         self.gui_driver_commands = GuiDriverCommands(self)
         self.library_commands = LibraryCommands(self.footprint_library)
         self._current_project_path: Optional[Path] = None  # set when boardPath is known
+        # Set when a command's boardPath switched the session to another board (#519).
+        self._board_switch_note: Optional[Dict[str, Any]] = None
 
         # Initialize symbol library manager (for searching local KiCad symbol libraries)
         self.symbol_library_commands = SymbolLibraryCommands()
@@ -696,6 +704,7 @@ class KiCADInterface(SchematicHandlersMixin):
             "set_net_color": self.routing_commands.set_net_color,
             "add_copper_pour": self.routing_commands.add_copper_pour,
             "add_zone": self.routing_commands.add_zone,
+            "add_copper_keepout": self._ipc_add_copper_keepout,
             "route_differential_pair": self.routing_commands.route_differential_pair,
             "refill_zones": self._handle_refill_zones,
             # Board query/inspection (MCP_ISSUES 2.4 Q1, Q3, Q4; read-only)
@@ -710,6 +719,7 @@ class KiCADInterface(SchematicHandlersMixin):
             "get_drc_violations": self.design_rule_commands.get_drc_violations,
             "assign_net_to_class": self.design_rule_commands.assign_net_to_class,
             "check_clearance": self.design_rule_commands.check_clearance,
+            "audit_via_nets": self.design_rule_commands.audit_via_nets,
             "set_layer_constraints": self.design_rule_commands.set_layer_constraints,
             # Board editing primitives, zones/rule areas and rules-as-data
             # (MCP_ISSUES E1-E3, C2, C3, §2.9)
@@ -726,6 +736,7 @@ class KiCADInterface(SchematicHandlersMixin):
             "list_drc_rules": self.drc_rule_commands.list_drc_rules,
             "remove_drc_rule": self.drc_rule_commands.remove_drc_rule,
             "check_standards": self.standards_commands.check_standards,
+            "set_voltage_clearance_rules": self.design_rule_commands.set_voltage_clearance_rules,
             # GUI-driver channel (in-process wx helper over a localhost socket;
             # generic scriptable surface, destructive names are advisory-flagged
             # with a "⚠ " prefix — never gated). See commands/gui_driver.py.
@@ -861,6 +872,7 @@ class KiCADInterface(SchematicHandlersMixin):
             # Schematic analysis tools (read-only)
             "get_schematic_view_region": self._handle_get_schematic_view_region,
             "find_overlapping_elements": self._handle_find_overlapping_elements,
+            "check_schematic_legibility": self._handle_check_schematic_legibility,
             "get_elements_in_region": self._handle_get_elements_in_region,
             "find_wires_crossing_symbols": self._handle_find_wires_crossing_symbols,
             "find_orphaned_wires": self._handle_find_orphaned_wires,
@@ -870,6 +882,8 @@ class KiCADInterface(SchematicHandlersMixin):
             "add_schematic_hierarchical_label": self._handle_add_schematic_hierarchical_label,
             "add_schematic_text": self._handle_add_schematic_text,
             "list_schematic_texts": self._handle_list_schematic_texts,
+            "list_schematic_rectangles": list_schematic_rectangles,
+            "set_schematic_rectangle": set_schematic_rectangle,
             "add_sheet_pin": self._handle_add_sheet_pin,
             "import_svg_logo": self._handle_import_svg_logo,
             # UI/Process management commands
@@ -947,11 +961,13 @@ class KiCADInterface(SchematicHandlersMixin):
         "route_arc_trace": "_ipc_route_arc_trace",
         "add_via": "_ipc_add_via",
         "add_net": "_ipc_add_net",
+        "modify_trace": "_ipc_modify_trace",
         "delete_trace": "_ipc_delete_trace",
         "query_traces": "_ipc_query_traces",
         "get_nets_list": "_ipc_get_nets_list",
         # Zone commands
         "add_copper_pour": "_ipc_add_copper_pour",
+        "add_copper_keepout": "_ipc_add_copper_keepout",
         "refill_zones": "_ipc_refill_zones",
         # Board commands
         "add_text": "_ipc_add_text",
@@ -1230,6 +1246,12 @@ class KiCADInterface(SchematicHandlersMixin):
                 and self._session_allows_ipc()
             )
 
+            if command == "add_copper_keepout" and not ipc_can_serve:
+                return {
+                    "success": False,
+                    "message": "A live KiCad PCB editor with IPC is required for copper keepouts; no file fallback was attempted",
+                }
+
             if ipc_can_serve:
                 ipc_handler_name = self.IPC_CAPABLE_COMMANDS[command]
                 ipc_handler = getattr(self, ipc_handler_name, None)
@@ -1252,10 +1274,23 @@ class KiCADInterface(SchematicHandlersMixin):
                             "the file (SWIG) backend instead of IPC"
                         )
                     else:
-                        # Add indicator that IPC was used
+                        # Add indicator that IPC was used. An IPC handler that
+                        # delegated to the SWIG code tags its reply
+                        # ``_backend: "swig"``; that work touched the server's
+                        # board copy, not the live KiCad board, so it must not
+                        # be reported as realtime (#553).
                         if isinstance(result, dict):
-                            result["_backend"] = "ipc"
-                            result["_realtime"] = True
+                            if result.get("_backend") == "swig":
+                                result["_realtime"] = False
+                                result.setdefault(
+                                    "_backend_note",
+                                    "this request was handled by the SWIG code on the "
+                                    "server's copy of the board, not over IPC, so the "
+                                    "board open in the KiCad editor does not reflect it",
+                                )
+                            else:
+                                result["_backend"] = "ipc"
+                                result["_realtime"] = True
 
                         logger.debug(f"IPC command result: {result}")
                         return result
@@ -1265,6 +1300,13 @@ class KiCADInterface(SchematicHandlersMixin):
                 logger.warning(
                     f"IPC handler not available for {command}, falling back to SWIG (deprecated)"
                 )
+
+            # A boardPath that is not the loaded board is loaded first, for the
+            # whole interface, so every handler works on the board the caller named.
+            self._board_switch_note = None
+            refusal = self._load_board_named_by_params(command, params)
+            if refusal:
+                return refusal
 
             # Get the handler for the command
             handler = self.command_routes.get(command)
@@ -1288,6 +1330,12 @@ class KiCADInterface(SchematicHandlersMixin):
                             "The board file was written, but the in-memory board could not "
                             "be reloaded from it. Run open_board before further edits."
                         )
+                # Tell the caller the session moved to boardPath: its next command
+                # without boardPath acts on that board.
+                note = getattr(self, "_board_switch_note", None)
+                if note and isinstance(result, dict):
+                    result.setdefault("sessionBoardPath", note["boardPath"])
+                    result["boardSwitchWarning"] = note["warning"]
 
                 # Add backend indicator
                 if isinstance(result, dict):
@@ -1314,6 +1362,22 @@ class KiCADInterface(SchematicHandlersMixin):
                     # an IPC read was redirected to SWIG for this command.
                     if swig_fallback_note:
                         result["_backend_note"] = swig_fallback_note
+                    # run_drc runs kicad-cli on the board file. In a realtime
+                    # session the live board can differ from that file, and a
+                    # clean report said nothing about it (#553).
+                    if (
+                        command == "run_drc"
+                        and result.get("success")
+                        and getattr(self, "session_backend", None) == "ipc"
+                        and self._ipc_session_alive()
+                    ):
+                        result["checkedSource"] = "file"
+                        result.setdefault("warnings", []).append(
+                            "DRC checked the board file on disk, not the board open in "
+                            "KiCad. Changes made in the KiCad editor or by realtime (IPC) "
+                            "tools since the last save are not included; run "
+                            "save_project first to check them."
+                        )
 
                 # Update board reference if command was successful
                 if result.get("success", False):
@@ -1407,6 +1471,8 @@ class KiCADInterface(SchematicHandlersMixin):
                                     result.setdefault("warnings", []).append(save_status["warning"])
                                 result["autoSave"] = save_status
                     elif command in self._BOARD_MUTATING_COMMANDS:
+                        # (A dry run never reaches here: the branch above skips
+                        # the save for any reply with dryRun true.)
                         # Auto-save after every board mutation via SWIG.
                         # Prevents data loss if Claude hits context limit before
                         # an explicit save_project call.  When auto-save refuses
@@ -1470,6 +1536,10 @@ class KiCADInterface(SchematicHandlersMixin):
         # setter for it, so the command edits the file and the handler above
         # reloads before this auto-save runs.
         "set_stackup_layer",
+        # modify_trace mutates track.SetWidth()/SetLayer()/SetNet() on the
+        # in-memory SWIG board but has no save of its own; without this entry
+        # it reported success and wrote nothing to disk, identical to #222.
+        "modify_trace",
         "place_component",
         "move_component",
         "rotate_component",
@@ -1567,6 +1637,7 @@ class KiCADInterface(SchematicHandlersMixin):
         "rotate_schematic_component",
         "set_schematic_component_property",
         "set_schematic_property_position",
+        "set_schematic_rectangle",
         "set_sheet_property",
         "snap_to_grid",
         "suggest_schematic_declutter",
@@ -1796,6 +1867,21 @@ class KiCADInterface(SchematicHandlersMixin):
         except Exception:
             path = None
         self._board_disk_signature = self._disk_signature(path) if path else None
+
+    def _note_own_board_save(self, path: str) -> None:
+        """A command saved self.board to ``path`` itself (autoroute, import_ses).
+
+        When that is the board's own file, record its new signature, as
+        handle_command does after save_project. Otherwise the next auto-save
+        sees the file differ from the signature taken before the command and
+        refuses, reporting our own write as an external change. A save to some
+        other file leaves the board's file, and its signature, as they were.
+        """
+        current = self._current_board_path()
+        if not current or not path:
+            return
+        if os.path.normcase(str(Path(path).resolve())) == os.path.normcase(current):
+            self._record_board_signature()
 
     def _current_board_path(self) -> Optional[str]:
         """Return the current board file path, if a healthy board is loaded."""
@@ -2163,6 +2249,94 @@ class KiCADInterface(SchematicHandlersMixin):
         self._record_board_signature()
         self._last_auto_save_status = None
         return True
+
+    # Commands whose ``boardPath`` names the board to work on. Before, such a path
+    # was accepted and then ignored: with nothing loaded, autoroute refused with
+    # "No board is loaded" even though boardPath was given, and with a different
+    # board loaded it routed that board and saved it over boardPath.
+    _BOARD_PATH_COMMANDS = {"autoroute", "export_dsn", "import_ses"}
+
+    def _load_board_named_by_params(
+        self, command: str, params: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Load ``params["boardPath"]`` when it is not the board this session holds.
+
+        The switch goes through ``_handle_open_board`` (board reference, every command
+        handler, disk signature, project path and symbol libraries, session pin), so
+        the whole interface moves to that board, as open_project would move it. Paths
+        are compared normalised against ``_authoritative_board_path()``, the session's
+        identity: in an IPC-pinned session the SWIG board can be missing, and its own
+        board must not read as "another board". Refused:
+
+        - when the loaded board holds changes that are not on disk (auto-save refused
+          after a mutation): switching would drop them. Save first, or reload to
+          discard;
+        - in an IPC-pinned session, for a board other than the one open in KiCad.
+
+        On a switch, ``_board_switch_note`` is set and the dispatcher adds
+        ``sessionBoardPath`` and ``boardSwitchWarning`` to the reply. Returns a failure
+        reply, else None.
+        """
+        if command not in self._BOARD_PATH_COMMANDS:
+            return None
+        board_path = params.get("boardPath")
+        if not board_path:
+            return None
+        target = self._normalize_board_path(board_path)
+        current = self._authoritative_board_path()
+        if current and target == self._normalize_board_path(current):
+            return None
+        if not os.path.isfile(str(board_path)):
+            return {
+                "success": False,
+                "message": f"Board file not found: {board_path}",
+                "errorDetails": "boardPath must name an existing .kicad_pcb file",
+            }
+        if getattr(self, "session_backend", None) == "ipc":
+            # The GUI owns this session's board; switching boards underneath it is
+            # the divergent-state problem of #223. The caller has to open the other
+            # project first.
+            return {
+                "success": False,
+                "message": f"{command}: boardPath names a board other than the one open in KiCad",
+                "errorDetails": (
+                    f"This session is pinned to the board open in KiCad "
+                    f"({self.session_board_path}). Call open_project on {board_path} first."
+                ),
+            }
+        # Refuse only for edits that exist nowhere but in memory. A board whose file changed
+        # on disk while memory is clean (diskChangedExternally) loses nothing by switching.
+        last_auto_save = getattr(self, "_last_auto_save_status", None) or {}
+        if current and last_auto_save.get("memChangesUnsaved"):
+            return {
+                "success": False,
+                "message": (
+                    f"{command}: the loaded board has changes that are not saved; "
+                    f"not switching to {board_path}"
+                ),
+                "errorDetails": (
+                    f"{current} holds edits that exist only in memory (auto-save was refused). "
+                    "Loading another board would drop them. Run save_project first to keep them, "
+                    "or reload_board / open_project to discard them, then call again."
+                ),
+            }
+        opened = self._handle_open_board({"boardPath": str(board_path)})
+        if not opened.get("success"):
+            return {
+                "success": False,
+                "message": f"Failed to load board {board_path}",
+                "errorDetails": opened.get("errorDetails") or opened.get("message"),
+            }
+        logger.info(f"{command}: loaded {board_path} (not the board this session held)")
+        self._board_switch_note = {
+            "boardPath": opened.get("boardPath", str(board_path)),
+            "warning": (
+                f"This session now holds {opened.get('boardPath', board_path)}"
+                + (f" instead of {current}" if current else "")
+                + ": commands without boardPath act on it."
+            ),
+        }
+        return None
 
     def _reload_stackup_file(self) -> bool:
         """Reload the board after set_stackup_layer writes its file.
@@ -5256,6 +5430,28 @@ class KiCADInterface(SchematicHandlersMixin):
     # Schematic analysis tools (read-only)
     # ===================================================================
 
+    def _handle_check_schematic_legibility(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Report what a reader would trip over on one sheet (see schematic_legibility)."""
+        try:
+            from pathlib import Path
+
+            from commands.schematic_legibility import check_legibility
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not Path(schematic_path).exists():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+            result = check_legibility(Path(schematic_path), int(params.get("maxProblems", 200)))
+            return {
+                "success": True,
+                **result,
+                "message": f"{result['total']} legibility problem(s)",
+            }
+        except Exception as e:
+            logger.error(f"Error checking schematic legibility: {e}")
+            return {"success": False, "message": str(e)}
+
     def _handle_find_overlapping_elements(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Detect spatially overlapping symbols, wires, and labels"""
         logger.info("Finding overlapping elements in schematic")
@@ -5753,16 +5949,31 @@ print("ok")
         }
 
     def _ipc_add_copper_pour(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """IPC handler for add_copper_pour - adds zone with real-time UI update"""
+        """IPC handler for add_copper_pour - adds zone with real-time UI update.
+
+        Mirrors the SWIG handler's checks: per-point units are converted to mm,
+        an unknown net is an error, and padConnection is applied.
+        """
+        from commands.routing import LENGTH_UNITS_MM
+
         try:
             layer = params.get("layer", "F.Cu")
             net = params.get("net")
             clearance = params.get("clearance", 0.5)
             min_width = params.get("minWidth", 0.25)
-            points = params.get("points", [])
+            # The tool schema sends `outline`; `points` is the older key.
+            points = params.get("outline") or params.get("points") or []
             priority = params.get("priority", 0)
             fill_type = params.get("fillType", "solid")
             name = params.get("name", "")
+            pad_connection = params.get("padConnection")  # thermal | solid | none
+
+            if pad_connection is not None and pad_connection not in ("thermal", "solid", "none"):
+                return {
+                    "success": False,
+                    "message": "Invalid padConnection",
+                    "errorDetails": "padConnection must be one of thermal, solid, none",
+                }
 
             if not points or len(points) < 3:
                 return {
@@ -5770,10 +5981,31 @@ print("ok")
                     "message": "At least 3 points are required for copper pour outline",
                 }
 
-            # Convert points format if needed (handle both {x, y} and {x, y, unit})
+            # Points may carry their own unit (add_zone sends mil/inch);
+            # ipc_board_api.add_zone takes mm.
             formatted_points = []
             for point in points:
-                formatted_points.append({"x": point.get("x", 0), "y": point.get("y", 0)})
+                unit = point.get("unit", "mm")
+                if unit not in LENGTH_UNITS_MM:
+                    return {
+                        "success": False,
+                        "message": "Invalid unit",
+                        "errorDetails": (
+                            f"point unit must be one of {sorted(LENGTH_UNITS_MM)}, got {unit!r}"
+                        ),
+                    }
+                scale = LENGTH_UNITS_MM[unit]
+                formatted_points.append(
+                    {"x": point.get("x", 0) * scale, "y": point.get("y", 0) * scale}
+                )
+
+            # add_zone leaves the zone net-less when the name matches nothing.
+            if net and net not in {n.get("name") for n in self.ipc_board_api.get_nets()}:
+                return {
+                    "success": False,
+                    "message": "Unknown net",
+                    "errorDetails": f"Net '{net}' does not exist on the board",
+                }
 
             success = self.ipc_board_api.add_zone(
                 points=formatted_points,
@@ -5784,6 +6016,7 @@ print("ok")
                 priority=priority,
                 fill_mode=fill_type,
                 name=name,
+                pad_connection=pad_connection,
             )
 
             return {
@@ -5800,12 +6033,26 @@ print("ok")
                     "minWidth": min_width,
                     "priority": priority,
                     "fillType": fill_type,
+                    "padConnection": pad_connection or "thermal",
                     "pointCount": len(points),
                 },
             }
         except Exception as e:
             logger.error(f"IPC add_copper_pour error: {e}")
             return {"success": False, "message": str(e)}
+
+    def _ipc_add_copper_keepout(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a copper-fill keepout in the live PCB editor only."""
+        try:
+            return self.ipc_board_api.add_copper_keepout(
+                board_path=params.get("boardPath"),
+                name=params.get("name"),
+                layers=params.get("layers"),
+                points=params.get("points"),
+            )
+        except Exception as error:
+            logger.error("IPC add_copper_keepout error: %s", error)
+            return {"success": False, "message": str(error)}
 
     def _ipc_refill_zones(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """IPC handler for refill_zones - refills all zones with real-time UI update"""
@@ -6121,12 +6368,56 @@ print("ok")
             logger.error(f"IPC save_project error: {e}")
             return {"success": False, "message": str(e)}
 
+    def _ipc_modify_trace(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """IPC handler for modify_trace - mutates an existing track with real-time UI update.
+
+        ``traceUuid`` is the schema name (src/tools/routing.ts); ``uuid`` is
+        kept for JSON-RPC callers that predate the schema alignment (#403),
+        matching the SWIG handler's same two-key lookup.
+        """
+        try:
+            trace_uuid = params.get("traceUuid") or params.get("uuid")
+            if not trace_uuid:
+                return {
+                    "success": False,
+                    "message": "Missing trace identifier",
+                    "errorDetails": "Provide 'traceUuid' to identify the trace",
+                }
+            return self.ipc_board_api.modify_track(
+                uuid=trace_uuid,
+                width=params.get("width"),
+                layer=params.get("layer"),
+                net_name=params.get("net"),
+            )
+        except Exception as e:
+            logger.error(f"IPC modify_trace error: {e}")
+            return {"success": False, "message": str(e)}
+
     def _ipc_delete_trace(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """IPC handler for delete_trace - Note: IPC doesn't support direct trace deletion yet"""
-        # IPC API doesn't have a direct delete track method
-        # Fall back to SWIG for this operation
-        logger.info("delete_trace: Falling back to SWIG (IPC doesn't support trace deletion)")
-        return self.routing_commands.delete_trace(params)
+        """IPC handler for delete_trace - deletes from the live KiCad board (#553).
+
+        This used to call the SWIG delete_trace, which edited the server's
+        own copy of the board while KiCad kept the track, and the dispatcher
+        still labelled the reply as a realtime IPC success. A "move" done as
+        delete + route_trace then left the old copper in place and shorted
+        nets on the live board.
+        """
+        try:
+            if not hasattr(self.ipc_board_api, "delete_tracks"):
+                return {
+                    "success": False,
+                    "message": "IPC backend does not support trace deletion on this installation",
+                }
+            return self.ipc_board_api.delete_tracks(
+                uuid=params.get("traceUuid"),
+                position=params.get("position"),
+                net_name=params.get("net"),
+                layer=params.get("layer"),
+                include_vias=bool(params.get("includeVias", False)),
+            )
+        except Exception as e:
+            logger.error(f"IPC delete_trace error: {e}")
+            return {"success": False, "message": str(e)}
 
     def _ipc_query_traces(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """IPC handler for query_traces - reads traces from the live KiCAD board."""
@@ -6256,7 +6547,12 @@ print("ok")
             # but Claude sends rectangle/rounded_rectangle as shape+width+height.
             # Fall back to the SWIG path which correctly handles both shapes.
             logger.info(f"_ipc_add_board_outline: delegating {shape} to SWIG path")
-            return self.board_commands.add_board_outline(params)
+            result = self.board_commands.add_board_outline(params)
+            # The SWIG path edits the server's board copy, not the live board;
+            # the tag stops the dispatcher reporting it as realtime (#553).
+            if isinstance(result, dict):
+                result["_backend"] = "swig"
+            return result
 
         try:
             from kipy.board_types import BoardSegment
@@ -7145,7 +7441,7 @@ def main() -> None:
                                 "serverInfo": {
                                     "name": "kicad-mcp-server",
                                     "title": "KiCAD PCB Design Assistant",
-                                    "version": "2.8.3",
+                                    "version": "2.9.0",
                                 },
                                 "instructions": "AI-assisted PCB design with KiCAD. Use tools to create projects, design boards, place components, route traces, and export manufacturing files.",
                             },

@@ -4,10 +4,10 @@
      run `npm run build && npm run docs:tools` instead. Descriptions already
      in this file are preserved, so improving the wording here is safe. -->
 
-**Version:** 2.8.3
-**Tools registered on the server:** 291
-**Tools indexed for keyword discovery:** 291 in 25 categories
-**Last updated:** 2026-11-10
+**Version:** 2.9.0
+**Tools registered on the server:** 299
+**Tools indexed for keyword discovery:** 299 in 25 categories
+**Last updated:** 2026-11-18
 
 ## How to read this document
 
@@ -53,7 +53,7 @@ _Source: `src/tools/project.ts`_
 
 ---
 
-## Board Management (21 tools)
+## Board Management (22 tools)
 
 _Source: `src/tools/board.ts`_
 
@@ -77,6 +77,7 @@ _Source: `src/tools/board.ts`_
 | `add_mounting_hole`     | Add mounting hole with optional pad                                                                                                 | `board`   |
 | `add_board_text`        | Add text annotation to board                                                                                                        | `board`   |
 | `add_zone`              | Add copper zone/pour with clearance settings                                                                                        | `board`   |
+| `add_copper_keepout`    | Add a live KiCad rule area that excludes copper zone fill on the selected enabled copper layers.                                    | `board`   |
 | `get_board_extents`     | Get bounding box of board                                                                                                           | `board`   |
 | `get_board_2d_view`     | Render 2D board view (PNG/JPG/SVG)                                                                                                  | `board`   |
 | `import_svg_logo`       | Import SVG file as polygons on silkscreen layer                                                                                     | `board`   |
@@ -148,23 +149,25 @@ _Source: `src/tools/routing.ts`_
 
 ---
 
-## Design Rules and DRC (7 tools)
+## Design Rules and DRC (9 tools)
 
 _Source: `src/tools/design-rules.ts`_
 
-| Tool                    | Description                                                 | Discovery |
-| ----------------------- | ----------------------------------------------------------- | --------- |
-| `set_design_rules`      | Set global design rules (clearance, track width, via sizes) | `drc`     |
-| `get_design_rules`      | Get current design rules                                    | `drc`     |
-| `run_drc`               | Run design rule check                                       | `drc`     |
-| `assign_net_to_class`   | Assign net to a net class                                   | `drc`     |
-| `set_layer_constraints` | Set layer-specific constraints                              | `drc`     |
-| `check_clearance`       | Check clearance between two items                           | `drc`     |
-| `get_drc_violations`    | Get DRC violation list (filter by severity)                 | `drc`     |
+| Tool                          | Description                                                                                                                                     | Discovery |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| `set_design_rules`            | Set global design rules (clearance, track width, via sizes)                                                                                     | `drc`     |
+| `get_design_rules`            | Get current design rules                                                                                                                        | `drc`     |
+| `run_drc`                     | Run design rule check                                                                                                                           | `drc`     |
+| `assign_net_to_class`         | Assign net to a net class                                                                                                                       | `drc`     |
+| `set_layer_constraints`       | Set layer-specific constraints                                                                                                                  | `drc`     |
+| `set_voltage_clearance_rules` | Clearance/creepage rules graded by working voltage between net classes                                                                          | `drc`     |
+| `check_clearance`             | Check clearance between two items                                                                                                               | `drc`     |
+| `audit_via_nets`              | Compare every via's net in the saved board with a reference board (a .kicad_pcb file or a git revision such as HEAD) and list vias whose net... | `drc`     |
+| `get_drc_violations`          | Get DRC violation list (filter by severity)                                                                                                     | `drc`     |
 
 ---
 
-## Export and Fabrication Output (25 tools)
+## Export and Fabrication Output (27 tools)
 
 _Source: `src/tools/export.ts`_
 
@@ -176,6 +179,8 @@ _Source: `src/tools/export.ts`_
 | `export_3d`             | Export 3D model (STEP, STL, VRML, OBJ)                                                                                                                | `export`  |
 | `export_bom`            | Export Bill of Materials (CSV, XML, HTML, JSON)                                                                                                       | `export`  |
 | `export_netlist`        | Export netlist (KiCad, Spice, Cadstar, OrcadPCB2)                                                                                                     | `export`  |
+| `export_position_file`  | Export a component placement/position file (pick-and-place) for PCB assembly in CSV or ASCII format.                                                  | `export`  |
+| `export_vrml`           | Export the PCB as a VRML 3D model for use in web viewers or simulation tools.                                                                         | `export`  |
 | `export_gerbers`        | Plot Gerber files for a PCB via kicad-cli, exposing the full Plot-dialog option set (X2, netlist attributes, DNP handling, soldermask subtraction,... | `export`  |
 | `export_drill`          | Generate drill files for a PCB via kicad-cli, exposing the full Excellon/Gerber drill option set (format, drill origin, zero suppression, oval...     | `export`  |
 | `export_ipc2581`        | Export the PCB in IPC-2581 format via kicad-cli.                                                                                                      | `export`  |
@@ -198,7 +203,7 @@ _Source: `src/tools/export.ts`_
 
 ---
 
-## Schematic (48 tools)
+## Schematic (51 tools)
 
 _Source: `src/tools/schematic.ts`_
 
@@ -238,6 +243,7 @@ _Source: `src/tools/schematic.ts`_
 | `backannotate_footprints`             | Copy footprint assignments from a .kicad_pcb back into the schematic's Footprint fields — the reverse of sync_schematic_to_board.                    | `schematic`             |
 | `create_board_from_schematic`         | Create a new .kicad_pcb file from a schematic, then update the PCB from that schematic so footprints and nets are present.                           | Essential               |
 | `get_schematic_view_region`           | Render a specific region of the schematic as image                                                                                                   | `schematic`             |
+| `check_schematic_legibility`          | Checks whether a person can read a schematic sheet: what ERC and a netlist cannot see.                                                               | `schematic_layout`      |
 | `find_overlapping_elements`           | Find schematic elements that visually overlap                                                                                                        | `schematic_layout`      |
 | `get_elements_in_region`              | Get all elements inside an XY bounding box                                                                                                           | `schematic_layout`      |
 | `find_wires_crossing_symbols`         | Find wires that cross through symbol bodies (DRC helper)                                                                                             | `schematic_layout`      |
@@ -249,6 +255,8 @@ _Source: `src/tools/schematic.ts`_
 | `add_schematic_hierarchical_label`    | Add hierarchical label for multi-sheet connections                                                                                                   | `schematic_hierarchy`   |
 | `list_schematic_texts`                | List all text annotations (with optional filter)                                                                                                     | `schematic`             |
 | `add_schematic_text`                  | Add free-form text annotation to schematic                                                                                                           | `schematic`             |
+| `list_schematic_rectangles`           | List rectangles drawn on a sheet (corners, stroke, fill, uuid)                                                                                       | `schematic`             |
+| `set_schematic_rectangle`             | Create, edit or delete a rectangle drawn on a sheet                                                                                                  | `schematic`             |
 | `add_sheet_pin`                       | Add a sheet pin to a hierarchical sheet symbol                                                                                                       | `schematic_hierarchy`   |
 | `assert_connectivity`                 | (no description in source)                                                                                                                           | `schematic`             |
 | `relabel_net`                         | (no description in source)                                                                                                                           | `schematic`             |
@@ -615,12 +623,12 @@ _Source: `src/tools/toolboxes.ts`_
 | Source file              | Section                                | Tools   |
 | ------------------------ | -------------------------------------- | ------- |
 | `project.ts`             | Project and Board Files                | 13      |
-| `board.ts`               | Board Management                       | 21      |
+| `board.ts`               | Board Management                       | 22      |
 | `component.ts`           | Component Management                   | 27      |
 | `routing.ts`             | Routing                                | 20      |
-| `design-rules.ts`        | Design Rules and DRC                   | 7       |
-| `export.ts`              | Export and Fabrication Output          | 25      |
-| `schematic.ts`           | Schematic                              | 48      |
+| `design-rules.ts`        | Design Rules and DRC                   | 9       |
+| `export.ts`              | Export and Fabrication Output          | 27      |
+| `schematic.ts`           | Schematic                              | 51      |
 | `schematic-batch.ts`     | Schematic Batch Operations             | 9       |
 | `schematic-hierarchy.ts` | Hierarchical Sheets                    | 5       |
 | `schematic-layout.ts`    | Schematic Layout and Cosmetics         | 5       |
@@ -646,24 +654,24 @@ _Source: `src/tools/toolboxes.ts`_
 | `jobs.ts`                | jobs.ts                                | 4       |
 | `routing-workflows.ts`   | routing-workflows.ts                   | 5       |
 | `toolboxes.ts`           | toolboxes.ts                           | 3       |
-| **Total**                |                                        | **291** |
+| **Total**                |                                        | **299** |
 
 ## Summary by discovery category
 
-These are the categories `search_tools` searches. They cover 291 of the 291 registered tools.
+These are the categories `search_tools` searches. They cover 299 of the 299 registered tools.
 
 | Category                   | Tools indexed |
 | -------------------------- | ------------- |
-| `board`                    | 21            |
+| `board`                    | 22            |
 | `component`                | 25            |
-| `export`                   | 26            |
-| `drc`                      | 12            |
-| `schematic`                | 38            |
+| `export`                   | 28            |
+| `drc`                      | 14            |
+| `schematic`                | 40            |
 | `library`                  | 9             |
 | `symbol_library`           | 17            |
 | `symbol_pins`              | 3             |
 | `schematic_hierarchy`      | 7             |
-| `schematic_layout`         | 12            |
+| `schematic_layout`         | 13            |
 | `schematic_batch`          | 7             |
 | `routing`                  | 20            |
 | `inspection`               | 4             |
@@ -679,6 +687,6 @@ These are the categories `search_tools` searches. They cover 291 of the 291 regi
 | `digikey`                  | 3             |
 | `gui-driver`               | 11            |
 | `snapshots`                | 4             |
-| **Indexed total**          | **291**       |
+| **Indexed total**          | **299**       |
 | Registered but not indexed | 0             |
-| **Registered total**       | **291**       |
+| **Registered total**       | **299**       |

@@ -255,7 +255,8 @@ def test_create_netclass_persists_patterns_and_assigns_in_memory(pcbnew, tmp_pat
     assert result["assignments"][0]["matchedNets"] == ["/Power/+5V"]
 
     data = json.loads(pro.read_text())
-    assert {"netclass": "Power", "pattern": "/Power/+5V"} in data["net_settings"][
+    # Written as a literal pattern (KiCad reads patterns as regular expressions).
+    assert {"netclass": "Power", "pattern": r"/Power/\+5V"} in data["net_settings"][
         "netclass_patterns"
     ]
     net = board.GetNetInfo().NetsByName()["/Power/+5V"]

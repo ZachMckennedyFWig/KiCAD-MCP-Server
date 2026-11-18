@@ -15,30 +15,28 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from commands.symbol_creator import KICAD9_SYMBOL_LIB_VERSION, _invalidate_symbol_caches
+from commands.symbol_creator import _invalidate_symbol_caches, symbol_lib_header
+from utils.sexpr_format import match_paren, paren_delta
 
 logger = logging.getLogger("kicad_interface")
 
-_NEW_LIB_HEADER = (
-    "(kicad_symbol_lib\n"
-    f"\t(version {KICAD9_SYMBOL_LIB_VERSION})\n"
-    '\t(generator "kicad-mcp")\n'
-    '\t(generator_version "9.0")\n'
-    ")\n"
-)
+
+def _new_lib_header(out_path: Path) -> str:
+    """Header for a new .kicad_sym at *out_path*: the project's own format."""
+    version, generator_version = symbol_lib_header(str(out_path.parent))
+    return (
+        "(kicad_symbol_lib\n"
+        f"\t(version {version})\n"
+        '\t(generator "kicad-mcp")\n'
+        f'\t(generator_version "{generator_version}")\n'
+        ")\n"
+    )
 
 
 def _extract_paren_block(text: str, start: int) -> str:
     """Extract a balanced () block starting at position `start`."""
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "(":
-            depth += 1
-        elif text[i] == ")":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return ""
+    end = match_paren(text, start)
+    return text[start : end + 1] if end != -1 else ""
 
 
 def _find_symbol_block(content: str, name: str) -> Optional[Tuple[int, int, str]]:
@@ -52,13 +50,7 @@ def _find_symbol_block(content: str, name: str) -> Optional[Tuple[int, int, str]
     pattern = re.compile(r'\(symbol "' + re.escape(name) + r'"')
     for m in pattern.finditer(content):
         pos = m.start()
-        depth = 0
-        for i in range(pos):
-            if content[i] == "(":
-                depth += 1
-            elif content[i] == ")":
-                depth -= 1
-        if depth != 1:
+        if paren_delta(content[:pos]) != 1:
             continue
         block = _extract_paren_block(content, pos)
         if block:
@@ -133,7 +125,7 @@ class LibraryManagementCommands:
             tgt_content = tgt.read_text(encoding="utf-8")
         else:
             tgt.parent.mkdir(parents=True, exist_ok=True)
-            tgt_content = _NEW_LIB_HEADER
+            tgt_content = _new_lib_header(tgt)
 
         if _find_symbol_block(tgt_content, new_name):
             if not overwrite:
@@ -193,7 +185,8 @@ class LibraryManagementCommands:
         _, _, block = found
 
         # Wrap in a new library shell (header before the block, then close).
-        new_lib = _NEW_LIB_HEADER[: _NEW_LIB_HEADER.rfind(")")] + block + "\n)\n"
+        header = _new_lib_header(out)
+        new_lib = header[: header.rfind(")")] + block + "\n)\n"
 
         out.parent.mkdir(parents=True, exist_ok=True)
         with out.open("w", encoding="utf-8", newline="\n") as f:

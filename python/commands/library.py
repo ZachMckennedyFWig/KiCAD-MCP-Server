@@ -18,6 +18,17 @@ from utils.platform_helper import PlatformHelper
 logger = logging.getLogger("kicad_interface")
 
 
+def footprint_name_pattern(pattern: str) -> "re.Pattern[str]":
+    """Compile a footprint-name search pattern.
+
+    The pattern matches anywhere in a name, case-insensitively. ``*`` matches
+    any run of characters and every other character is literal, so ``3x14+6``
+    and ``0.5`` mean what they say and an unbalanced ``(`` is not an error.
+    """
+    parts = (re.escape(part) for part in pattern.split("*"))
+    return re.compile(".*".join(parts), re.IGNORECASE)
+
+
 class LibraryManager:
     """
     Manages KiCAD footprint libraries
@@ -58,28 +69,15 @@ class LibraryManager:
         logger.info(f"Loaded {len(self.libraries)} footprint libraries")
 
     def _get_global_fp_lib_table(self) -> Optional[Path]:
-        """Get path to global fp-lib-table file"""
-        # Try different possible locations
-        kicad_config_paths = [
-            Path.home() / ".config" / "kicad" / "10.0" / "fp-lib-table",
-            Path.home() / ".config" / "kicad" / "9.0" / "fp-lib-table",
-            Path.home() / ".config" / "kicad" / "8.0" / "fp-lib-table",
-            Path.home() / ".config" / "kicad" / "fp-lib-table",
-            # Windows paths
-            Path.home() / "AppData" / "Roaming" / "kicad" / "10.0" / "fp-lib-table",
-            Path.home() / "AppData" / "Roaming" / "kicad" / "9.0" / "fp-lib-table",
-            Path.home() / "AppData" / "Roaming" / "kicad" / "8.0" / "fp-lib-table",
-            # macOS paths
-            Path.home() / "Library" / "Preferences" / "kicad" / "10.0" / "fp-lib-table",
-            Path.home() / "Library" / "Preferences" / "kicad" / "9.0" / "fp-lib-table",
-            Path.home() / "Library" / "Preferences" / "kicad" / "8.0" / "fp-lib-table",
-        ]
+        """The global fp-lib-table to read.
 
-        for path in kicad_config_paths:
-            if path.exists():
-                return path
+        Shares discovery with the table editor: it honours ``KICAD_CONFIG_HOME``,
+        ``XDG_CONFIG_HOME`` and ``APPDATA``. Before KiCad has created a user
+        table, it falls back to KiCad's stock template table.
+        """
+        from commands.library_tables import global_table_for_reading
 
-        return None
+        return global_table_for_reading("footprint")
 
     def _parse_fp_lib_table(
         self,
@@ -350,29 +348,33 @@ class LibraryManager:
             logger.warning(f"Footprint not found in any library: {footprint_name}")
             return None
 
-    def search_footprints(self, pattern: str, limit: int = 20) -> List[Dict[str, str]]:
+    def search_footprints(
+        self, pattern: str, limit: int = 20, library: Optional[str] = None
+    ) -> List[Dict[str, str]]:
         """
         Search for footprints matching a pattern
 
         Args:
-            pattern: Search pattern (supports wildcards *, case-insensitive)
+            pattern: Matched anywhere in the name, case-insensitively; ``*``
+                is a wildcard and every other character is literal
             limit: Maximum number of results to return
+            library: Only search this library nickname (case-insensitive)
 
         Returns:
             List of dicts with 'library', 'footprint', and 'full_name' keys
         """
         results = []
-        pattern_lower = pattern.lower()
+        regex = footprint_name_pattern(pattern)
 
-        # Convert wildcards to regex
-        regex_pattern = pattern_lower.replace("*", ".*")
-        regex = re.compile(regex_pattern)
+        nicknames = list(self.libraries.keys())
+        if library:
+            nicknames = [n for n in nicknames if n.lower() == library.lower()]
 
-        for library_nickname in self.libraries.keys():
+        for library_nickname in nicknames:
             footprints = self.list_footprints(library_nickname)
 
             for footprint in footprints:
-                if regex.search(footprint.lower()):
+                if regex.search(footprint):
                     results.append(
                         {
                             "library": library_nickname,
@@ -444,16 +446,10 @@ class LibraryCommands:
             limit = params.get("limit", 20)
             library_filter = params.get("library")
 
-            results = self.library_manager.search_footprints(
-                pattern, limit * 10 if library_filter else limit
-            )
-
-            # Filter by library if specified
-            if library_filter:
-                results = [
-                    r for r in results if r.get("library", "").lower() == library_filter.lower()
-                ]
-                results = results[:limit]
+            # Restrict the scan itself: filtering a capped all-library result
+            # afterwards dropped every match from libraries listed late in the
+            # table (e.g. a user library after the ~150 stock ones).
+            results = self.library_manager.search_footprints(pattern, limit, library_filter)
 
             return {
                 "success": True,
@@ -470,19 +466,41 @@ class LibraryCommands:
             }
 
     def list_library_footprints(self, params: Dict) -> Dict:
-        """List all footprints in a specific library"""
+        """List the footprints in a library, optionally filtered and capped.
+
+        ``filter`` keeps names containing it, case-insensitively, with ``*`` as
+        a wildcard; every other character is literal. ``limit`` caps the list
+        after filtering. ``count`` is the number returned and ``total`` the
+        number that matched before the cap.
+        """
         try:
             library = params.get("library") or params.get("library_name")
             if not library:
                 return {"success": False, "message": "Missing library parameter"}
 
-            footprints = self.library_manager.list_footprints(library)
+            limit = params.get("limit")
+            if limit is not None and (
+                isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+            ):
+                return {"success": False, "message": "limit must be a positive integer"}
+
+            footprints = sorted(self.library_manager.list_footprints(library), key=str.casefold)
+
+            name_filter = params.get("filter")
+            if name_filter:
+                regex = footprint_name_pattern(name_filter)
+                footprints = [name for name in footprints if regex.search(name)]
+
+            total = len(footprints)
+            if limit is not None:
+                footprints = footprints[:limit]
 
             return {
                 "success": True,
                 "library": library,
                 "footprints": footprints,
                 "count": len(footprints),
+                "total": total,
             }
         except Exception as e:
             logger.error(f"Error listing library footprints: {e}")

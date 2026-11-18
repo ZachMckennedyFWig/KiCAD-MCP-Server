@@ -355,6 +355,62 @@
       "$schema": "http://json-schema.org/draft-07/schema#"
     }
   },
+  "add_copper_keepout": {
+    "name": "add_copper_keepout",
+    "description": "Add a live KiCad rule area that excludes copper zone fill on the selected enabled copper layers. Tracks, vias, pads and footprints remain allowed. Requires an open PCB editor; save the board separately.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "boardPath": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact .kicad_pcb path open in the PCB editor"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Name shown for the rule area"
+        },
+        "layers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "description": "Exact enabled copper layers, for example F.Cu, In1.Cu, B.Cu"
+        },
+        "points": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "additionalProperties": false
+          },
+          "minItems": 3,
+          "description": "Simple polygon vertices in millimetres, without a repeated closing vertex"
+        }
+      },
+      "required": [
+        "boardPath",
+        "name",
+        "layers",
+        "points"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
   "add_copper_pour": {
     "name": "add_copper_pour",
     "description": "Add a copper pour (ground/power plane) to the PCB. Coordinates and sizes are mm. For several layers or a named zone use add_zone. Returns {success, message, pour: {layer, net, clearance, minWidth, priority, fillType, pointCount, padConnection?, ...}}.",
@@ -395,11 +451,20 @@
         },
         "priority": {
           "type": "integer",
-          "description": "Zone priority; higher fills first (default 0)"
+          "minimum": 0,
+          "description": "Zone priority (default 0). Overlapping zones on one layer need distinct priorities; the higher one fills first."
         },
         "minWidth": {
           "type": "number",
           "description": "Minimum copper width in mm (default 0.2)"
+        },
+        "fillType": {
+          "type": "string",
+          "enum": [
+            "solid",
+            "hatched"
+          ],
+          "description": "Fill style (default solid)"
         },
         "padConnection": {
           "type": "string",
@@ -409,7 +474,7 @@
             "none",
             "thermal_tht"
           ],
-          "description": "How pads connect to the pour"
+          "description": "How pads of the zone's net connect: thermal reliefs (default), solid copper (for high-current pads), not at all, or thermal reliefs on through-hole pads only"
         },
         "thermalGap": {
           "type": "number",
@@ -1142,13 +1207,33 @@
           "description": "Label text (e.g. 'SD_CLK') — must match the sheet pin name"
         },
         "position": {
-          "type": "array",
-          "items": {
-            "type": "number"
-          },
-          "minItems": 2,
-          "maxItems": 2,
-          "description": "Position [x, y] in mm"
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            },
+            {
+              "type": "object",
+              "properties": {
+                "x": {
+                  "type": "number"
+                },
+                "y": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "x",
+                "y"
+              ],
+              "additionalProperties": false
+            }
+          ],
+          "description": "Position in mm, as [x, y] or {x, y}"
         },
         "shape": {
           "type": "string",
@@ -1189,13 +1274,33 @@
           "description": "Name of the net (e.g., VCC, GND, SIGNAL_1)"
         },
         "position": {
-          "type": "array",
-          "items": {
-            "type": "number"
-          },
-          "minItems": 2,
-          "maxItems": 2,
-          "description": "Position [x, y] for the label. Required when componentRef/pinNumber are not given."
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            },
+            {
+              "type": "object",
+              "properties": {
+                "x": {
+                  "type": "number"
+                },
+                "y": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "x",
+                "y"
+              ],
+              "additionalProperties": false
+            }
+          ],
+          "description": "Position for the label in mm, as [x, y] or {x, y}. Required when componentRef/pinNumber are not given."
         },
         "componentRef": {
           "type": "string",
@@ -1245,13 +1350,33 @@
           "description": "Text content to display"
         },
         "position": {
-          "type": "array",
-          "items": {
-            "type": "number"
-          },
-          "minItems": 2,
-          "maxItems": 2,
-          "description": "Position [x, y] in schematic mm coordinates"
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            },
+            {
+              "type": "object",
+              "properties": {
+                "x": {
+                  "type": "number"
+                },
+                "y": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "x",
+                "y"
+              ],
+              "additionalProperties": false
+            }
+          ],
+          "description": "Position in schematic mm coordinates, as [x, y] or {x, y}"
         },
         "angle": {
           "type": "number",
@@ -1356,13 +1481,33 @@
           "description": "Signal direction (should match the sub-sheet hierarchical label shape)"
         },
         "position": {
-          "type": "array",
-          "items": {
-            "type": "number"
-          },
-          "minItems": 2,
-          "maxItems": 2,
-          "description": "Pin position [x, y] in mm — must be on the sheet block boundary"
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            },
+            {
+              "type": "object",
+              "properties": {
+                "x": {
+                  "type": "number"
+                },
+                "y": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "x",
+                "y"
+              ],
+              "additionalProperties": false
+            }
+          ],
+          "description": "Pin position in mm, as [x, y] or {x, y} — must be on the sheet block boundary"
         },
         "orientation": {
           "type": "number",
@@ -1808,6 +1953,28 @@
       "$schema": "http://json-schema.org/draft-07/schema#"
     }
   },
+  "audit_via_nets": {
+    "name": "audit_via_nets",
+    "description": "Compare every via's net in the saved board with a reference board (a .kicad_pcb file or a git revision such as HEAD) and list vias whose net changed, plus vias added, removed or moved. KiCad can silently change a via's net on save (e.g. to a surrounding zone's net, or after an autorouter import), and DRC does not flag it because the board stays self-consistent. Run after saving, autorouting or importing a session.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "reference": {
+          "type": "string",
+          "description": "Known-good version of the board: a .kicad_pcb path, or a git revision of the same file (HEAD, HEAD~1, a sha)"
+        },
+        "boardPath": {
+          "type": "string",
+          "description": "Board file to audit; defaults to the loaded board's file on disk"
+        }
+      },
+      "required": [
+        "reference"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
   "autoplace_schematic_fields": {
     "name": "autoplace_schematic_fields",
     "description": "Automatically reposition every component's Reference and Value field so they sit outside the component body AND outside any net labels attached to its pins, avoiding collisions with other components and already-placed fields. Like KiCAD's built-in field auto-placement but net-label aware. Optionally limit to specific references.",
@@ -1857,7 +2024,12 @@
         },
         "timeout": {
           "type": "number",
-          "description": "Per-attempt timeout in seconds (default: 300)"
+          "description": "Per-attempt timeout in seconds (default: 300). Freerouting is killed when it is reached and nothing it routed is kept, so the router is given a shorter time budget of its own (see jobTimeout)."
+        },
+        "jobTimeout": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Time in seconds Freerouting may spend routing before it stops by itself and writes what it has routed (--router.job_timeout). Default: `timeout` minus a tenth of it (at least 60 s, at most 120 s); no default budget with a `timeout` under 120 s, where it would cut off runs that finish in time. Needs Freerouting 2.4 or later: older versions stop at the budget but write no session file. The result has time_budget_reached: true when routing stopped this way; the board then holds a partial routing. 0 passes no time budget."
         },
         "attempts": {
           "type": "integer",
@@ -1877,6 +2049,47 @@
             "type": "number"
           },
           "description": "Per-attempt `--max-passes` values to cycle through (default: [50, 60, 65, 70, 75, 80, 85, 90, 55, 95]). The list wraps if `attempts` exceeds its length."
+        },
+        "routerSettings": {
+          "type": "object",
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": [
+                    "string",
+                    "number",
+                    "boolean"
+                  ]
+                }
+              }
+            ]
+          },
+          "description": "Freerouting router settings for this run, by the names in Freerouting's docs/settings.md under `router`; each is passed as --router.<name>=<value>, a list joined with commas. Examples: {\"autorouter.priority_net_classes\": [\"DIFF\", \"ANALOG\"]} routes those net classes first and keeps other nets from ripping them; {\"autorouter.plane_as_priority\": true} gives each plane pad a via of its own into its plane (the plane's layer must be of type power); {\"autorouter.ignore_net_classes\": [\"HV\"]}. Which settings exist depends on the Freerouting version: priority_net_classes and plane_as_priority are on Freerouting master only (merged 2026-11-07), not in a v2 release. Freerouting skips a setting it does not know and keeps routing; the reply lists those in router_settings_rejected. Use maxPasses and jobTimeout for those two. With attempts above 1 the thread count (max_threads, autorouter.max_threads, optimizer.max_threads) is refused: best-of-N runs single-threaded so the attempts stay comparable."
+        },
+        "routeNets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Route only these nets (names or globs such as '/HV PWR/*'). Other nets stay on the board as obstacles but are left out of the routing job, so a board can be routed one isolation domain at a time."
+        },
+        "excludeNets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Leave these nets (names or globs) out of the routing job, e.g. high-current nets you will pour by hand."
         },
         "keepArtifacts": {
           "type": "boolean",
@@ -1993,6 +2206,20 @@
         "lockRouted": {
           "type": "boolean",
           "description": "Lock the newly routed tracks/vias (default false)"
+        },
+        "layerTraceCosts": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number"
+          },
+          "description": "Per-layer trace cost factor, e.g. {\"In1.Cu\": 5}: the layer stays usable but a track there costs more (the factor along its preferred direction, twice that against it; Freerouting's defaults are about 1 and 2), so a plane layer carries only the tracks that fit nowhere else. Keys are canonical (In1.Cu) or the board's own layer names; a name the board lacks is refused. Combines with signalLayers; written to the same Freerouting rules file."
+        },
+        "signalLayers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Copper layers tracks may use, e.g. [\"F.Cu\", \"In2.Cu\", \"B.Cu\"] when In1 is a plane; canonical names or the board's own (a renamed F.Cu is found either way), and a name the board lacks is refused. The other copper layers get (active off) in a Freerouting rules file (autoroute_settings layer_rule, passed with -dr): no tracks there, vias still pass through, so a plane is not cut into islands. Nothing else is written to the file, so Freerouting's own per-layer defaults stay in force. The reply lists the restricted layers by the board's names in tracksKeptOffLayers. Default: all layers."
         }
       },
       "additionalProperties": false,
@@ -2115,6 +2342,10 @@
             "auto"
           ],
           "description": "Label scope, overrides labelType: 'local' = label, 'global' = global_label, 'auto' = per net, a global label when the net name is already used on another sheet of the hierarchy (or as a global label on this sheet), else a local label. Omit to use labelType."
+        },
+        "stubLength": {
+          "type": "number",
+          "description": "Wire stub (mm) between each pin and its label, as in batch_connect (default 0)"
         },
         "origin_x": {
           "type": "number"
@@ -2258,7 +2489,7 @@
   },
   "batch_connect": {
     "name": "batch_connect",
-    "description": "Place net labels on multiple pins in one call to wire nets quickly. 'connections' is a map {reference: {pin: netName}} where pin is a number or name. labelType selects 'label' (sheet-local, the default) or 'global_label' (connects across all sheets by name — use this for power rails and any net that spans sheets). For local labels, if a facing label for the same net is nearby an orthogonal wire (straight, or a Z with a grid-snapped jog — never diagonal) is drawn instead of a duplicate label; when that wire would land on or cross another object a plain label is placed instead. Global labels are placed one-per-pin since they join their net by name. On two-pin parts a label whose text would overlap a visible Reference/Value field is moved 2.54 or 5.08 mm out along the pin with a stub wire (avoidFieldOverlap, default true). scope='auto' picks global_label per net when the name is already used on another sheet of the hierarchy, else a local label (each placed row then reports labelType). Set replace=true to remove every existing label (local, global, hierarchical) on each pin first, plus a wire run from the pin that ends at a label of another net (e.g. an earlier auto-wire to another pin's label) when nothing else hangs off it. Coordinates are schematic mm, origin top-left, Y down. Returns {success, message, placed:[{ref, pin, net, position:{x,y}, label_position?, wire?, note?, replaced?}], failed:[{ref, pin, reason}], warnings?}. Warns only about nets touched by this call that hold a power_in pin and no power_out pin (PWR_FLAG or regulator output) anywhere in the sheet hierarchy.",
+    "description": "Place net labels on multiple pins in one call to wire nets quickly. 'connections' is a map {reference: {pin: netName}} where pin is a number or name. labelType selects 'label' (sheet-local, the default) or 'global_label' (connects across all sheets by name — use this for power rails and any net that spans sheets). For local labels, if a label for the same net lies straight out in front of the pin, on the pin's axis, a straight wire is drawn to it instead of a duplicate label (never diagonal); when that wire would land on or cross another object a plain label is placed instead. stubLength draws a wire that long out of each pin and puts the label at its end. All labels and wires are written in one pass, so a batch never stops half-written. Global labels are placed one-per-pin since they join their net by name. On two-pin parts a label whose text would overlap a visible Reference/Value field is moved 2.54 or 5.08 mm out along the pin with a stub wire (avoidFieldOverlap, default true; an explicit stubLength wins). scope='auto' picks global_label per net when the name is already used on another sheet of the hierarchy, else a local label (each placed row then reports labelType). Set replace=true to remove every existing label (local, global, hierarchical) on each pin first, an earlier run's stub wire and the label at its end, plus a wire run from the pin that ends at a label of another net (e.g. an earlier auto-wire to another pin's label) when nothing else hangs off it; removals happen in the same write as the new labels. Coordinates are schematic mm, origin top-left, Y down. Returns {success, message, placed:[{ref, pin, net, position:{x,y}, label_position?, wire?, note?, replaced?}], failed:[{ref, pin, reason}], warnings?}. Warns only about nets touched by this call that hold a power_in pin and no power_out pin (PWR_FLAG or regulator output) anywhere in the sheet hierarchy.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2302,7 +2533,11 @@
         "avoidFieldOverlap": {
           "type": "boolean",
           "default": true,
-          "description": "On two-pin parts, move a label out along the pin (with a stub wire) when its text would overlap a visible Reference/Value field (default true)"
+          "description": "On two-pin parts, move a label out along the pin (with a stub wire) when its text would overlap a visible Reference/Value field (default true). Not applied when stubLength is given."
+        },
+        "stubLength": {
+          "type": "number",
+          "description": "Draw a wire this long (mm) out of each pin and put the label at its end, so the label doesn't sit on the pin number and name. 2.54 is typical; default 0 (label on the pin)."
         }
       },
       "required": [
@@ -2811,6 +3046,28 @@
           "description": "Extra pad bbox clearance in mm"
         }
       },
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  "check_schematic_legibility": {
+    "name": "check_schematic_legibility",
+    "description": "Checks whether a person can read a schematic sheet: what ERC and a netlist cannot see. Boxes every symbol body, visible reference/value, label and free text and reports text over text (a symbol's own fields included), text over another symbol's body, a symbol's own field across a drawn line of its body (inside an IC's rectangle or beside a capacitor's plates is fine), body over body, a wire through a text (a label's own wire only touches its edge), items on the title block or outside the frame, and a field stored upside down. Each problem comes with its box in sheet mm; look at it with get_schematic_view_region.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "schematicPath": {
+          "type": "string",
+          "description": "Path to the .kicad_sch sheet to check (one sheet)"
+        },
+        "maxProblems": {
+          "type": "number",
+          "description": "Most problems to list (default 200); counts always cover all"
+        }
+      },
+      "required": [
+        "schematicPath"
+      ],
       "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     }
@@ -3923,21 +4180,33 @@
           "description": "Name of the net label to remove"
         },
         "position": {
-          "type": "object",
-          "properties": {
-            "x": {
-              "type": "number"
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 2,
+              "maxItems": 2
             },
-            "y": {
-              "type": "number"
+            {
+              "type": "object",
+              "properties": {
+                "x": {
+                  "type": "number"
+                },
+                "y": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "x",
+                "y"
+              ],
+              "additionalProperties": false
             }
-          },
-          "required": [
-            "x",
-            "y"
           ],
-          "additionalProperties": false,
-          "description": "Position to disambiguate if multiple labels with same name"
+          "description": "Position in mm, as [x, y] or {x, y}, to disambiguate if multiple labels share the name"
         }
       },
       "required": [
@@ -6980,7 +7249,7 @@
   },
   "find_wires_crossing_symbols": {
     "name": "find_wires_crossing_symbols",
-    "description": "Find all wires that cross over component symbol bodies. Wires passing over symbols are unacceptable in schematics — they indicate routing mistakes where a wire was drawn across a component instead of around it.",
+    "description": "Find all wires that cross over component symbol bodies. Wires passing over symbols are unacceptable in schematics — they indicate routing mistakes where a wire was drawn across a component instead of around it. Also lists, under pinsOnWireInterior (with pinsOnWireInteriorCount), every symbol pin, power pins included, that lies on the middle of a wire without being connected to it: KiCad joins a pin to a wire only where the wire ends or where a junction sits on the pin, so a label there does not connect it to the wire. collisions and count are unchanged.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -8884,7 +9153,7 @@
   },
   "list_library_footprints": {
     "name": "list_library_footprints",
-    "description": "List all footprints in a specific KiCAD library",
+    "description": "List footprints in a KiCAD library, sorted by name; returns the first 100 unless `limit` is set",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -8894,12 +9163,13 @@
         },
         "filter": {
           "type": "string",
-          "description": "Optional filter pattern for footprint names"
+          "description": "Keep names containing this text (case-insensitive, * as a wildcard)"
         },
         "limit": {
-          "type": "number",
+          "type": "integer",
+          "minimum": 1,
           "default": 100,
-          "description": "Maximum number of footprints to list"
+          "description": "Maximum number of footprints to list (default 100)"
         }
       },
       "required": [
@@ -9033,6 +9303,24 @@
   "list_schematic_nets": {
     "name": "list_schematic_nets",
     "description": "List all nets in the schematic with their connections.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "schematicPath": {
+          "type": "string",
+          "description": "Path to the .kicad_sch file"
+        }
+      },
+      "required": [
+        "schematicPath"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  "list_schematic_rectangles": {
+    "name": "list_schematic_rectangles",
+    "description": "List the rectangles drawn on a schematic sheet (graphic boxes, such as a titled box around a group of parts). Returns each one's uuid, start and end corners in mm, stroke and fill, plus the corner radius and locked flag when KiCad wrote them. Rectangles inside symbol bodies are not included. Use the uuid with set_schematic_rectangle to move, resize, restyle or delete one.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -11890,7 +12178,7 @@
       "properties": {
         "search_term": {
           "type": "string",
-          "description": "Search term or pattern to match footprint names"
+          "description": "Text to find in footprint names (case-insensitive, * as a wildcard)"
         },
         "library": {
           "type": "string",
@@ -12486,6 +12774,119 @@
       "$schema": "http://json-schema.org/draft-07/schema#"
     }
   },
+  "set_schematic_rectangle": {
+    "name": "set_schematic_rectangle",
+    "description": "Create, change or delete a rectangle drawn on a schematic sheet. Without uuid it creates one from start and end (corners in mm) and returns its uuid. With uuid it changes only the fields given (start, end, stroke, fill); a stroke or fill given in part keeps the rest. With uuid and delete: true it removes the rectangle. An unknown uuid is an error that lists the rectangles on the sheet (see list_schematic_rectangles). A corner radius is not written, because KiCad 9 cannot load one; an existing radius is kept when a rectangle is edited.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "schematicPath": {
+          "type": "string",
+          "description": "Path to the .kicad_sch file"
+        },
+        "uuid": {
+          "type": "string",
+          "description": "Rectangle to change or delete; leave out to create a new one"
+        },
+        "start": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            },
+            {
+              "type": "object",
+              "properties": {
+                "x": {
+                  "type": "number"
+                },
+                "y": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "x",
+                "y"
+              ],
+              "additionalProperties": false
+            }
+          ],
+          "description": "First corner in mm, as [x, y] or {x, y}"
+        },
+        "end": {
+          "$ref": "#/properties/start",
+          "description": "Opposite corner in mm, as [x, y] or {x, y}"
+        },
+        "stroke": {
+          "type": "object",
+          "properties": {
+            "width": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Line width in mm; 0 (default) is KiCad's default width"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "default",
+                "solid",
+                "dash",
+                "dot",
+                "dash_dot",
+                "dash_dot_dot"
+              ],
+              "description": "Line style (default: default)"
+            },
+            "color": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 4,
+              "maxItems": 4,
+              "description": "[r, g, b, a]: r, g, b from 0 to 255 and a (opacity) from 0 to 1"
+            }
+          },
+          "additionalProperties": false,
+          "description": "Outline style"
+        },
+        "fill": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "none",
+                "outline",
+                "background",
+                "color"
+              ],
+              "description": "none (default), outline, background, or color (needs fill.color)"
+            },
+            "color": {
+              "$ref": "#/properties/stroke/properties/color",
+              "description": "[r, g, b, a]: r, g, b from 0 to 255 and a (opacity) from 0 to 1"
+            }
+          },
+          "additionalProperties": false,
+          "description": "Fill style"
+        },
+        "delete": {
+          "type": "boolean",
+          "description": "With uuid: remove the rectangle (no other fields allowed)"
+        }
+      },
+      "required": [
+        "schematicPath"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
   "set_sheet_property": {
     "name": "set_sheet_property",
     "description": "Add or update a custom property on a hierarchical sheet's (sheet ...) block — e.g. cell identity or generator parameters carried as sheet metadata. Identify the sheet by sheetName or sheetPath (basename match against the sheet's file property). The property is created hidden if absent, otherwise its value is updated in place; the file's formatting is preserved. The built-in 'Sheet name'/'Sheet file' properties cannot be set here — use add/remove_hierarchical_sheet to manage the sheet link.",
@@ -12655,6 +13056,152 @@
       },
       "required": [
         "libraryPath"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  "set_voltage_clearance_rules": {
+    "name": "set_voltage_clearance_rules",
+    "description": "Write clearance and creepage rules graded by the working voltage between net classes, as a managed block in the board's .kicad_dru.\n\nGive each net class its potential against one shared reference: a single number for a node that stays at one potential, or [min, max] for a node that swings (a half-bridge switch node going 0 to 800 V is [0, 800]). The working voltage between two classes is the largest difference their ranges can show, max(|maxA - minB|, |maxB - minA|), which is |Va - Vb| for two fixed nodes. A swinging node given only its maximum is under-spaced against the bus it swings to (800 vs 800 reads as 0 V), so use the range. Use 'pairs' to set the working voltage of one pair directly, for classes in separate domains, for example across an isolation barrier.\n\n'spacing' maps working voltage to the required clearance and (optionally) creepage. Choose its values from your standard (e.g. IPC-2221 or IEC 60664) and your coating or potting; the tool does not supply them. Under IEC 60664-1 clearance follows from the impulse/peak voltage and creepage from the RMS working voltage, so the voltage you key the table by must suit both columns. Once a row gives a creepage, every higher row must too.\n\nOne rule is written per pair of classes, plus one per class against all other nets (at otherNetsVoltage, default 0 V). A re-run replaces the block and leaves other rules alone. The write is refused if the rest of the .kicad_dru does not parse, because KiCad silently ignores every rule in a file it cannot parse. Classes not defined in the project are reported in warnings. Rules apply from the next DRC run. Needs KiCad 9 or newer (creepage constraint, hasNetclass); on KiCad 8 the tool refuses and writes nothing.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "classes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Net class name (must exist in the project)"
+              },
+              "voltage": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "number"
+                      }
+                    ]
+                  }
+                ],
+                "description": "Potential (V) against the shared reference: a number for a fixed node, [min, max] for one that swings"
+              }
+            },
+            "required": [
+              "name",
+              "voltage"
+            ],
+            "additionalProperties": false
+          },
+          "minItems": 1,
+          "description": "Net classes and their voltages"
+        },
+        "spacing": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "upTo": {
+                "type": "number",
+                "description": "Working voltage (V) this row covers, up to and including"
+              },
+              "clearance": {
+                "type": "number",
+                "description": "Minimum clearance (mm)"
+              },
+              "creepage": {
+                "type": "number",
+                "description": "Minimum creepage (mm)"
+              }
+            },
+            "required": [
+              "upTo",
+              "clearance"
+            ],
+            "additionalProperties": false
+          },
+          "minItems": 1,
+          "description": "Spacing table; spacing must not fall as voltage rises, and a row with creepage must not be followed by one without"
+        },
+        "pairs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "a": {
+                "type": "string"
+              },
+              "b": {
+                "type": "string"
+              },
+              "voltage": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "a",
+              "b",
+              "voltage"
+            ],
+            "additionalProperties": false
+          },
+          "description": "Explicit working voltage (V) between two classes, overriding the computed one"
+        },
+        "otherNetsVoltage": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 2,
+                  "items": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "number"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Potential of nets in none of the classes, a number or [min, max] (default 0); null skips those rules"
+        },
+        "excludeUnconnectedNets": {
+          "type": "boolean",
+          "description": "Leave KiCad's unconnected-(...) nets (unwired pins) out of the 'other nets' rules. Default false: an unwired pin of a low-voltage part sits near that part's potential and needs the full spacing. Turn on only when the unwired pins near the high-voltage copper belong to the high-voltage parts themselves"
+        },
+        "boardPath": {
+          "type": "string",
+          "description": "Board .kicad_pcb (default: the loaded board)"
+        },
+        "dryRun": {
+          "type": "boolean",
+          "description": "Return the planned rules without writing"
+        }
+      },
+      "required": [
+        "classes",
+        "spacing"
       ],
       "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
@@ -13375,7 +13922,7 @@
   },
   "sync_schematic_to_board": {
     "name": "sync_schematic_to_board",
-    "description": "Import the schematic netlist into the PCB board — equivalent to pressing F8 in KiCAD (Tools → Update PCB from Schematic). MUST be called after the schematic is complete and before placing or routing components on the PCB. Without this step, the board has no footprints and no net assignments — place_component and route_pad_to_pad will produce an empty, unroutable board. Works from kicad-cli's XML netlist: adds missing footprints (at the origin), swaps footprints whose schematic Footprint field changed (updateFootprints), re-nets every numbered pad (a pad its symbol has no pin for is disconnected, as in F8; generated 'unconnected-(...)' names escape '/' as {slash}), and syncs Value, Datasheet, Description and custom fields (e.g. LCSC), DNP, exclude-from-BOM and the schematic link. Footprints whose symbol is gone are always reported (footprints_without_symbol) and removed only with removeExtra=true; board-only footprints are never touched. dryRun=true returns the same report without changing or saving the board. Returns {success, dryRun, message, footprints_added, footprints_replaced, footprints_mismatched, footprints_removed, footprints_without_symbol, field_updates:[{reference, changes:[{what, from, to}]}], nets_added, pad_net_changes:[{pad, from, to}], pads_cleared, unmatched_pads, warnings}.",
+    "description": "Import the schematic netlist into the PCB board — equivalent to pressing F8 in KiCAD (Tools → Update PCB from Schematic). MUST be called after the schematic is complete and before placing or routing components on the PCB. Without this step, the board has no footprints and no net assignments — place_component and route_pad_to_pad will produce an empty, unroutable board. Nets come from kicad-cli's netlist (netSource), with the built-in sheet walker as a fallback. Adds missing footprints, renames footprints whose symbol was re-annotated (matched by symbol path), carries values, fields, DNP and exclude-from-BOM to the board (new fields hidden on Fab), and re-nets every pad; a pad its symbol has no pin for is cleared, as in F8. Footprints whose library ID differs are listed in footprint_changes_pending and swapped only with replaceFootprints; parts with no symbol are deleted only with deleteUnusedFootprints. dryRun=true previews against the board file on disk and writes nothing. Returns {success, dryRun, message, netSource, pads_changed, pads_changed_count, footprints_added, footprints_renamed, footprints_updated, footprint_changes_pending, footprints_replaced, footprints_deleted, pads_cleared, nets_added, unmatched_pads, warnings}.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -13387,17 +13934,25 @@
           "type": "string",
           "description": "Absolute path to the .kicad_pcb board file"
         },
-        "updateFootprints": {
-          "type": "boolean",
-          "description": "Replace board footprints whose schematic Footprint field changed, keeping position, rotation, side and nets (default true). false only reports them in footprints_mismatched."
-        },
         "dryRun": {
           "type": "boolean",
-          "description": "Report every change without modifying or saving the board (default false)"
+          "description": "Report every change (pad nets, values, fields, footprints added) without saving. The sync overwrites board values and fields with the schematic's, so preview first on a board that was edited after its last sync."
+        },
+        "replaceFootprints": {
+          "type": "boolean",
+          "description": "Swap footprints whose library ID differs from the symbol's footprint, keeping position, rotation, side and symbol link (KiCad F8: 'Replace footprints with those specified by symbols')."
+        },
+        "deleteUnusedFootprints": {
+          "type": "boolean",
+          "description": "Delete footprints with no symbol in the schematic; board-only and locked footprints are kept, and a footprint whose symbol UUID matches a schematic symbol is renamed to it (re-annotation), never deleted (KiCad F8: 'Delete footprints with no symbols'). Refused, like replaceFootprints, while the board is open in KiCad (session pinned to IPC) unless dryRun."
+        },
+        "updateFootprints": {
+          "type": "boolean",
+          "description": "Deprecated alias of replaceFootprints (used when replaceFootprints is omitted)"
         },
         "removeExtra": {
           "type": "boolean",
-          "description": "Remove footprints whose reference is no longer in the schematic (default false: they are only reported in footprints_without_symbol). Board-only footprints are kept."
+          "description": "Deprecated alias of deleteUnusedFootprints (used when deleteUnusedFootprints is omitted)"
         }
       },
       "required": [

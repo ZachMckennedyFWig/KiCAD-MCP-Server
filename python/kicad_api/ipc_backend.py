@@ -15,6 +15,7 @@ Key Benefits over SWIG:
 """
 
 import logging
+import math
 import os
 import platform
 import threading
@@ -67,6 +68,19 @@ _IPC_LAYER_BY_NUMBER: Dict[int, str] = {
 }
 
 
+def _open_board_path_from_kicad(kicad: Any) -> Optional[str]:
+    """Rebuild a PCB path from kipy's project directory and bare board filename."""
+    # kipy requires an explicit document type. A no-argument call raises TypeError.
+    from kipy.proto.common.types import DocumentType
+
+    for doc in kicad.get_open_documents(DocumentType.DOCTYPE_PCB):
+        name = str(getattr(doc, "board_filename", "") or "")
+        if name.endswith(".kicad_pcb"):
+            root = str(getattr(getattr(doc, "project", None), "path", "") or "")
+            return os.path.join(root, name) if root else name
+    return None
+
+
 def ipc_layer_name(layer: Any) -> str:
     """Canonical KiCad layer name for an IPC layer value.
 
@@ -86,6 +100,91 @@ def ipc_layer_name(layer: Any) -> str:
     except (TypeError, ValueError):
         return text
     return _IPC_LAYER_BY_NUMBER.get(number, text)
+
+
+def _keepout_polygon_mm(points: List[Dict[str, float]]) -> List[tuple[float, float]]:
+    """Validate a simple, non-degenerate polygon before any KiCad mutation."""
+    if not isinstance(points, list) or len(points) < 3:
+        raise ValueError("A keepout needs at least three polygon vertices")
+
+    vertices = []
+    for index, point in enumerate(points):
+        if not isinstance(point, dict):
+            raise ValueError(f"Vertex {index} must contain numeric x and y")
+        x, y = point.get("x"), point.get("y")
+        if (
+            isinstance(x, bool)
+            or isinstance(y, bool)
+            or not isinstance(x, (int, float))
+            or not isinstance(y, (int, float))
+            or not math.isfinite(x)
+            or not math.isfinite(y)
+        ):
+            raise ValueError(f"Vertex {index} must contain finite numeric x and y")
+        vertices.append((float(x), float(y)))
+
+    if len(set(vertices)) != len(vertices):
+        raise ValueError("Keepout vertices must be distinct; omit the closing vertex")
+    area_twice = sum(
+        x1 * y2 - x2 * y1 for (x1, y1), (x2, y2) in zip(vertices, vertices[1:] + vertices[:1])
+    )
+    if abs(area_twice) < 1e-12:
+        raise ValueError("Keepout polygon has zero area")
+
+    def crosses(
+        a: tuple[float, float],
+        b: tuple[float, float],
+        c: tuple[float, float],
+        d: tuple[float, float],
+    ) -> bool:
+        def orient(p: tuple[float, float], q: tuple[float, float], r: tuple[float, float]) -> float:
+            return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+        def on_segment(
+            p: tuple[float, float], q: tuple[float, float], r: tuple[float, float]
+        ) -> bool:
+            return min(p[0], q[0]) <= r[0] <= max(p[0], q[0]) and min(p[1], q[1]) <= r[1] <= max(
+                p[1], q[1]
+            )
+
+        o1, o2, o3, o4 = orient(a, b, c), orient(a, b, d), orient(c, d, a), orient(c, d, b)
+        if o1 == 0 and on_segment(a, b, c) or o2 == 0 and on_segment(a, b, d):
+            return True
+        if o3 == 0 and on_segment(c, d, a) or o4 == 0 and on_segment(c, d, b):
+            return True
+        return (o1 > 0) != (o2 > 0) and (o3 > 0) != (o4 > 0)
+
+    count = len(vertices)
+    for index in range(count):
+        for other in range(index + 1, count):
+            if other == index + 1 or (index == 0 and other == count - 1):
+                continue
+            if crosses(
+                vertices[index],
+                vertices[(index + 1) % count],
+                vertices[other],
+                vertices[(other + 1) % count],
+            ):
+                raise ValueError("Keepout polygon must not cross itself")
+    return vertices
+
+
+def _same_keepout_outline(
+    observed: List[tuple[float, float]], requested: List[tuple[float, float]]
+) -> bool:
+    """Match the same polygon regardless of its first vertex or winding."""
+    if len(observed) != len(requested):
+        return False
+    count = len(requested)
+    for order in (requested, list(reversed(requested))):
+        for offset in range(count):
+            if all(
+                abs(actual_axis - expected_axis) < 1e-6
+                for index, actual in enumerate(observed)
+                for actual_axis, expected_axis in zip(actual, order[(index + offset) % count])
+            ):
+                return True
+    return False
 
 
 def _same_angle(a_deg: float, b_deg: float, tol: float = 1e-6) -> bool:
@@ -303,15 +402,7 @@ class IPCBackend(KiCADBackend):
         if not self.is_connected():
             return None
         try:
-            # kipy requires an explicit doc_type; a no-arg call raises TypeError.
-            # DocumentSpecifier exposes board_filename + project.path, not .path.
-            from kipy.proto.common.types import DocumentType
-
-            for doc in self._kicad.get_open_documents(DocumentType.DOCTYPE_PCB):
-                name = str(getattr(doc, "board_filename", "") or "")
-                if name.endswith(".kicad_pcb"):
-                    root = str(getattr(getattr(doc, "project", None), "path", "") or "")
-                    return os.path.join(root, name) if root else name
+            return _open_board_path_from_kicad(self._kicad)
         except Exception as e:
             logger.debug(f"Could not read open documents via IPC: {e}")
         return None
@@ -460,6 +551,10 @@ class IPCBoardAPI(BoardAPI):
         self._board = None
         self._notify = notify_callback
         self._current_commit = None
+
+    def get_open_board_path(self) -> Optional[str]:
+        """Full path of the PCB document reported by this live IPC connection."""
+        return _open_board_path_from_kicad(self._kicad)
 
     def _get_board(self) -> Any:
         """Get board instance, connecting if needed."""
@@ -1289,6 +1384,286 @@ class IPCBoardAPI(BoardAPI):
             logger.error(f"Failed to add arc track: {e}")
             return False
 
+    def modify_track(
+        self,
+        uuid: str,
+        width: Optional[float] = None,
+        layer: Optional[str] = None,
+        net_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Modify an existing track's width/layer/net in place (live UI update).
+
+        A via UUID works too, as on the SWIG path where board.Tracks()
+        includes vias: width sets the via diameter and net reassigns it.
+
+        Unlike add_track's ``layer_map.get(layer, BL_F_Cu)``, an unrecognized
+        layer or net name here is a reported error, not a silent fallback —
+        modify_trace already shipped once reporting success while writing
+        nothing (#515, SWIG side); silently applying a different layer/net
+        than the one named is the same failure shape with a different cause.
+        """
+        try:
+            from kipy.board_types import Via
+            from kipy.proto.board.board_types_pb2 import BoardLayer
+            from kipy.util.units import from_mm
+
+            board = self._get_board()
+
+            track = None
+            for candidate in [*board.get_tracks(), *board.get_vias()]:
+                # track.id is a KIID message; str() gives protobuf text
+                # format ('value: "..."\n'), so compare the value field.
+                if candidate.id.value == uuid:
+                    track = candidate
+                    break
+
+            if track is None:
+                return {
+                    "success": False,
+                    "message": "Track not found",
+                    "errorDetails": f"No live track or via with uuid '{uuid}'",
+                }
+
+            is_via = isinstance(track, Via)
+            modifications = []
+
+            if width is not None:
+                if is_via:
+                    # Same as SetWidth() on a SWIG via. kipy also resets
+                    # the padstack to PST_NORMAL when it sets the diameter.
+                    track.diameter = from_mm(width)
+                else:
+                    track.width = from_mm(width)
+                modifications.append(f"width={width}mm")
+
+            if layer is not None:
+                if is_via:
+                    return {
+                        "success": False,
+                        "message": "Invalid layer",
+                        "errorDetails": "A via spans layers; 'layer' applies to traces only",
+                    }
+                # kipy enum names follow KiCad's canonical layer names
+                # (In3.Cu -> BL_In3_Cu), which covers all 32 copper layers.
+                enum_name = "BL_" + layer.replace(".", "_")
+                if not layer.endswith(".Cu") or enum_name not in BoardLayer.keys():
+                    return {
+                        "success": False,
+                        "message": "Invalid layer",
+                        "errorDetails": f"'{layer}' is not a copper layer name "
+                        "(expected F.Cu, B.Cu or In1.Cu..In30.Cu)",
+                    }
+                track.layer = BoardLayer.Value(enum_name)
+                modifications.append(f"layer={layer}")
+
+            if net_name is not None:
+                target_net = None
+                for net in board.get_nets():
+                    if net.name == net_name:
+                        target_net = net
+                        break
+                if target_net is None:
+                    return {
+                        "success": False,
+                        "message": "Invalid net",
+                        "errorDetails": f"Net '{net_name}' not found",
+                    }
+                track.net = target_net
+                modifications.append(f"net={net_name}")
+
+            if not modifications:
+                return {
+                    "success": False,
+                    "message": "No modifications specified",
+                    "errorDetails": "Provide at least one of: width, layer, net",
+                }
+
+            commit = board.begin_commit()
+            board.update_items([track])
+            board.push_commit(commit, "Modified track")
+
+            self._notify(
+                "track_modified",
+                {"uuid": uuid, "width": width, "layer": layer, "net": net_name},
+            )
+
+            return {
+                "success": True,
+                "message": f"Modified trace: {', '.join(modifications)}",
+                "uuid": uuid,
+                "modifications": modifications,
+            }
+        except Exception as e:
+            logger.error(f"Failed to modify track: {e}")
+            return {
+                "success": False,
+                "message": "Failed to modify trace",
+                "errorDetails": str(e),
+            }
+
+    # Same pick radius as the SWIG delete_trace: nearest track within 1 mm.
+    _DELETE_PICK_RADIUS_MM = 1.0
+
+    def delete_tracks(
+        self,
+        uuid: Optional[str] = None,
+        position: Optional[Dict[str, Any]] = None,
+        net_name: Optional[str] = None,
+        layer: Optional[str] = None,
+        include_vias: bool = False,
+    ) -> Dict[str, Any]:
+        """Delete tracks, arc tracks or vias from the live board (#553).
+
+        Mirrors the SWIG delete_trace contract (python/commands/routing.py):
+        ``net_name`` bulk-deletes every track on that net (``"*"`` = all nets,
+        vias only with ``include_vias``, ``layer`` filters tracks), else
+        ``uuid`` deletes one track or via, else ``position`` deletes the track
+        or via nearest to that point within 1 mm. SWIG board.Tracks() holds
+        tracks, arcs and vias together; kipy lists vias apart, so both lists
+        are searched.
+
+        kipy's remove_items() discards KiCad's per-item deletion status, so
+        the live board is read back after the commit: a reply only says
+        "deleted" when the items are really gone from KiCad.
+        """
+        try:
+            from kipy.board_types import Via
+            from kipy.util.units import to_mm
+
+            board = self._get_board()
+            tracks = list(board.get_tracks())
+            vias = list(board.get_vias())
+
+            targets: List[Any] = []
+            if net_name:
+                for item in [*tracks, *vias]:
+                    item_net = item.net.name if item.net else ""
+                    if net_name != "*" and item_net != net_name:
+                        continue
+                    is_via = isinstance(item, Via)
+                    if is_via and not include_vias:
+                        continue
+                    if layer and not is_via and ipc_layer_name(item.layer) != layer:
+                        continue
+                    targets.append(item)
+                if not targets:
+                    return {
+                        "success": True,
+                        "message": f"Deleted 0 traces on net '{net_name}'",
+                        "deletedCount": 0,
+                    }
+            elif uuid:
+                for item in [*tracks, *vias]:
+                    # item.id is a KIID message; str() gives protobuf text
+                    # ('value: "..."\n'), so compare the value field, the same
+                    # id get_tracks()/get_vias() hand out to query_traces.
+                    if item.id.value == uuid:
+                        targets.append(item)
+                        break
+                if not targets:
+                    return {
+                        "success": False,
+                        "message": "Track not found",
+                        "errorDetails": f"No live track or via with uuid '{uuid}'",
+                    }
+            elif position:
+                unit = position.get("unit") or "mm"
+                scale = {"mm": 1.0, "mil": 0.0254, "inch": 25.4}.get(unit)
+                if scale is None:
+                    return {
+                        "success": False,
+                        "message": "Invalid unit",
+                        "errorDetails": f"unit must be mm, mil or inch, got '{unit}'",
+                    }
+                px = float(position["x"]) * scale
+                py = float(position["y"]) * scale
+
+                def distance(item: Any) -> float:
+                    if isinstance(item, Via):
+                        sx = ex = to_mm(item.position.x)
+                        sy = ey = to_mm(item.position.y)
+                    else:
+                        # Arc tracks are measured on their chord, as SWIG does.
+                        sx, sy = to_mm(item.start.x), to_mm(item.start.y)
+                        ex, ey = to_mm(item.end.x), to_mm(item.end.y)
+                    vx, vy = ex - sx, ey - sy
+                    length_sq = vx * vx + vy * vy
+                    t = 0.0
+                    if length_sq > 0:
+                        t = max(0.0, min(1.0, ((px - sx) * vx + (py - sy) * vy) / length_sq))
+                    return math.hypot(px - (sx + t * vx), py - (sy + t * vy))
+
+                nearest = None
+                best = float("inf")
+                for item in [*tracks, *vias]:
+                    d = distance(item)
+                    if d < best:
+                        best, nearest = d, item
+                if nearest is None or best >= self._DELETE_PICK_RADIUS_MM:
+                    return {
+                        "success": False,
+                        "message": "No track found",
+                        "errorDetails": "No track found near specified position",
+                    }
+                targets.append(nearest)
+            else:
+                return {
+                    "success": False,
+                    "message": "Missing parameters",
+                    "errorDetails": "One of traceUuid, position, or net must be provided",
+                }
+
+            wanted = {item.id.value for item in targets}
+            commit = board.begin_commit()
+            try:
+                board.remove_items(targets)
+                board.push_commit(commit, f"Deleted {len(targets)} track(s)")
+            except Exception as error:
+                try:
+                    board.drop_commit(commit)
+                except Exception:
+                    logger.exception("Could not discard failed delete transaction")
+                return {
+                    "success": False,
+                    "message": "KiCad refused to delete the trace",
+                    "errorDetails": str(error),
+                }
+
+            remaining = {item.id.value for item in [*board.get_tracks(), *board.get_vias()]}
+            still_there = sorted(wanted & remaining)
+            if still_there:
+                return {
+                    "success": False,
+                    "message": "KiCad did not delete the trace",
+                    "errorDetails": (
+                        f"{len(still_there)} of {len(wanted)} item(s) are still on the "
+                        f"live board: {', '.join(still_there)}"
+                    ),
+                    "remainingUuids": still_there,
+                }
+
+            deleted = sorted(wanted)
+            self._notify("tracks_deleted", {"uuids": deleted})
+            if net_name:
+                message = f"Deleted {len(deleted)} traces on net '{net_name}'"
+            elif uuid:
+                message = f"Deleted track: {uuid}"
+            else:
+                message = "Deleted track at specified position"
+            return {
+                "success": True,
+                "message": message,
+                "deletedCount": len(deleted),
+                "deletedUuids": deleted,
+            }
+        except Exception as e:
+            logger.error(f"Failed to delete track: {e}")
+            return {
+                "success": False,
+                "message": "Failed to delete trace",
+                "errorDetails": str(e),
+            }
+
     def add_via(
         self,
         x: float,
@@ -1420,7 +1795,7 @@ class IPCBoardAPI(BoardAPI):
                             "width": to_mm(track.width),
                             "layer": str(track.layer),
                             "net": track.net.name if track.net else "",
-                            "id": str(track.id) if hasattr(track, "id") else "",
+                            "id": track.id.value,
                         }
                     )
                 except Exception as e:
@@ -1451,7 +1826,7 @@ class IPCBoardAPI(BoardAPI):
                             "drill": to_mm(via.drill_diameter),
                             "net": via.net.name if via.net else "",
                             "type": str(via.type),
-                            "id": str(via.id) if hasattr(via, "id") else "",
+                            "id": via.id.value,
                         }
                     )
                 except Exception as e:
@@ -1496,6 +1871,7 @@ class IPCBoardAPI(BoardAPI):
         priority: int = 0,
         fill_mode: str = "solid",
         name: str = "",
+        pad_connection: Optional[str] = None,
     ) -> bool:
         """
         Add a copper pour zone to the board.
@@ -1511,11 +1887,12 @@ class IPCBoardAPI(BoardAPI):
             priority: Zone priority (higher = fills first)
             fill_mode: "solid" or "hatched"
             name: Optional zone name
+            pad_connection: "thermal", "solid" or "none"; None keeps KiCad's default
         """
         try:
             from kipy.board_types import Zone, ZoneFillMode, ZoneType
             from kipy.geometry import PolyLine, PolyLineNode, Vector2
-            from kipy.proto.board.board_types_pb2 import BoardLayer
+            from kipy.proto.board.board_types_pb2 import BoardLayer, ZoneConnectionStyle
             from kipy.util.units import from_mm
 
             board = self._get_board()
@@ -1563,6 +1940,13 @@ class IPCBoardAPI(BoardAPI):
                 ZoneFillMode.ZFM_HATCHED if fill_mode == "hatched" else ZoneFillMode.ZFM_SOLID
             )
 
+            if pad_connection is not None:
+                zone._proto.copper_settings.connection.zone_connection = {
+                    "thermal": ZoneConnectionStyle.ZCS_THERMAL,
+                    "solid": ZoneConnectionStyle.ZCS_FULL,
+                    "none": ZoneConnectionStyle.ZCS_NONE,
+                }[pad_connection]
+
             # Create outline polyline
             outline = PolyLine()
             outline.closed = True
@@ -1595,6 +1979,165 @@ class IPCBoardAPI(BoardAPI):
         except Exception as e:
             logger.error(f"Failed to add zone: {e}")
             return False
+
+    def add_copper_keepout(
+        self,
+        board_path: str,
+        name: str,
+        layers: List[str],
+        points: List[Dict[str, float]],
+    ) -> Dict[str, Any]:
+        """Create and verify a live rule area that excludes zone fills only."""
+        from kipy.board_types import Zone, ZoneType
+        from kipy.geometry import PolyLine, PolyLineNode
+        from kipy.proto.board.board_types_pb2 import BoardLayer
+        from kipy.util.units import from_mm, to_mm
+
+        if not isinstance(name, str) or not name.strip():
+            return {"success": False, "message": "Keepout name must not be empty"}
+        if not isinstance(board_path, str) or not board_path.strip():
+            return {"success": False, "message": "boardPath must name the open PCB"}
+        try:
+            vertices = _keepout_polygon_mm(points)
+        except ValueError as error:
+            return {"success": False, "message": str(error)}
+        if (
+            not isinstance(layers, list)
+            or not layers
+            or any(not isinstance(layer, str) for layer in layers)
+            or len(set(layers)) != len(layers)
+        ):
+            return {"success": False, "message": "Select distinct copper layers"}
+
+        copper_layers = {"F.Cu": BoardLayer.BL_F_Cu, "B.Cu": BoardLayer.BL_B_Cu}
+        copper_layers.update(
+            {f"In{index}.Cu": getattr(BoardLayer, f"BL_In{index}_Cu") for index in range(1, 31)}
+        )
+        if any(layer not in copper_layers for layer in layers):
+            return {"success": False, "message": "Keepout layers must be copper layers"}
+
+        try:
+            board = self._get_board()
+            live_path = self.get_open_board_path()
+            if not live_path or os.path.normcase(
+                str(Path(live_path).resolve())
+            ) != os.path.normcase(str(Path(board_path).resolve())):
+                return {
+                    "success": False,
+                    "message": f"Requested board is not open in KiCad: {board_path}",
+                    "open_board": live_path,
+                }
+            enabled = {ipc_layer_name(layer) for layer in board.get_enabled_layers()}
+        except Exception as error:
+            return {"success": False, "message": f"Could not read enabled layers: {error}"}
+        disabled = [layer for layer in layers if layer not in enabled]
+        if disabled:
+            return {
+                "success": False,
+                "message": f"Copper layer(s) not enabled: {', '.join(disabled)}",
+            }
+
+        zone = Zone()
+        zone.type = ZoneType.ZT_RULE_AREA
+        zone.name = name
+        zone.layers = [copper_layers[layer] for layer in layers]
+        rule = zone._proto.rule_area_settings
+        rule.keepout_copper = True
+        rule.keepout_tracks = False
+        rule.keepout_vias = False
+        rule.keepout_pads = False
+        rule.keepout_footprints = False
+        outline = PolyLine()
+        outline.closed = True
+        for x, y in vertices:
+            outline.append(PolyLineNode.from_xy(from_mm(x), from_mm(y)))
+        zone._proto.outline.polygons.add().outline.CopyFrom(outline._proto)
+
+        commit = board.begin_commit()
+        created = None
+        try:
+            created = board.create_items(zone)
+            board.push_commit(commit, f"Added copper keepout {name}")
+        except Exception as error:
+            try:
+                board.drop_commit(commit)
+            except Exception as rollback_error:
+                logger.exception("Could not discard failed keepout transaction")
+                if created is not None:
+                    return {
+                        "success": False,
+                        "status": "mutation_outcome_uncertain",
+                        "message": f"KiCad created the keepout but commit and rollback failed: {error}; {rollback_error}",
+                    }
+            return {"success": False, "message": f"KiCad refused the keepout: {error}"}
+
+        created_id = ""
+        if created is not None and len(created) == 1:
+            created_id = getattr(
+                getattr(getattr(created[0], "_proto", None), "id", None), "value", ""
+            )
+        response: Dict[str, Any] = {
+            "success": True,
+            "mutation_applied": True,
+            "status": "applied_unverified",
+            "name": name,
+            "layers": layers,
+            "point_count": len(vertices),
+            "id": created_id,
+            "verified": False,
+            "refilled": False,
+        }
+        try:
+            observed = next(
+                item
+                for item in board.get_zones()
+                if created_id and item._proto.id.value == created_id
+            )
+            observed_points = [
+                (to_mm(node.point.x_nm), to_mm(node.point.y_nm))
+                for polygon in observed._proto.outline.polygons
+                for node in polygon.outline.nodes
+            ]
+            observed_layers = [ipc_layer_name(layer) for layer in observed.layers]
+            observed_rule = observed._proto.rule_area_settings
+            verified = (
+                observed.type == ZoneType.ZT_RULE_AREA
+                and set(observed_layers) == set(layers)
+                and observed.name == name
+                and observed_rule.keepout_copper
+                and not any(
+                    (
+                        observed_rule.keepout_tracks,
+                        observed_rule.keepout_vias,
+                        observed_rule.keepout_pads,
+                        observed_rule.keepout_footprints,
+                    )
+                )
+                and _same_keepout_outline(observed_points, vertices)
+            )
+            response.update(
+                {
+                    "verified": verified,
+                    "layers": observed_layers,
+                    "points": [{"x": x, "y": y} for x, y in observed_points],
+                    "status": "applied" if verified else "applied_readback_mismatch",
+                }
+            )
+        except Exception as error:
+            response["readback_error"] = str(error)
+
+        try:
+            board.refill_zones()
+            response["refilled"] = True
+        except Exception as error:
+            response["refill_error"] = str(error)
+            if response["status"] == "applied":
+                response["status"] = "applied_not_refilled"
+        try:
+            self._notify("rule_area_added", {"id": created_id, "name": name, "layers": layers})
+        except Exception:
+            logger.exception("Could not emit keepout notification")
+        return response
 
     def get_zones(self) -> List[Dict[str, Any]]:
         """Get all zones on the board."""
